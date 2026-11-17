@@ -1,0 +1,6 @@
+# component  upstream-url  commit  (patches in patches/<component>/ apply on top)
+moltenvk      https://github.com/KhronosGroup/MoltenVK.git 5189f8de86ec365860f63bf1da736815cfaea5cd
+spirv-cross   https://github.com/KhronosGroup/SPIRV-Cross.git aa217aeb6c9f0ace7a0ab233b28807edf45eb165
+vkd3d-proton  https://github.com/HansKristian-Work/vkd3d-proton.git 5b1089c89dbc5cb9f662650feb60d2d3df3e55ca
+dxil-spirv    https://github.com/HansKristian-Work/dxil-spirv.git 114e664efca411c926380b2f3bd1930c1faeaf4d  # = vkd3d-proton's subprojects/dxil-spirv
+dxvk          https://github.com/doitsujin/dxvk.git 71bf4bad427dd6a6a338d6768812110c61bb4503

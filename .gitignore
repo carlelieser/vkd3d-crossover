@@ -1,0 +1,7 @@
+# Upstream checkouts and build output (created by tools/dev scripts)
+/src/
+/build/
+/out/
+*.dylib
+*.dll
+.DS_Store

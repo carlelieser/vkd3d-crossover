@@ -1,0 +1,668 @@
+diff --git a/src/dxgi/dxgi_factory.cpp b/src/dxgi/dxgi_factory.cpp
+index d89409e..0d66340 100644
+--- a/src/dxgi/dxgi_factory.cpp
++++ b/src/dxgi/dxgi_factory.cpp
+@@ -1,3 +1,4 @@
++#include "dxgi_trace.h"
+ #include <algorithm>
+ 
+ #include "dxgi_factory.h"
+@@ -212,7 +213,7 @@ namespace dxvk {
+   }
+   
+   
+-  HRESULT STDMETHODCALLTYPE DxgiFactory::CreateSwapChain(
++  HRESULT DxgiFactory::CreateSwapChain_Impl(
+           IUnknown*             pDevice,
+           DXGI_SWAP_CHAIN_DESC* pDesc,
+           IDXGISwapChain**      ppSwapChain) {
+@@ -248,7 +249,7 @@ namespace dxvk {
+   }
+   
+   
+-  HRESULT STDMETHODCALLTYPE DxgiFactory::CreateSwapChainForHwnd(
++  HRESULT DxgiFactory::CreateSwapChainForHwnd_Impl(
+           IUnknown*             pDevice,
+           HWND                  hWnd,
+     const DXGI_SWAP_CHAIN_DESC1* pDesc,
+@@ -584,4 +585,33 @@ namespace dxvk {
+     return s_globalHDRState;
+   }
+ 
++
++  HRESULT STDMETHODCALLTYPE DxgiFactory::CreateSwapChain(IUnknown* pDevice, DXGI_SWAP_CHAIN_DESC* pDesc, IDXGISwapChain** ppSwapChain) {
++    HRESULT hr = CreateSwapChain_Impl(pDevice, pDesc, ppSwapChain);
++    if (dxgiTraceEnabled()) {
++      if (pDesc) {
++        dxgiTrace("Factory::CreateSwapChain(%ux%u format %d, windowed %d, buffers %u, swap effect %d, flags %#x) -> hr %08x",
++          pDesc->BufferDesc.Width, pDesc->BufferDesc.Height, pDesc->BufferDesc.Format, pDesc->Windowed, pDesc->BufferCount, pDesc->SwapEffect, pDesc->Flags, hr);
++      RECT wr = {}, cr = {};
++      GetWindowRect(pDesc->OutputWindow, &wr); GetClientRect(pDesc->OutputWindow, &cr);
++      dxgiTrace("    window %p: window rect %ldx%ld at (%ld,%ld), client rect %ldx%ld, style %#lx", (void*)pDesc->OutputWindow, wr.right - wr.left, wr.bottom - wr.top, wr.left, wr.top,
++        cr.right - cr.left, cr.bottom - cr.top, GetWindowLongW(pDesc->OutputWindow, GWL_STYLE));
++      }
++    }
++    return hr;
++  }
++
++  HRESULT STDMETHODCALLTYPE DxgiFactory::CreateSwapChainForHwnd(IUnknown* pDevice, HWND hWnd, const DXGI_SWAP_CHAIN_DESC1* pDesc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc, IDXGIOutput* pRestrictToOutput, IDXGISwapChain1** ppSwapChain) {
++    HRESULT hr = CreateSwapChainForHwnd_Impl(pDevice, hWnd, pDesc, pFullscreenDesc, pRestrictToOutput, ppSwapChain);
++    if (dxgiTraceEnabled()) {
++      if (pDesc) dxgiTrace("Factory::CreateSwapChainForHwnd(%ux%u format %d, scaling %d, buffers %u, swap effect %d, flags %#x, fullscreen desc %s windowed %d) -> hr %08x",
++        pDesc->Width, pDesc->Height, pDesc->Format, pDesc->Scaling, pDesc->BufferCount, pDesc->SwapEffect, pDesc->Flags,
++        pFullscreenDesc ? "yes" : "no", pFullscreenDesc ? pFullscreenDesc->Windowed : -1, hr);
++      RECT wr = {}, cr = {};
++      GetWindowRect(hWnd, &wr); GetClientRect(hWnd, &cr);
++      dxgiTrace("    window %p: window rect %ldx%ld at (%ld,%ld), client rect %ldx%ld, style %#lx", (void*)hWnd, wr.right - wr.left, wr.bottom - wr.top, wr.left, wr.top,
++        cr.right - cr.left, cr.bottom - cr.top, GetWindowLongW(hWnd, GWL_STYLE));
++    }
++    return hr;
++  }
+ }
+diff --git a/src/dxgi/dxgi_factory.h b/src/dxgi/dxgi_factory.h
+index d6a6808..c82bcd8 100644
+--- a/src/dxgi/dxgi_factory.h
++++ b/src/dxgi/dxgi_factory.h
+@@ -79,6 +79,8 @@ namespace dxvk {
+             IUnknown*             pDevice,
+             DXGI_SWAP_CHAIN_DESC* pDesc,
+             IDXGISwapChain**      ppSwapChain) final;
++    HRESULT CreateSwapChain_Impl(IUnknown* pDevice, DXGI_SWAP_CHAIN_DESC* pDesc, IDXGISwapChain** ppSwapChain);
++
+     
+     DXVK_HOTPATCHABLE
+     HRESULT STDMETHODCALLTYPE CreateSwapChainForHwnd(
+@@ -88,6 +90,8 @@ namespace dxvk {
+       const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc,
+             IDXGIOutput*          pRestrictToOutput,
+             IDXGISwapChain1**     ppSwapChain) final;
++    HRESULT CreateSwapChainForHwnd_Impl(IUnknown* pDevice, HWND hWnd, const DXGI_SWAP_CHAIN_DESC1* pDesc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc, IDXGIOutput* pRestrictToOutput, IDXGISwapChain1** ppSwapChain);
++
+ 
+     DXVK_HOTPATCHABLE
+     HRESULT STDMETHODCALLTYPE CreateSwapChainForCoreWindow(
+diff --git a/src/dxgi/dxgi_output.cpp b/src/dxgi/dxgi_output.cpp
+index 8814f5c..85a7aa3 100644
+--- a/src/dxgi/dxgi_output.cpp
++++ b/src/dxgi/dxgi_output.cpp
+@@ -1,3 +1,4 @@
++#include "dxgi_trace.h"
+ #include <algorithm>
+ #include <numeric>
+ 
+@@ -76,7 +77,7 @@ namespace dxvk {
+   }
+   
+   
+-  HRESULT STDMETHODCALLTYPE DxgiOutput::FindClosestMatchingMode(
++  HRESULT DxgiOutput::FindClosestMatchingMode_Impl(
+     const DXGI_MODE_DESC *pModeToMatch,
+           DXGI_MODE_DESC *pClosestMatch,
+           IUnknown       *pConcernedDevice) {
+@@ -110,7 +111,7 @@ namespace dxvk {
+   }
+   
+   
+-  HRESULT STDMETHODCALLTYPE DxgiOutput::FindClosestMatchingMode1(
++  HRESULT DxgiOutput::FindClosestMatchingMode1_Impl(
+     const DXGI_MODE_DESC1*      pModeToMatch,
+           DXGI_MODE_DESC1*      pClosestMatch,
+           IUnknown*             pConcernedDevice) {
+@@ -198,7 +199,7 @@ namespace dxvk {
+   }
+ 
+ 
+-  HRESULT STDMETHODCALLTYPE DxgiOutput::GetDesc(DXGI_OUTPUT_DESC *pDesc) {
++  HRESULT DxgiOutput::GetDesc_Impl(DXGI_OUTPUT_DESC *pDesc) {
+     if (pDesc == nullptr)
+       return DXGI_ERROR_INVALID_CALL;
+ 
+@@ -217,7 +218,7 @@ namespace dxvk {
+   }
+ 
+ 
+-  HRESULT STDMETHODCALLTYPE DxgiOutput::GetDesc1(
++  HRESULT DxgiOutput::GetDesc1_Impl(
+           DXGI_OUTPUT_DESC1*    pDesc) {
+     if (pDesc == nullptr)
+       return DXGI_ERROR_INVALID_CALL;
+@@ -261,7 +262,93 @@ namespace dxvk {
+   }
+ 
+ 
+-  HRESULT STDMETHODCALLTYPE DxgiOutput::GetDisplayModeList(
++  /**
++   * Wine's macOS driver exposes hundreds of synthetic scaled sizes
++   * (~17px apart, mostly odd aspect ratios) and lacks common ones like
++   * 1920x1080. Games that pick a default from the mode list (RE Engine
++   * stores an index into it) end up at absurd sizes such as 882x550.
++   * When the list looks like that, replace it with what a Windows
++   * driver reports: standard sizes that fit the panel, plus the native
++   * and desktop sizes, at the panel's refresh rates.
++   * DXVK_DXGI_MODE_FILTER=0 disables this.
++   */
++  void DxgiOutput::NormalizeModeList(std::vector<DXGI_MODE_DESC1>& modeList) const {
++    static const bool disabled = [] {
++      const char* e = std::getenv("DXVK_DXGI_MODE_FILTER");
++      return e && e[0] == '0';
++    }();
++
++    if (disabled || modeList.empty())
++      return;
++
++    std::vector<std::pair<UINT, UINT>> sizes;
++    for (const auto& m : modeList) {
++      std::pair<UINT, UINT> s = { m.Width, m.Height };
++      if (std::find(sizes.begin(), sizes.end(), s) == sizes.end())
++        sizes.push_back(s);
++    }
++
++    // A real Windows driver reports a few dozen sizes at most.
++    if (sizes.size() <= 64)
++      return;
++
++    auto native = *std::max_element(sizes.begin(), sizes.end(),
++      [] (const auto& a, const auto& b) { return uint64_t(a.first) * a.second < uint64_t(b.first) * b.second; });
++
++    std::vector<DXGI_MODE_DESC1> templates;
++    for (const auto& m : modeList) {
++      if (m.Width == native.first && m.Height == native.second)
++        templates.push_back(m);
++    }
++
++    static const std::pair<UINT, UINT> standard[] = {
++      {  640,  480 }, {  800,  600 }, { 1024,  768 }, { 1152,  864 },
++      { 1280,  720 }, { 1280,  768 }, { 1280,  800 }, { 1280,  960 },
++      { 1280, 1024 }, { 1360,  768 }, { 1366,  768 }, { 1440,  900 },
++      { 1600,  900 }, { 1600, 1200 }, { 1680, 1050 }, { 1920, 1080 },
++      { 1920, 1200 }, { 2048, 1152 }, { 2560, 1440 }, { 2560, 1600 },
++      { 2880, 1800 }, { 3200, 1800 }, { 3840, 2160 }, { 3840, 2400 },
++      { 5120, 2880 }, { 5120, 3200 }, { 6016, 3384 },
++    };
++
++    std::vector<std::pair<UINT, UINT>> keep;
++    for (const auto& s : standard) {
++      if (s.first <= native.first && s.second <= native.second)
++        keep.push_back(s);
++    }
++
++    keep.push_back(native);
++
++    wsi::WsiMode desktop = { };
++    if (wsi::getDesktopDisplayMode(m_monitor, &desktop)
++     && desktop.width <= native.first && desktop.height <= native.second)
++      keep.push_back({ desktop.width, desktop.height });
++
++    std::vector<DXGI_MODE_DESC1> result;
++    for (const auto& s : keep) {
++      for (const auto& t : templates) {
++        DXGI_MODE_DESC1 mode = t;
++        mode.Width  = s.first;
++        mode.Height = s.second;
++
++        bool dup = std::any_of(result.begin(), result.end(), [&] (const DXGI_MODE_DESC1& r) {
++          return r.Width == mode.Width && r.Height == mode.Height
++              && r.RefreshRate.Numerator   == mode.RefreshRate.Numerator
++              && r.RefreshRate.Denominator == mode.RefreshRate.Denominator
++              && r.ScanlineOrdering == mode.ScanlineOrdering
++              && r.Scaling == mode.Scaling;
++        });
++
++        if (!dup)
++          result.push_back(mode);
++      }
++    }
++
++    modeList = std::move(result);
++  }
++
++
++  HRESULT DxgiOutput::GetDisplayModeList_Impl(
+           DXGI_FORMAT    EnumFormat,
+           UINT           Flags,
+           UINT*          pNumModes,
+@@ -291,7 +378,7 @@ namespace dxvk {
+   }
+   
+   
+-  HRESULT STDMETHODCALLTYPE DxgiOutput::GetDisplayModeList1(
++  HRESULT DxgiOutput::GetDisplayModeList1_Impl(
+           DXGI_FORMAT           EnumFormat,
+           UINT                  Flags,
+           UINT*                 pNumModes,
+@@ -310,30 +397,28 @@ namespace dxvk {
+     wsi::WsiMode devMode = { };
+     
+     uint32_t srcModeId = 0;
+-    uint32_t dstModeId = 0;
+-    
++
+     std::vector<DXGI_MODE_DESC1> modeList;
+-    
++
+     while (wsi::getDisplayMode(m_monitor, srcModeId++, &devMode)) {
+       // Only enumerate interlaced modes if requested.
+       if (devMode.interlaced && !(Flags & DXGI_ENUM_MODES_INTERLACED))
+         continue;
+-      
++
+       // Skip modes with incompatible formats
+       if (devMode.bitsPerPixel != GetMonitorFormatBpp(EnumFormat))
+         continue;
+-      
+-      if (pDesc != nullptr) {
+-        DXGI_MODE_DESC1 mode = ConvertDisplayMode(devMode);
+-        // Fix up the DXGI_FORMAT to match what we were enumerating.
+-        mode.Format = EnumFormat;
+ 
+-        modeList.push_back(mode);
+-      }
+-      
+-      dstModeId += 1;
++      DXGI_MODE_DESC1 mode = ConvertDisplayMode(devMode);
++      // Fix up the DXGI_FORMAT to match what we were enumerating.
++      mode.Format = EnumFormat;
++      modeList.push_back(mode);
+     }
+-    
++
++    NormalizeModeList(modeList);
++
++    uint32_t dstModeId = uint32_t(modeList.size());
++
+     // Sort display modes by width, height and refresh rate,
+     // in that order. Some games rely on correct ordering.
+     std::sort(modeList.begin(), modeList.end(),
+@@ -697,4 +782,94 @@ namespace dxvk {
+     m_monitorInfo->InitMonitorData(m_monitor, &monitorData);
+   }
+ 
++
++  HRESULT STDMETHODCALLTYPE DxgiOutput::GetDesc(DXGI_OUTPUT_DESC* pDesc) {
++    HRESULT hr = GetDesc_Impl(pDesc);
++    if (dxgiTraceEnabled()) {
++      if (SUCCEEDED(hr) && pDesc) dxgiTrace("Output::GetDesc -> desktop (%ld,%ld)-(%ld,%ld) = %ldx%ld, attached %d, rotation %d",
++        pDesc->DesktopCoordinates.left, pDesc->DesktopCoordinates.top, pDesc->DesktopCoordinates.right, pDesc->DesktopCoordinates.bottom,
++        pDesc->DesktopCoordinates.right - pDesc->DesktopCoordinates.left, pDesc->DesktopCoordinates.bottom - pDesc->DesktopCoordinates.top,
++        pDesc->AttachedToDesktop, pDesc->Rotation);
++      else dxgiTrace("Output::GetDesc -> hr %08x", hr);
++    }
++    return hr;
++  }
++
++  HRESULT STDMETHODCALLTYPE DxgiOutput::GetDesc1(DXGI_OUTPUT_DESC1* pDesc) {
++    HRESULT hr = GetDesc1_Impl(pDesc);
++    if (dxgiTraceEnabled()) {
++      if (SUCCEEDED(hr) && pDesc) dxgiTrace("Output::GetDesc1 -> desktop %ldx%ld at (%ld,%ld), bpc %u, colorspace %d, lum %.2f-%.1f (full frame %.1f)",
++        pDesc->DesktopCoordinates.right - pDesc->DesktopCoordinates.left, pDesc->DesktopCoordinates.bottom - pDesc->DesktopCoordinates.top,
++        pDesc->DesktopCoordinates.left, pDesc->DesktopCoordinates.top, pDesc->BitsPerColor, pDesc->ColorSpace,
++        pDesc->MinLuminance, pDesc->MaxLuminance, pDesc->MaxFullFrameLuminance);
++      else dxgiTrace("Output::GetDesc1 -> hr %08x", hr);
++    }
++    return hr;
++  }
++
++  HRESULT STDMETHODCALLTYPE DxgiOutput::GetDisplayModeList(DXGI_FORMAT EnumFormat, UINT Flags, UINT* pNumModes, DXGI_MODE_DESC* pDesc) {
++    HRESULT hr = GetDisplayModeList_Impl(EnumFormat, Flags, pNumModes, pDesc);
++    if (dxgiTraceEnabled()) {
++      UINT n = pNumModes ? *pNumModes : 0;
++      if (!pDesc) { dxgiTrace("Output::%s(format %d, flags %#x, count query) -> %u modes, hr %08x", "GetDisplayModeList", EnumFormat, Flags, n, hr); }
++      else {
++        UINT maxW = 0, maxH = 0, idx882 = ~0u, first = 0;
++        for (UINT i = 0; i < n; i++) {
++          if (pDesc[i].Width * pDesc[i].Height > maxW * maxH) { maxW = pDesc[i].Width; maxH = pDesc[i].Height; }
++          if (pDesc[i].Width == 882 && idx882 == ~0u) idx882 = i;
++        }
++        dxgiTrace("Output::%s(format %d, flags %#x) -> %u modes, hr %08x, largest %ux%u, first 882-wide at %d", "GetDisplayModeList", EnumFormat, Flags, n, hr, maxW, maxH, (int)idx882);
++        for (UINT i = 0; i < n && i < 6; i++) dxgiTrace("    mode %u: %ux%u @ %u/%u scaling %d order %d", i, pDesc[i].Width, pDesc[i].Height,
++          pDesc[i].RefreshRate.Numerator, pDesc[i].RefreshRate.Denominator, pDesc[i].Scaling, pDesc[i].ScanlineOrdering);
++        for (UINT i = n > 6 ? n - 6 : n; i < n; i++) dxgiTrace("    mode %u: %ux%u @ %u/%u scaling %d order %d", i, pDesc[i].Width, pDesc[i].Height,
++          pDesc[i].RefreshRate.Numerator, pDesc[i].RefreshRate.Denominator, pDesc[i].Scaling, pDesc[i].ScanlineOrdering);
++        (void)first;
++      }
++    }
++    return hr;
++  }
++
++  HRESULT STDMETHODCALLTYPE DxgiOutput::GetDisplayModeList1(DXGI_FORMAT EnumFormat, UINT Flags, UINT* pNumModes, DXGI_MODE_DESC1* pDesc) {
++    HRESULT hr = GetDisplayModeList1_Impl(EnumFormat, Flags, pNumModes, pDesc);
++    if (dxgiTraceEnabled()) {
++      UINT n = pNumModes ? *pNumModes : 0;
++      if (!pDesc) { dxgiTrace("Output::%s(format %d, flags %#x, count query) -> %u modes, hr %08x", "GetDisplayModeList1", EnumFormat, Flags, n, hr); }
++      else {
++        UINT maxW = 0, maxH = 0, idx882 = ~0u, first = 0;
++        for (UINT i = 0; i < n; i++) {
++          if (pDesc[i].Width * pDesc[i].Height > maxW * maxH) { maxW = pDesc[i].Width; maxH = pDesc[i].Height; }
++          if (pDesc[i].Width == 882 && idx882 == ~0u) idx882 = i;
++        }
++        dxgiTrace("Output::%s(format %d, flags %#x) -> %u modes, hr %08x, largest %ux%u, first 882-wide at %d", "GetDisplayModeList1", EnumFormat, Flags, n, hr, maxW, maxH, (int)idx882);
++        for (UINT i = 0; i < n && i < 6; i++) dxgiTrace("    mode %u: %ux%u @ %u/%u scaling %d order %d", i, pDesc[i].Width, pDesc[i].Height,
++          pDesc[i].RefreshRate.Numerator, pDesc[i].RefreshRate.Denominator, pDesc[i].Scaling, pDesc[i].ScanlineOrdering);
++        for (UINT i = n > 6 ? n - 6 : n; i < n; i++) dxgiTrace("    mode %u: %ux%u @ %u/%u scaling %d order %d", i, pDesc[i].Width, pDesc[i].Height,
++          pDesc[i].RefreshRate.Numerator, pDesc[i].RefreshRate.Denominator, pDesc[i].Scaling, pDesc[i].ScanlineOrdering);
++        (void)first;
++      }
++    }
++    return hr;
++  }
++
++  HRESULT STDMETHODCALLTYPE DxgiOutput::FindClosestMatchingMode(const DXGI_MODE_DESC* pModeToMatch, DXGI_MODE_DESC* pClosestMatch, IUnknown* pConcernedDevice) {
++    HRESULT hr = FindClosestMatchingMode_Impl(pModeToMatch, pClosestMatch, pConcernedDevice);
++    if (dxgiTraceEnabled()) {
++      if (pModeToMatch) dxgiTrace("Output::%s(want %ux%u @ %u/%u format %d scaling %d) -> %ux%u @ %u/%u format %d, hr %08x", "FindClosestMatchingMode",
++        pModeToMatch->Width, pModeToMatch->Height, pModeToMatch->RefreshRate.Numerator, pModeToMatch->RefreshRate.Denominator, pModeToMatch->Format, pModeToMatch->Scaling,
++        pClosestMatch ? pClosestMatch->Width : 0, pClosestMatch ? pClosestMatch->Height : 0, pClosestMatch ? pClosestMatch->RefreshRate.Numerator : 0,
++        pClosestMatch ? pClosestMatch->RefreshRate.Denominator : 0, pClosestMatch ? pClosestMatch->Format : 0, hr);
++    }
++    return hr;
++  }
++
++  HRESULT STDMETHODCALLTYPE DxgiOutput::FindClosestMatchingMode1(const DXGI_MODE_DESC1* pModeToMatch, DXGI_MODE_DESC1* pClosestMatch, IUnknown* pConcernedDevice) {
++    HRESULT hr = FindClosestMatchingMode1_Impl(pModeToMatch, pClosestMatch, pConcernedDevice);
++    if (dxgiTraceEnabled()) {
++      if (pModeToMatch) dxgiTrace("Output::%s(want %ux%u @ %u/%u format %d scaling %d) -> %ux%u @ %u/%u format %d, hr %08x", "FindClosestMatchingMode1",
++        pModeToMatch->Width, pModeToMatch->Height, pModeToMatch->RefreshRate.Numerator, pModeToMatch->RefreshRate.Denominator, pModeToMatch->Format, pModeToMatch->Scaling,
++        pClosestMatch ? pClosestMatch->Width : 0, pClosestMatch ? pClosestMatch->Height : 0, pClosestMatch ? pClosestMatch->RefreshRate.Numerator : 0,
++        pClosestMatch ? pClosestMatch->RefreshRate.Denominator : 0, pClosestMatch ? pClosestMatch->Format : 0, hr);
++    }
++    return hr;
++  }
+ }
+diff --git a/src/dxgi/dxgi_output.h b/src/dxgi/dxgi_output.h
+index dca52ea..89225e5 100644
+--- a/src/dxgi/dxgi_output.h
++++ b/src/dxgi/dxgi_output.h
+@@ -47,29 +47,42 @@ namespace dxvk {
+       const DXGI_MODE_DESC*       pModeToMatch,
+             DXGI_MODE_DESC*       pClosestMatch,
+             IUnknown*             pConcernedDevice) final;
++    HRESULT FindClosestMatchingMode_Impl(const DXGI_MODE_DESC* pModeToMatch, DXGI_MODE_DESC* pClosestMatch, IUnknown* pConcernedDevice);
++
+ 
+     HRESULT STDMETHODCALLTYPE FindClosestMatchingMode1(
+       const DXGI_MODE_DESC1*      pModeToMatch,
+             DXGI_MODE_DESC1*      pClosestMatch,
+             IUnknown*             pConcernedDevice) final;
++    HRESULT FindClosestMatchingMode1_Impl(const DXGI_MODE_DESC1* pModeToMatch, DXGI_MODE_DESC1* pClosestMatch, IUnknown* pConcernedDevice);
++
+     
+     HRESULT STDMETHODCALLTYPE GetDesc(
+             DXGI_OUTPUT_DESC*     pDesc) final;
++    HRESULT GetDesc_Impl(DXGI_OUTPUT_DESC* pDesc);
++
+     
+     HRESULT STDMETHODCALLTYPE GetDesc1(
+             DXGI_OUTPUT_DESC1*    pDesc) final;
++    HRESULT GetDesc1_Impl(DXGI_OUTPUT_DESC1* pDesc);
++
+ 
+     HRESULT STDMETHODCALLTYPE GetDisplayModeList(
+             DXGI_FORMAT           EnumFormat,
+             UINT                  Flags,
+             UINT*                 pNumModes,
+             DXGI_MODE_DESC*       pDesc) final;
++    HRESULT GetDisplayModeList_Impl(DXGI_FORMAT EnumFormat, UINT Flags, UINT* pNumModes, DXGI_MODE_DESC* pDesc);
++
+     
+     HRESULT STDMETHODCALLTYPE GetDisplayModeList1(
+             DXGI_FORMAT           EnumFormat,
+             UINT                  Flags,
+             UINT*                 pNumModes,
+             DXGI_MODE_DESC1*      pDesc) final;
++    HRESULT GetDisplayModeList1_Impl(DXGI_FORMAT EnumFormat, UINT Flags, UINT* pNumModes, DXGI_MODE_DESC1* pDesc);
++    void NormalizeModeList(std::vector<DXGI_MODE_DESC1>& modeList) const;
++
+     
+     HRESULT STDMETHODCALLTYPE GetDisplaySurfaceData(
+             IDXGISurface*         pDestination) final;
+diff --git a/src/dxgi/dxgi_swapchain.cpp b/src/dxgi/dxgi_swapchain.cpp
+index b7d0f76..8060c19 100644
+--- a/src/dxgi/dxgi_swapchain.cpp
++++ b/src/dxgi/dxgi_swapchain.cpp
+@@ -1,3 +1,4 @@
++#include "dxgi_trace.h"
+ #include "dxgi_factory.h"
+ #include "dxgi_output.h"
+ #include "dxgi_swapchain.h"
+@@ -120,7 +121,7 @@ namespace dxvk {
+   }
+   
+   
+-  HRESULT STDMETHODCALLTYPE DxgiSwapChain::GetContainingOutput(IDXGIOutput** ppOutput) {
++  HRESULT DxgiSwapChain::GetContainingOutput_Impl(IDXGIOutput** ppOutput) {
+     InitReturnPtr(ppOutput);
+     
+     if (!wsi::isWindow(m_window))
+@@ -142,7 +143,7 @@ namespace dxvk {
+   }
+   
+   
+-  HRESULT STDMETHODCALLTYPE DxgiSwapChain::GetDesc(DXGI_SWAP_CHAIN_DESC* pDesc) {
++  HRESULT DxgiSwapChain::GetDesc_Impl(DXGI_SWAP_CHAIN_DESC* pDesc) {
+     if (!pDesc)
+       return E_INVALIDARG;
+     
+@@ -163,7 +164,7 @@ namespace dxvk {
+   }
+   
+   
+-  HRESULT STDMETHODCALLTYPE DxgiSwapChain::GetDesc1(DXGI_SWAP_CHAIN_DESC1* pDesc) {
++  HRESULT DxgiSwapChain::GetDesc1_Impl(DXGI_SWAP_CHAIN_DESC1* pDesc) {
+     if (pDesc == nullptr)
+       return E_INVALIDARG;
+     
+@@ -405,7 +406,7 @@ namespace dxvk {
+   }
+   
+   
+-  HRESULT STDMETHODCALLTYPE DxgiSwapChain::ResizeBuffers(
++  HRESULT DxgiSwapChain::ResizeBuffers_Impl(
+           UINT                      BufferCount,
+           UINT                      Width,
+           UINT                      Height,
+@@ -460,7 +461,7 @@ namespace dxvk {
+   }
+ 
+ 
+-  HRESULT STDMETHODCALLTYPE DxgiSwapChain::ResizeTarget(const DXGI_MODE_DESC* pNewTargetParameters) {
++  HRESULT DxgiSwapChain::ResizeTarget_Impl(const DXGI_MODE_DESC* pNewTargetParameters) {
+     std::lock_guard<dxvk::recursive_mutex> lock(m_lockWindow);
+ 
+     if (!pNewTargetParameters)
+@@ -518,7 +519,7 @@ namespace dxvk {
+   }
+   
+   
+-  HRESULT STDMETHODCALLTYPE DxgiSwapChain::SetFullscreenState(
++  HRESULT DxgiSwapChain::SetFullscreenState_Impl(
+           BOOL          Fullscreen,
+           IDXGIOutput*  pTarget) {
+     std::lock_guard<dxvk::recursive_mutex> lock(m_lockWindow);
+@@ -1112,4 +1113,55 @@ namespace dxvk {
+     }
+   }
+ 
++
++  HRESULT STDMETHODCALLTYPE DxgiSwapChain::GetDesc(DXGI_SWAP_CHAIN_DESC* pDesc) {
++    HRESULT hr = GetDesc_Impl(pDesc);
++    if (dxgiTraceEnabled()) {
++      if (SUCCEEDED(hr) && pDesc) dxgiTrace("SwapChain::GetDesc -> %ux%u format %d, windowed %d, buffers %u, flags %#x",
++        pDesc->BufferDesc.Width, pDesc->BufferDesc.Height, pDesc->BufferDesc.Format, pDesc->Windowed, pDesc->BufferCount, pDesc->Flags);
++    }
++    return hr;
++  }
++
++  HRESULT STDMETHODCALLTYPE DxgiSwapChain::GetDesc1(DXGI_SWAP_CHAIN_DESC1* pDesc) {
++    HRESULT hr = GetDesc1_Impl(pDesc);
++    if (dxgiTraceEnabled()) {
++      if (SUCCEEDED(hr) && pDesc) dxgiTrace("SwapChain::GetDesc1 -> %ux%u format %d, scaling %d, buffers %u, flags %#x",
++        pDesc->Width, pDesc->Height, pDesc->Format, pDesc->Scaling, pDesc->BufferCount, pDesc->Flags);
++    }
++    return hr;
++  }
++
++  HRESULT STDMETHODCALLTYPE DxgiSwapChain::ResizeBuffers(UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT NewFormat, UINT SwapChainFlags) {
++    HRESULT hr = ResizeBuffers_Impl(BufferCount, Width, Height, NewFormat, SwapChainFlags);
++    if (dxgiTraceEnabled()) {
++      dxgiTrace("SwapChain::ResizeBuffers(%u buffers, %ux%u, format %d, flags %#x) -> hr %08x", BufferCount, Width, Height, NewFormat, SwapChainFlags, hr);
++    }
++    return hr;
++  }
++
++  HRESULT STDMETHODCALLTYPE DxgiSwapChain::ResizeTarget(const DXGI_MODE_DESC* pNewTargetParameters) {
++    HRESULT hr = ResizeTarget_Impl(pNewTargetParameters);
++    if (dxgiTraceEnabled()) {
++      if (pNewTargetParameters) dxgiTrace("SwapChain::ResizeTarget(%ux%u @ %u/%u) -> hr %08x", pNewTargetParameters->Width, pNewTargetParameters->Height,
++        pNewTargetParameters->RefreshRate.Numerator, pNewTargetParameters->RefreshRate.Denominator, hr);
++    }
++    return hr;
++  }
++
++  HRESULT STDMETHODCALLTYPE DxgiSwapChain::SetFullscreenState(BOOL Fullscreen, IDXGIOutput* pTarget) {
++    HRESULT hr = SetFullscreenState_Impl(Fullscreen, pTarget);
++    if (dxgiTraceEnabled()) {
++      dxgiTrace("SwapChain::SetFullscreenState(%d, target %p) -> hr %08x", Fullscreen, (void*)pTarget, hr);
++    }
++    return hr;
++  }
++
++  HRESULT STDMETHODCALLTYPE DxgiSwapChain::GetContainingOutput(IDXGIOutput** ppOutput) {
++    HRESULT hr = GetContainingOutput_Impl(ppOutput);
++    if (dxgiTraceEnabled()) {
++      dxgiTrace("SwapChain::GetContainingOutput -> hr %08x", hr);
++    }
++    return hr;
++  }
+ }
+diff --git a/src/dxgi/dxgi_swapchain.h b/src/dxgi/dxgi_swapchain.h
+index 7becd55..f7ab7aa 100644
+--- a/src/dxgi/dxgi_swapchain.h
++++ b/src/dxgi/dxgi_swapchain.h
+@@ -56,12 +56,18 @@ namespace dxvk {
+ 
+     HRESULT STDMETHODCALLTYPE GetContainingOutput(
+             IDXGIOutput**             ppOutput) final;
++    HRESULT GetContainingOutput_Impl(IDXGIOutput** ppOutput);
++
+     
+     HRESULT STDMETHODCALLTYPE GetDesc(
+             DXGI_SWAP_CHAIN_DESC*     pDesc) final;
++    HRESULT GetDesc_Impl(DXGI_SWAP_CHAIN_DESC* pDesc);
++
+     
+     HRESULT STDMETHODCALLTYPE GetDesc1(
+             DXGI_SWAP_CHAIN_DESC1*    pDesc) final;
++    HRESULT GetDesc1_Impl(DXGI_SWAP_CHAIN_DESC1* pDesc);
++
+     
+     HRESULT STDMETHODCALLTYPE GetFullscreenState(
+             BOOL*                     pFullscreen,
+@@ -112,6 +118,8 @@ namespace dxvk {
+             UINT                      Height,
+             DXGI_FORMAT               NewFormat,
+             UINT                      SwapChainFlags) final;
++    HRESULT ResizeBuffers_Impl(UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT NewFormat, UINT SwapChainFlags);
++
+     
+     DXVK_HOTPATCHABLE
+     HRESULT STDMETHODCALLTYPE ResizeBuffers1(
+@@ -126,11 +134,15 @@ namespace dxvk {
+     DXVK_HOTPATCHABLE
+     HRESULT STDMETHODCALLTYPE ResizeTarget(
+       const DXGI_MODE_DESC*           pNewTargetParameters) final;
++    HRESULT ResizeTarget_Impl(const DXGI_MODE_DESC* pNewTargetParameters);
++
+     
+     DXVK_HOTPATCHABLE
+     HRESULT STDMETHODCALLTYPE SetFullscreenState(
+             BOOL                      Fullscreen,
+             IDXGIOutput*              pTarget) final;
++    HRESULT SetFullscreenState_Impl(BOOL Fullscreen, IDXGIOutput* pTarget);
++
+     
+     HRESULT STDMETHODCALLTYPE SetBackgroundColor(
+       const DXGI_RGBA*                pColor) final;
+diff --git a/src/dxgi/dxgi_trace.h b/src/dxgi/dxgi_trace.h
+new file mode 100644
+index 0000000..78be079
+--- /dev/null
++++ b/src/dxgi/dxgi_trace.h
+@@ -0,0 +1,37 @@
++#pragma once
++// Diagnostics: DXVK_DXGI_TRACE=1 (or an existing C:\gfx-dxgi.trace file) logs every display/swapchain-related DXGI call made by the application, with its
++// arguments and results, to C:\gfx-dxgi.log (capped at 20000 lines).
++#include <cstdio>
++#include <cstdarg>
++#include <mutex>
++#include "../util/util_env.h"
++
++namespace dxvk {
++
++  inline bool dxgiTraceEnabled() {
++    static int e = -1;
++    if (e < 0) {
++      e = env::getEnvVar("DXVK_DXGI_TRACE") == "1" ? 1 : 0;
++      if (!e) { if (FILE* t = std::fopen("C:\\gfx-dxgi.trace", "r")) { std::fclose(t); e = 1; } }
++    }
++    return e != 0;
++  }
++
++  inline void dxgiTrace(const char* fmt, ...) {
++    if (!dxgiTraceEnabled()) return;
++    static std::mutex m;
++    static FILE* f = nullptr;
++    static unsigned n = 0;
++    std::lock_guard<std::mutex> g(m);
++    if (n++ > 20000) return;
++    if (!f) f = std::fopen("C:\\gfx-dxgi.log", "a");
++    if (!f) return;
++    va_list ap;
++    va_start(ap, fmt);
++    std::vfprintf(f, fmt, ap);
++    va_end(ap);
++    std::fputc('\n', f);
++    std::fflush(f);
++  }
++
++}
+diff --git a/src/dxvk/dxvk_device_info.cpp b/src/dxvk/dxvk_device_info.cpp
+index 6e821e9..e7df087 100644
+--- a/src/dxvk/dxvk_device_info.cpp
++++ b/src/dxvk/dxvk_device_info.cpp
+@@ -8,6 +8,8 @@
+ #include "dxvk_instance.h"
+ #include "dxvk_limits.h"
+ 
++#include "../util/util_env.h"
++
+ namespace dxvk {
+ 
+   #define CORE_VERSIONS                            \
+@@ -786,8 +788,18 @@ namespace dxvk {
+     if (m_queueMapping.graphics.family == VK_QUEUE_FAMILY_IGNORED)
+       return std::string("Device does not have a graphics queue");
+ 
++    // Dev hack: DXVK_RELAX_CAPS=1 lets the adapter through even if D3D11-only features are missing.
++    // Used when only dxgi.dll is needed to front vkd3d-proton (e.g. on MoltenVK, which lacks geometry shaders).
++    const std::string relax = env::getEnvVar("DXVK_RELAX_CAPS");
++    const bool relaxCaps = !relax.empty() && relax != "0";
++
+     for (const auto& f : getFeatureList()) {
+       if (f.featureRequired && !(*f.featureEnabled)) {
++        if (relaxCaps) {
++          Logger::warn(str::format("DXVK_RELAX_CAPS: ignoring missing required feature '", f.readableName, "'"));
++          continue;
++        }
++
+         std::string message = str::format("Device does not support required feature '", f.readableName, "'");
+ 
+         if (f.extensionEnabled)
+@@ -797,7 +809,7 @@ namespace dxvk {
+       }
+     }
+ 
+-    if (!m_featuresEnabled.extDescriptorHeap.descriptorHeap && m_properties.core.properties.limits.maxPushConstantsSize < MaxTotalPushDataSize)
++    if (!relaxCaps && !m_featuresEnabled.extDescriptorHeap.descriptorHeap && m_properties.core.properties.limits.maxPushConstantsSize < MaxTotalPushDataSize)
+       return str::format("Device does not support ", MaxTotalPushDataSize, " of push data");
+ 
+     return std::nullopt;

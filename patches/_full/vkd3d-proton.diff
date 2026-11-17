@@ -1,0 +1,2543 @@
+diff --git a/include/private/vkd3d_debug.h b/include/private/vkd3d_debug.h
+index 90e7a36..3ac649c 100644
+--- a/include/private/vkd3d_debug.h
++++ b/include/private/vkd3d_debug.h
+@@ -72,6 +72,13 @@ void vkd3d_dbg_printf(enum vkd3d_dbg_channel channel, enum vkd3d_dbg_level level
+         const char *fmt, ...) VKD3D_PRINTF_FUNC(4, 5);
+ void vkd3d_dbg_flush(void);
+ 
++/* Always-on, deduplicated failure log shared with MoltenVK. VKD3D_FAILURE_LOG = path or "0";
++ * default C:\\gfx-failures.log. */
++bool vkd3d_failure_log_enabled(void);
++void vkd3d_start_thread_sampler(void);
++bool vkd3d_diagnostics_enabled(void);
++void vkd3d_failure_log(const char *category, const char *fmt, ...) VKD3D_PRINTF_FUNC(2, 3);
++
+ #define VKD3D_DEBUG_BUFFER_SIZE 512
+ char *vkd3d_dbg_get_buffer(void);
+ 
+diff --git a/libs/vkd3d-common/debug.c b/libs/vkd3d-common/debug.c
+index 32503a8..e0dec0c 100644
+--- a/libs/vkd3d-common/debug.c
++++ b/libs/vkd3d-common/debug.c
+@@ -172,12 +172,244 @@ void vkd3d_dbg_flush(void)
+     }
+ }
+ 
++/* Failure log. */
++struct vkd3d_failure_entry
++{
++    uint32_t hash;
++    uint32_t count;
++    uint32_t reported;
++    char key[160];
++};
++
++#define VKD3D_FAILURE_ENTRIES 1024
++static struct vkd3d_failure_entry *vkd3d_failure_entries;
++static pthread_once_t vkd3d_failure_once = PTHREAD_ONCE_INIT;
++static spinlock_t vkd3d_failure_spin;
++static uint64_t vkd3d_failure_last_summary_ns;
++#ifdef _WIN32
++static HANDLE vkd3d_failure_file = INVALID_HANDLE_VALUE;
++#else
++static FILE *vkd3d_failure_file;
++#endif
++
++static void vkd3d_failure_write(const char *str, size_t len)
++{
++#ifdef _WIN32
++    DWORD written;
++    if (vkd3d_failure_file != INVALID_HANDLE_VALUE)
++        WriteFile(vkd3d_failure_file, str, (DWORD)len, &written, NULL);
++#else
++    if (vkd3d_failure_file)
++    {
++        fwrite(str, 1, len, vkd3d_failure_file);
++        fflush(vkd3d_failure_file);
++    }
++#endif
++}
++
++static void vkd3d_failure_writef(const char *category, const char *fmt, ...) VKD3D_PRINTF_FUNC(2, 3);
++
++static void vkd3d_failure_write_line(const char *category, const char *msg, uint32_t occurrence)
++{
++    char line[2048];
++    size_t len = 0;
++    int lines = 0;
++    const char *p;
++#ifdef _WIN32
++    SYSTEMTIME st;
++    char exe[MAX_PATH] = "?";
++    const char *exe_name;
++    GetLocalTime(&st);
++    GetModuleFileNameA(NULL, exe, sizeof(exe));
++    exe_name = strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe;
++    len = snprintf(line, sizeof(line), "%02u:%02u:%02u.%03u vkd3d[%s:%04lx] %s: ", st.wHour, st.wMinute, st.wSecond,
++            st.wMilliseconds, exe_name, (unsigned long)GetCurrentProcessId(), category);
++#else
++    len = snprintf(line, sizeof(line), "vkd3d %s: ", category);
++#endif
++    if (occurrence > 1 && len < sizeof(line))
++        len += snprintf(line + len, sizeof(line) - len, "[#%u] ", occurrence);
++    for (p = msg; *p && len + 8 < sizeof(line); p++)
++    {
++        if (*p == '\n')
++        {
++            if (!p[1])
++                break;
++            if (++lines >= 8)
++                break;
++            memcpy(line + len, "\n    ", 5);
++            len += 5;
++            continue;
++        }
++        line[len++] = *p;
++    }
++    line[len++] = '\n';
++    vkd3d_failure_write(line, len);
++}
++
++static void vkd3d_failure_writef(const char *category, const char *fmt, ...)
++{
++    char msg[512];
++    va_list args;
++    va_start(args, fmt);
++    vsnprintf(msg, sizeof(msg), fmt, args);
++    va_end(args);
++    vkd3d_failure_write_line(category, msg, 1);
++}
++
++static void vkd3d_failure_init_once(void)
++{
++    char path[MAX_PATH];
++
++    if (vkd3d_get_env_var("VKD3D_FAILURE_LOG", path, sizeof(path)))
++    {
++        if (!strcmp(path, "0") || !strcmp(path, "off"))
++            return;
++    }
++    else
++    {
++        strcpy(path, "C:\\gfx-failures.log");
++    }
++#ifdef _WIN32
++    vkd3d_failure_file = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++            NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
++    if (vkd3d_failure_file == INVALID_HANDLE_VALUE)
++        return;
++#else
++    if (!(vkd3d_failure_file = fopen(path, "a")))
++        return;
++#endif
++    vkd3d_failure_entries = calloc(VKD3D_FAILURE_ENTRIES, sizeof(*vkd3d_failure_entries));
++    vkd3d_failure_last_summary_ns = vkd3d_get_current_time_ns();
++    vkd3d_failure_writef("process", "vkd3d-proton loaded");
++}
++
++bool vkd3d_failure_log_enabled(void)
++{
++    pthread_once(&vkd3d_failure_once, vkd3d_failure_init_once);
++    return vkd3d_failure_entries != NULL;
++}
++
++/* Collapses numbers and hex so failures that differ only in handles or sizes share one entry. */
++static uint32_t vkd3d_failure_make_key(const char *category, const char *msg, char *key, size_t key_size)
++{
++    uint32_t hash = 2166136261u;
++    size_t len = 0;
++    const char *p;
++
++    for (p = category; *p && len + 2 < key_size; p++)
++        key[len++] = *p;
++    key[len++] = ':';
++    for (p = msg; *p && *p != '\n' && len + 1 < key_size; p++)
++    {
++        if (p[0] == '0' && p[1] == 'x')
++        {
++            key[len++] = '#';
++            p += 2;
++            while (isxdigit((unsigned char)*p))
++                p++;
++            p--;
++            continue;
++        }
++        if (isdigit((unsigned char)*p))
++        {
++            key[len++] = '#';
++            while (isdigit((unsigned char)p[1]))
++                p++;
++            continue;
++        }
++        key[len++] = *p;
++    }
++    key[len] = '\0';
++    for (p = key; *p; p++)
++        hash = (hash ^ (uint8_t)*p) * 16777619u;
++    return hash;
++}
++
++static void vkd3d_failure_log_message(const char *category, const char *msg)
++{
++    struct vkd3d_failure_entry *entry = NULL;
++    char key[160];
++    uint32_t hash, i, occurrence;
++    uint64_t now;
++
++    if (!vkd3d_failure_log_enabled())
++        return;
++
++    hash = vkd3d_failure_make_key(category, msg, key, sizeof(key));
++
++    spinlock_acquire(&vkd3d_failure_spin);
++    for (i = 0; i < VKD3D_FAILURE_ENTRIES; i++)
++    {
++        struct vkd3d_failure_entry *e = &vkd3d_failure_entries[(hash + i) % VKD3D_FAILURE_ENTRIES];
++        if (!e->count)
++        {
++            e->hash = hash;
++            strcpy(e->key, key);
++            entry = e;
++            break;
++        }
++        if (e->hash == hash && !strcmp(e->key, key))
++        {
++            entry = e;
++            break;
++        }
++    }
++    occurrence = entry ? ++entry->count : 1;
++    if (entry && occurrence <= 3)
++        entry->reported = occurrence;
++
++    now = vkd3d_get_current_time_ns();
++    if (now - vkd3d_failure_last_summary_ns > 10000000000ull)
++    {
++        vkd3d_failure_last_summary_ns = now;
++        for (i = 0; i < VKD3D_FAILURE_ENTRIES; i++)
++        {
++            struct vkd3d_failure_entry *e = &vkd3d_failure_entries[i];
++            if (e->count > e->reported)
++            {
++                vkd3d_failure_writef("repeat", "+%u more: %s", e->count - e->reported, e->key);
++                e->reported = e->count;
++            }
++        }
++    }
++    spinlock_release(&vkd3d_failure_spin);
++
++    if (occurrence <= 3)
++        vkd3d_failure_write_line(category, msg, occurrence);
++}
++
++void vkd3d_failure_log(const char *category, const char *fmt, ...)
++{
++    char msg[2048];
++    va_list args;
++
++    if (!vkd3d_failure_log_enabled())
++        return;
++    va_start(args, fmt);
++    vsnprintf(msg, sizeof(msg), fmt, args);
++    va_end(args);
++    vkd3d_failure_log_message(category, msg);
++}
++
+ void vkd3d_dbg_printf(enum vkd3d_dbg_channel channel, enum vkd3d_dbg_level level, const char *function, const char *fmt, ...)
+ {
+     unsigned int tid;
+     FILE *log_file;
+     va_list args;
+ 
++    /* Mirror errors and FIXMEs (unimplemented paths) into the failure log, regardless of VKD3D_DEBUG. */
++    if ((level == VKD3D_DBG_LEVEL_ERR || level == VKD3D_DBG_LEVEL_FIXME) && vkd3d_failure_log_enabled())
++    {
++        char msg[2048];
++        int n = snprintf(msg, sizeof(msg), "%s: ", function);
++        va_start(args, fmt);
++        if (n > 0 && n < (int)sizeof(msg))
++            vsnprintf(msg + n, sizeof(msg) - n, fmt, args);
++        va_end(args);
++        vkd3d_failure_log_message(level == VKD3D_DBG_LEVEL_ERR ? "error" : "fixme", msg);
++    }
++
+     if (vkd3d_dbg_get_level(channel) < level)
+         return;
+     assert(level < ARRAY_SIZE(debug_level_names));
+@@ -479,3 +711,254 @@ union vkd3d_config_flags vkd3d_parse_debug_options(const char *string,
+ 
+     return flags;
+ }
++
++#ifdef _WIN32
++/* In-process thread sampler (diagnostics; needs VKD3D_DIAGNOSTICS=1, VKD3D_THREAD_SAMPLER=0 disables).
++ * At 60 s and 150 s after the first D3D12 device, every thread of this process is briefly suspended; its
++ * registers and the top of its stack are copied into preallocated memory (no locks or allocations while a
++ * thread is suspended), then it is resumed. Return-address candidates that point into executable module code
++ * are written as module+offset (nearest export when available) to C:\gfx-threads.log. Unlike attaching a
++ * debugger, this is invisible to anti-debug checks. */
++#include <tlhelp32.h>
++
++#define VKD3D_SAMPLER_STACK_BYTES (64 * 1024)
++#define VKD3D_SAMPLER_MAX_FRAMES 28
++
++static const char *vkd3d_sampler_export_name(HMODULE mod, uintptr_t addr, uintptr_t *offset)
++{
++    const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)mod;
++    const IMAGE_NT_HEADERS64 *nt;
++    const IMAGE_EXPORT_DIRECTORY *exp;
++    const DWORD *funcs, *names;
++    const WORD *ords;
++    const char *best = NULL;
++    uintptr_t base = (uintptr_t)mod, best_rva = 0, rva = addr - base;
++    DWORD i, size;
++
++    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
++        return NULL;
++    nt = (const IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
++    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT)
++        return NULL;
++    size = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
++    if (!size)
++        return NULL;
++    exp = (const IMAGE_EXPORT_DIRECTORY *)(base + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
++    funcs = (const DWORD *)(base + exp->AddressOfFunctions);
++    names = (const DWORD *)(base + exp->AddressOfNames);
++    ords = (const WORD *)(base + exp->AddressOfNameOrdinals);
++    for (i = 0; i < exp->NumberOfNames; i++)
++    {
++        DWORD f = funcs[ords[i]];
++        if (f <= rva && f > best_rva)
++        {
++            best_rva = f;
++            best = (const char *)(base + names[i]);
++        }
++    }
++    if (best)
++        *offset = rva - best_rva;
++    return best;
++}
++
++static bool vkd3d_sampler_is_code(uintptr_t addr)
++{
++    MEMORY_BASIC_INFORMATION mbi;
++    if (addr < 0x10000 || !VirtualQuery((void *)addr, &mbi, sizeof(mbi)))
++        return false;
++    return mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE &&
++            (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
++}
++
++static void vkd3d_sampler_describe(uintptr_t addr, char *out, size_t out_size)
++{
++    char path[MAX_PATH], *name;
++    const char *exp;
++    uintptr_t exp_off = 0;
++    HMODULE mod = NULL;
++
++    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++            (const char *)addr, &mod) || !mod)
++    {
++        snprintf(out, out_size, "%#" PRIxPTR, addr);
++        return;
++    }
++    GetModuleFileNameA(mod, path, sizeof(path));
++    name = strrchr(path, '\\');
++    name = name ? name + 1 : path;
++    if ((exp = vkd3d_sampler_export_name(mod, addr, &exp_off)) && exp_off < 0x4000)
++        snprintf(out, out_size, "%s!%s+%#" PRIxPTR, name, exp, exp_off);
++    else
++        snprintf(out, out_size, "%s+%#" PRIxPTR, name, addr - (uintptr_t)mod);
++}
++
++typedef struct
++{
++    LONG ExitStatus;
++    void *TebBaseAddress;
++    void *UniqueProcess;
++    void *UniqueThread;
++    ULONG_PTR AffinityMask;
++    LONG Priority;
++    LONG BasePriority;
++} VKD3D_THREAD_BASIC_INFORMATION;
++typedef LONG (WINAPI *PFN_NtQueryInformationThread)(HANDLE, int, void *, ULONG, ULONG *);
++
++static void vkd3d_sampler_dump(FILE *f, int pass)
++{
++    static uint64_t stack[VKD3D_SAMPLER_STACK_BYTES / 8];
++    PFN_NtQueryInformationThread query_thread = (PFN_NtQueryInformationThread)(void *)GetProcAddress(
++            GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
++    DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
++    char exe[MAX_PATH] = "?";
++    THREADENTRY32 te;
++    HANDLE snap;
++    char desc[300];
++
++    GetModuleFileNameA(NULL, exe, sizeof(exe));
++    fprintf(f, "==== thread snapshot %d (%s, pid %#lx) ====\n", pass, strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe, (unsigned long)pid);
++    if ((snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)) == INVALID_HANDLE_VALUE)
++        return;
++    te.dwSize = sizeof(te);
++    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te))
++    {
++        CONTEXT ctx;
++        MEMORY_BASIC_INFORMATION mbi;
++        uintptr_t frames[VKD3D_SAMPLER_MAX_FRAMES];
++        size_t nwords = 0, nframes = 0, i;
++        DWORD susp = (DWORD)-1, err_susp = 0, err_ctx = 0;
++        BOOL got_ctx = FALSE, approximate = FALSE;
++        PWSTR wname = NULL;
++        HANDLE th;
++
++        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self)
++            continue;
++        if (!(th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID)))
++        {
++            fprintf(f, "-- thread %#lx: OpenThread failed (%lu)\n", (unsigned long)te.th32ThreadID, (unsigned long)GetLastError());
++            continue;
++        }
++        memset(&ctx, 0, sizeof(ctx));
++        ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
++        susp = SuspendThread(th);
++        if (susp == (DWORD)-1)
++            err_susp = GetLastError();
++        else
++        {
++            got_ctx = GetThreadContext(th, &ctx);
++            if (!got_ctx)
++                err_ctx = GetLastError();
++            if (got_ctx && ctx.Rsp && VirtualQuery((void *)ctx.Rsp, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT)
++            {
++                uintptr_t end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
++                size_t bytes = end - ctx.Rsp;
++                if (bytes > sizeof(stack))
++                    bytes = sizeof(stack);
++                memcpy(stack, (const void *)ctx.Rsp, bytes);
++                nwords = bytes / 8;
++            }
++            ResumeThread(th);
++        }
++        /* Fallback without suspension: stack bounds from the TEB, scan the top 16 KiB below StackBase. */
++        if (!nwords && query_thread)
++        {
++            VKD3D_THREAD_BASIC_INFORMATION tbi;
++            memset(&tbi, 0, sizeof(tbi));
++            if (query_thread(th, 0 /* ThreadBasicInformation */, &tbi, sizeof(tbi), NULL) >= 0 && tbi.TebBaseAddress)
++            {
++                const NT_TIB *tib = (const NT_TIB *)tbi.TebBaseAddress;
++                uintptr_t base = (uintptr_t)tib->StackBase, limit = (uintptr_t)tib->StackLimit;
++                uintptr_t start = base - 16384 > limit ? base - 16384 : limit;
++                if (base > start && VirtualQuery((void *)start, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT)
++                {
++                    size_t bytes = base - start;
++                    memcpy(stack, (const void *)start, bytes);
++                    nwords = bytes / 8;
++                    approximate = TRUE;
++                }
++            }
++        }
++        if (got_ctx && ctx.Rip && vkd3d_sampler_is_code(ctx.Rip))
++            frames[nframes++] = ctx.Rip;
++        for (i = 0; i < nwords && nframes < VKD3D_SAMPLER_MAX_FRAMES; i++)
++            if (vkd3d_sampler_is_code(stack[i]))
++                frames[nframes++] = stack[i];
++        desc[0] = '\0';
++        if (SUCCEEDED(GetThreadDescription(th, &wname)) && wname && wname[0])
++            WideCharToMultiByte(CP_UTF8, 0, wname, -1, desc, sizeof(desc), NULL, NULL);
++        if (wname)
++            LocalFree(wname);
++        CloseHandle(th);
++        fprintf(f, "-- thread %#lx%s%s%s", (unsigned long)te.th32ThreadID, desc[0] ? " \"" : "", desc, desc[0] ? "\"" : "");
++        if (susp == (DWORD)-1)
++            fprintf(f, " [suspend failed %lu]", (unsigned long)err_susp);
++        else if (!got_ctx)
++            fprintf(f, " [context failed %lu]", (unsigned long)err_ctx);
++        else if (!ctx.Rsp)
++            fprintf(f, " [context empty]");
++        if (approximate)
++            fprintf(f, " [approximate: TEB stack scan]");
++        fprintf(f, "\n");
++        for (i = 0; i < nframes; i++)
++        {
++            char where[300];
++            vkd3d_sampler_describe(frames[i], where, sizeof(where));
++            fprintf(f, "   %s\n", where);
++        }
++    }
++    CloseHandle(snap);
++    fflush(f);
++}
++
++static DWORD WINAPI vkd3d_sampler_thread(void *arg)
++{
++    static const DWORD delays_ms[] = { 60000, 90000 };
++    char path[MAX_PATH];
++    FILE *f;
++    int pass;
++
++    (void)arg;
++    snprintf(path, sizeof(path), "C:\\gfx-threads.log");
++    for (pass = 0; pass < 2; pass++)
++    {
++        Sleep(delays_ms[pass]);
++        if (!(f = fopen(path, "a")))
++            return 0;
++        vkd3d_sampler_dump(f, pass + 1);
++        fclose(f);
++        vkd3d_failure_log("thread-sampler", "thread snapshot %d written to %s", pass + 1, path);
++    }
++    return 0;
++}
++
++/* Master switch for the black-screen diagnostics (fence/queue reports, backbuffer-draw logger, event recording,
++ * GPU readback, thread sampler). Off by default; VKD3D_DIAGNOSTICS=1 enables. */
++bool vkd3d_diagnostics_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled < 0)
++    {
++        char env[16];
++        enabled = vkd3d_get_env_var("VKD3D_DIAGNOSTICS", env, sizeof(env)) && env[0] == '1';
++    }
++    return enabled;
++}
++
++void vkd3d_start_thread_sampler(void)
++{
++    static LONG started;
++    char env[16];
++    HANDLE t;
++
++    if (!vkd3d_diagnostics_enabled() || (vkd3d_get_env_var("VKD3D_THREAD_SAMPLER", env, sizeof(env)) && env[0] == '0'))
++        return;
++    if (InterlockedExchange(&started, 1))
++        return;
++    if ((t = CreateThread(NULL, 0, vkd3d_sampler_thread, NULL, 0, NULL)))
++        CloseHandle(t);
++}
++#else
++void vkd3d_start_thread_sampler(void)
++{
++}
++#endif
+diff --git a/libs/vkd3d/cache.c b/libs/vkd3d/cache.c
+index 14a5755..80f5cf9 100644
+--- a/libs/vkd3d/cache.c
++++ b/libs/vkd3d/cache.c
+@@ -345,6 +345,45 @@ static uint32_t d3d12_cached_pipeline_state_to_flags(const struct d3d12_cached_p
+     return pipeline_library_flags;
+ }
+ 
++/* Diagnostics: one raw line per rejected cached PSO blob in C:\\gfx-pso-mismatch.log (never collapsed), with the
++ * requested and stored state hashes and whether root signature and shaders match, so a game's own cache file can be
++ * cross-checked offline. VKD3D_PSO_MISMATCH_LOG=0 disables. */
++static void vkd3d_pso_mismatch_record(const struct vkd3d_pipeline_cache_compatibility *want,
++        const struct vkd3d_pipeline_cache_compatibility *have)
++{
++#ifdef _WIN32
++    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++    static FILE *f;
++    static int enabled = -1;
++    unsigned int i, same_shaders = 1;
++    char env[16];
++
++    if (enabled < 0)
++        enabled = !(vkd3d_get_env_var("VKD3D_PSO_MISMATCH_LOG", env, sizeof(env)) && env[0] == '0');
++    if (!enabled)
++        return;
++    for (i = 0; i < ARRAY_SIZE(want->dxbc_blob_hashes); i++)
++        if (want->dxbc_blob_hashes[i] != have->dxbc_blob_hashes[i])
++            same_shaders = 0;
++    pthread_mutex_lock(&lock);
++    if (!f)
++        f = fopen("C:\\gfx-pso-mismatch.log", "a");
++    if (f)
++    {
++        fprintf(f, "want %016"PRIx64" have %016"PRIx64" rootsig %s shaders %s |", want->state_desc_compat_hash,
++                have->state_desc_compat_hash, want->root_signature_compat_hash == have->root_signature_compat_hash ? "same" : "DIFF",
++                same_shaders ? "same" : "DIFF");
++        for (i = 0; i < ARRAY_SIZE(want->dxbc_blob_hashes); i++)
++            fprintf(f, " %016"PRIx64, want->dxbc_blob_hashes[i]);
++        fprintf(f, " | rs %016"PRIx64"\n", want->root_signature_compat_hash);
++        fflush(f);
++    }
++    pthread_mutex_unlock(&lock);
++#else
++    (void)want; (void)have;
++#endif
++}
++
+ HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
+         const struct d3d12_cached_pipeline_state *state,
+         const struct vkd3d_pipeline_cache_compatibility *compat)
+@@ -455,10 +494,13 @@ HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
+     /* Verify the expected PSO state that was used. This must match, or we have to fail compilation as per API spec. */
+     if (compat->state_desc_compat_hash != pso_compat->compat.state_desc_compat_hash)
+     {
++        vkd3d_pso_mismatch_record(compat, &pso_compat->compat);
+         if (VKD3D_CONFIG_FLAG_IS_SET(PIPELINE_LIBRARY_LOG))
+             INFO("PSO compatibility hash mismatch.\n");
+         else
+             WARN("PSO compatibility hash mismatch.\n");
++        vkd3d_failure_log("info", "cached PSO blob rejected: it was saved for a PSO with a different description "
++                "(E_INVALIDARG, as D3D12 requires); see the pso-retry lines for whether the game rebuilds it");
+         return E_INVALIDARG;
+     }
+ 
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index b4d0976..c4832b5 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -32,6 +32,32 @@ static HRESULT d3d12_fence_signal(struct d3d12_fence *fence, struct vkd3d_fence_
+ static void d3d12_command_queue_add_submission(struct d3d12_command_queue *queue,
+         const struct d3d12_command_queue_submission *sub);
+ static void d3d12_fence_inc_ref(struct d3d12_fence *fence);
++enum vkd3d_diag_event_kind { DIAG_EV_RT = 1, DIAG_EV_BARRIER, DIAG_EV_ALIAS, DIAG_EV_UAVB, DIAG_EV_CLEAR_RTV, DIAG_EV_CLEAR_UAV,
++        DIAG_EV_DISCARD, DIAG_EV_COPY_DST, DIAG_EV_DISPATCH, DIAG_EV_DISPATCH_RES, DIAG_EV_DRAW };
++static void d3d12_command_list_diag_event(struct d3d12_command_list *list, unsigned int kind, unsigned int sub,
++        const void *res, uint32_t a, uint32_t b)
++{
++    unsigned int i;
++    if (!vkd3d_diagnostics_enabled())
++        return;
++    if (list->diag_ev_count && list->diag_ev[(list->diag_ev_count - 1) % 64].kind == DIAG_EV_DRAW && kind == DIAG_EV_DRAW)
++    {
++        list->diag_ev[(list->diag_ev_count - 1) % 64].a++;
++        return;
++    }
++    i = list->diag_ev_count++ % 64;
++    list->diag_ev[i].kind = kind; list->diag_ev[i].sub = sub; list->diag_ev[i].res = res;
++    list->diag_ev[i].a = a; list->diag_ev[i].b = b;
++    list->diag_ev[i].w = list->diag_ev[i].h = list->diag_ev[i].fmt = 0;
++    list->diag_ev[i].heap = NULL; list->diag_ev[i].off = 0;
++    if (res && kind != DIAG_EV_DISPATCH_RES)
++    {
++        const struct d3d12_resource *r = res; /* live: the caller just got it from the application */
++        list->diag_ev[i].w = (uint32_t)r->desc.Width; list->diag_ev[i].h = r->desc.Height;
++        list->diag_ev[i].fmt = r->desc.Format; list->diag_ev[i].heap = r->heap; list->diag_ev[i].off = r->mem.offset;
++    }
++}
++
+ static void d3d12_fence_dec_ref(struct d3d12_fence *fence);
+ static void d3d12_shared_fence_inc_ref(struct d3d12_shared_fence *fence);
+ static void d3d12_shared_fence_dec_ref(struct d3d12_shared_fence *fence);
+@@ -880,12 +906,127 @@ static void d3d12_fence_inc_ref(struct d3d12_fence *fence)
+     InterlockedIncrement(&fence->refcount_internal);
+ }
+ 
++/* Fence stall diagnostics: every live fence is registered; vkd3d_fence_stall_report() (called from Present)
++ * logs CPU waits (SetEventOnCompletion) and queue Waits pending for 5 s or more, and fences polled in a
++ * loop (GetCompletedValue) whose value does not move. Disabled with VKD3D_FENCE_STALL_LOG=0. */
++static pthread_mutex_t vkd3d_queue_diag_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct list vkd3d_queue_diag_list = LIST_INIT(vkd3d_queue_diag_list);
++static uint32_t vkd3d_queue_diag_next_id;
++static uint64_t vkd3d_queue_diag_last_report;
++static pthread_mutex_t vkd3d_fence_diag_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct list vkd3d_fence_diag_list = LIST_INIT(vkd3d_fence_diag_list);
++static uint32_t vkd3d_fence_diag_next_id;
++static uint64_t vkd3d_fence_diag_last_report;
++
++static bool vkd3d_fence_diag_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled < 0)
++    {
++        char env[16];
++        enabled = vkd3d_diagnostics_enabled() && !(vkd3d_get_env_var("VKD3D_FENCE_STALL_LOG", env, sizeof(env)) && env[0] == '0');
++    }
++    return enabled;
++}
++
++static void vkd3d_fence_diag_register(struct d3d12_fence *fence)
++{
++    pthread_mutex_lock(&vkd3d_fence_diag_lock);
++    fence->diag_id = ++vkd3d_fence_diag_next_id;
++    list_add_tail(&vkd3d_fence_diag_list, &fence->diag_entry);
++    pthread_mutex_unlock(&vkd3d_fence_diag_lock);
++}
++
++static void vkd3d_fence_diag_unregister(struct d3d12_fence *fence)
++{
++    pthread_mutex_lock(&vkd3d_fence_diag_lock);
++    list_remove(&fence->diag_entry);
++    pthread_mutex_unlock(&vkd3d_fence_diag_lock);
++}
++
++void vkd3d_fence_stall_report(void)
++{
++    enum { MAX_LINES = 12 };
++    static const uint64_t stall_ns = 5000000000ull;
++    char lines[MAX_LINES][256];
++    unsigned int line_count = 0, i;
++    uint64_t now, interval;
++    struct d3d12_fence *fence;
++    size_t j;
++
++    if (!vkd3d_fence_diag_enabled())
++        return;
++    now = vkd3d_get_current_time_ns();
++    pthread_mutex_lock(&vkd3d_fence_diag_lock);
++    interval = now - vkd3d_fence_diag_last_report;
++    if (!vkd3d_fence_diag_last_report || interval < 10000000000ull)
++    {
++        if (!vkd3d_fence_diag_last_report)
++        {
++            vkd3d_fence_diag_last_report = now;
++            LIST_FOR_EACH_ENTRY(fence, &vkd3d_fence_diag_list, struct d3d12_fence, diag_entry)
++                InterlockedExchange(&fence->diag_polls, 0);
++        }
++        pthread_mutex_unlock(&vkd3d_fence_diag_lock);
++        return;
++    }
++    vkd3d_fence_diag_last_report = now;
++
++    LIST_FOR_EACH_ENTRY(fence, &vkd3d_fence_diag_list, struct d3d12_fence, diag_entry)
++    {
++        uint64_t value, pending_max, cpu_oldest = 0, cpu_value = 0, gpu_oldest = 0, gpu_value = 0;
++        unsigned int cpu_stalled = 0, gpu_stalled = 0;
++        LONG polls = InterlockedExchange(&fence->diag_polls, 0);
++
++        pthread_mutex_lock(&fence->mutex);
++        value = fence->virtual_value;
++        pending_max = fence->max_pending_virtual_timeline_value;
++        for (j = 0; j < fence->event_count; j++)
++        {
++            const struct vkd3d_waiting_event *e = &fence->events[j];
++            if (e->diag_start_ns && now - e->diag_start_ns >= stall_ns && e->value > value)
++            {
++                cpu_stalled++;
++                if (now - e->diag_start_ns > cpu_oldest) { cpu_oldest = now - e->diag_start_ns; cpu_value = e->value; }
++            }
++        }
++        for (j = 0; j < fence->wait_tickets_count; j++)
++        {
++            const struct vkd3d_fence_wait_ticket *t = &fence->wait_tickets[j];
++            if (t->diag_start_ns && now - t->diag_start_ns >= stall_ns && t->virtual_value > value)
++            {
++                gpu_stalled++;
++                if (now - t->diag_start_ns > gpu_oldest) { gpu_oldest = now - t->diag_start_ns; gpu_value = t->virtual_value; }
++            }
++        }
++        pthread_mutex_unlock(&fence->mutex);
++
++        if (cpu_stalled && line_count < MAX_LINES)
++            snprintf(lines[line_count++], sizeof(lines[0]), "fence %u: %u CPU wait(s) pending, oldest %.0f s for value %"PRIu64
++                    "; fence at %"PRIu64", highest signal submitted %"PRIu64"%s", fence->diag_id, cpu_stalled, cpu_oldest / 1e9,
++                    cpu_value, value, pending_max, cpu_value > pending_max ? " (no signal for it was ever submitted)" : "");
++        if (gpu_stalled && line_count < MAX_LINES)
++            snprintf(lines[line_count++], sizeof(lines[0]), "fence %u: %u queue Wait(s) pending, oldest %.0f s for value %"PRIu64
++                    "; fence at %"PRIu64", highest signal submitted %"PRIu64"%s", fence->diag_id, gpu_stalled, gpu_oldest / 1e9,
++                    gpu_value, value, pending_max, gpu_value > pending_max ? " (no signal for it was ever submitted)" : "");
++        if (polls >= 100 && value == fence->diag_last_value && line_count < MAX_LINES)
++            snprintf(lines[line_count++], sizeof(lines[0]), "fence %u: polled %ld times in %.0f s with its value stuck at %"PRIu64
++                    " (highest signal submitted %"PRIu64")", fence->diag_id, (long)polls, interval / 1e9, value, pending_max);
++        fence->diag_last_value = value;
++    }
++    pthread_mutex_unlock(&vkd3d_fence_diag_lock);
++
++    for (i = 0; i < line_count; i++)
++        vkd3d_failure_log("fence-stall", "%s", lines[i]);
++}
++
+ static void d3d12_fence_dec_ref(struct d3d12_fence *fence)
+ {
+     ULONG refcount_internal = InterlockedDecrement(&fence->refcount_internal);
+ 
+     if (!refcount_internal)
+     {
++        vkd3d_fence_diag_unregister(fence);
+         d3d_destruction_notifier_free(&fence->destruction_notifier);
+         vkd3d_private_store_destroy(&fence->private_store);
+         d3d12_fence_destroy_vk_objects(fence);
+@@ -1221,6 +1362,7 @@ uint64_t d3d12_fence_register_pending_gpu_wait(struct d3d12_fence *fence, uint64
+ 
+         wait_ticket = &fence->wait_tickets[fence->wait_tickets_count++];
+         wait_ticket->ticket = ticket;
++        wait_ticket->diag_start_ns = vkd3d_get_current_time_ns();
+         wait_ticket->virtual_value = value;
+     }
+ 
+@@ -1404,6 +1546,8 @@ static UINT64 STDMETHODCALLTYPE d3d12_fence_GetCompletedValue(d3d12_fence_iface
+     }
+     completed_value = fence->virtual_value;
+     pthread_mutex_unlock(&fence->mutex);
++    if (vkd3d_diagnostics_enabled())
++        InterlockedIncrement(&fence->diag_polls);
+ 
+     /* A removed device reports UINT64_MAX, even for fences without a signal in flight. */
+     if (d3d12_device_removed_unblocks_fences(fence->device))
+@@ -1432,6 +1576,7 @@ static HRESULT d3d12_fence_set_native_sync_handle_on_completion_explicit(struct
+     event.handle = handle;
+     event.latch = &latch;
+     event.payload = payload;
++    event.diag_start_ns = vkd3d_get_current_time_ns();
+ 
+     /* A removed device completes every fence to UINT64_MAX, so any value is reached. */
+     if (value <= fence->virtual_value || d3d12_device_removed_unblocks_fences(fence->device))
+@@ -1592,6 +1737,7 @@ static HRESULT d3d12_fence_init(struct d3d12_fence *fence, struct d3d12_device *
+ 
+     d3d_destruction_notifier_init(&fence->destruction_notifier, (IUnknown*)&fence->ID3D12Fence_iface);
+     d3d12_device_add_ref(fence->device = device);
++    vkd3d_fence_diag_register(fence);
+ 
+     return S_OK;
+ }
+@@ -7181,6 +7327,12 @@ static void d3d12_command_list_reset_api_state(struct d3d12_command_list *list,
+     memset(list->so_counter_buffer_offsets, 0, sizeof(list->so_counter_buffer_offsets));
+ 
+     list->cbv_srv_uav_descriptors_view = NULL;
++    list->diag_bb_pending = false;
++    list->diag_rt_used = 0;
++    list->diag_rt_head = 0;
++    list->diag_ev_count = 0;
++    list->diag_dispatches = list->diag_copies = 0;
++    list->diag_copy_bytes = 0;
+     list->vrs_image = NULL;
+ 
+     ID3D12GraphicsCommandList10_SetPipelineState(iface, initial_pipeline_state);
+@@ -7627,7 +7779,11 @@ static bool d3d12_command_list_update_graphics_pipeline(struct d3d12_command_lis
+     {
+         if (!(vk_pipeline = d3d12_pipeline_state_get_or_create_pipeline(list->state,
+                 &list->dynamic_state, list->dsv.format, &new_active_flags)))
++        {
++            vkd3d_failure_log("draw-skipped", "draw skipped: could not create a pipeline variant for PSO %p",
++                    (void *)list->state);
+             return false;
++        }
+     }
+ 
+     if (d3d12_command_list_has_depth_stencil_view(list))
+@@ -8915,7 +9071,10 @@ static bool d3d12_command_list_begin_render_pass(struct d3d12_command_list *list
+     /* It's not possible to modify rendering info while a render pass is in flight. */
+     if (!(list->rendering_info.state_flags & VKD3D_RENDERING_ACTIVE))
+         if (!d3d12_command_list_update_rendering_info(list))
++        {
++            vkd3d_failure_log("draw-skipped", "draw skipped: could not set up render targets");
+             return false;
++        }
+ 
+     if (pipeline_type != VKD3D_PIPELINE_TYPE_NONE)
+     {
+@@ -9142,6 +9301,403 @@ static bool d3d12_command_list_emit_predicated_command(struct d3d12_command_list
+     return true;
+ }
+ 
++/* Diagnostics: one-time GPU readback of the images involved in the final composite. Armed by the backbuffer-draw
++ * logger; performed right after the command list containing the draw is submitted. Windows builds only. */
++static struct d3d12_command_list *vkd3d_diag_rb_list;
++static const struct d3d12_resource *vkd3d_diag_rb_res[4];
++static uint32_t vkd3d_diag_rb_state[4];
++static const char *vkd3d_diag_rb_role[4];
++static unsigned int vkd3d_diag_rb_count;
++static bool vkd3d_diag_rb_busy;
++
++#ifdef _WIN32
++static void vkd3d_diag_readback(struct d3d12_command_queue *queue)
++{
++    ID3D12Device *dev = (ID3D12Device *)&queue->device->ID3D12Device_iface;
++    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_READBACK };
++    D3D12_RESOURCE_DESC bd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 0, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, 0 };
++    ID3D12CommandAllocator *alloc = NULL; ID3D12GraphicsCommandList *cl = NULL; ID3D12Resource *buf = NULL; ID3D12Fence *fence = NULL;
++    uint32_t pitch[4], offs[4], total = 0, i;
++    HANDLE ev;
++    uint8_t *map;
++
++    for (i = 0; i < vkd3d_diag_rb_count; i++)
++    {
++        pitch[i] = ((uint32_t)vkd3d_diag_rb_res[i]->desc.Width * 8 + 255) & ~255u;
++        offs[i] = total;
++        total += pitch[i];
++    }
++    bd.Width = total;
++    if (FAILED(ID3D12Device_CreateCommittedResource(dev, &hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
++                &IID_ID3D12Resource, (void **)&buf)) ||
++            FAILED(ID3D12Device_CreateCommandAllocator(dev, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void **)&alloc)) ||
++            FAILED(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL, &IID_ID3D12GraphicsCommandList, (void **)&cl)) ||
++            FAILED(ID3D12Device_CreateFence(dev, 0, 0, &IID_ID3D12Fence, (void **)&fence)))
++    {
++        vkd3d_failure_log("gpu-readback", "could not create readback objects");
++        goto done;
++    }
++    for (i = 0; i < vkd3d_diag_rb_count; i++)
++    {
++        ID3D12Resource *src = (ID3D12Resource *)&vkd3d_diag_rb_res[i]->ID3D12Resource_iface;
++        D3D12_TEXTURE_COPY_LOCATION d = {0}, sl = {0};
++        D3D12_RESOURCE_BARRIER b = {0};
++        uint32_t y = vkd3d_diag_rb_res[i]->desc.Height / 2;
++        D3D12_BOX box = { 0, y, 0, (UINT)vkd3d_diag_rb_res[i]->desc.Width, y + 1, 1 };
++
++        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b.Transition.pResource = src; b.Transition.Subresource = 0;
++        b.Transition.StateBefore = vkd3d_diag_rb_state[i]; b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
++        if (b.Transition.StateBefore != b.Transition.StateAfter)
++            ID3D12GraphicsCommandList_ResourceBarrier(cl, 1, &b);
++        d.pResource = buf; d.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++        d.PlacedFootprint.Offset = offs[i];
++        d.PlacedFootprint.Footprint.Format = vkd3d_diag_rb_res[i]->desc.Format;
++        d.PlacedFootprint.Footprint.Width = (UINT)vkd3d_diag_rb_res[i]->desc.Width;
++        d.PlacedFootprint.Footprint.Height = 1; d.PlacedFootprint.Footprint.Depth = 1;
++        d.PlacedFootprint.Footprint.RowPitch = pitch[i];
++        sl.pResource = src; sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; sl.SubresourceIndex = 0;
++        ID3D12GraphicsCommandList_CopyTextureRegion(cl, &d, 0, 0, 0, &sl, &box);
++        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE; b.Transition.StateAfter = vkd3d_diag_rb_state[i];
++        if (b.Transition.StateBefore != b.Transition.StateAfter)
++            ID3D12GraphicsCommandList_ResourceBarrier(cl, 1, &b);
++    }
++    ID3D12GraphicsCommandList_Close(cl);
++    vkd3d_diag_rb_busy = true;
++    ID3D12CommandQueue_ExecuteCommandLists((ID3D12CommandQueue *)&queue->ID3D12CommandQueue_iface, 1, (ID3D12CommandList **)&cl);
++    ID3D12CommandQueue_Signal((ID3D12CommandQueue *)&queue->ID3D12CommandQueue_iface, fence, 1);
++    vkd3d_diag_rb_busy = false;
++    ev = CreateEventA(NULL, FALSE, FALSE, NULL);
++    ID3D12Fence_SetEventOnCompletion(fence, 1, ev);
++    if (WaitForSingleObject(ev, 3000) != WAIT_OBJECT_0)
++    {
++        vkd3d_failure_log("gpu-readback", "timed out waiting for the copy");
++        CloseHandle(ev);
++        goto done;
++    }
++    CloseHandle(ev);
++    if (SUCCEEDED(ID3D12Resource_Map(buf, 0, NULL, (void **)&map)))
++    {
++        for (i = 0; i < vkd3d_diag_rb_count; i++)
++        {
++            const struct d3d12_resource *r = vkd3d_diag_rb_res[i];
++            uint32_t w = (uint32_t)r->desc.Width, bpp = r->desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4, x, nonzero = 0;
++            const uint8_t *row = map + offs[i];
++            for (x = 0; x < w; x++)
++            {
++                uint32_t v; memcpy(&v, row + x * bpp, 4);
++                if (v || (bpp == 8 && *(const uint32_t *)(row + x * bpp + 4))) nonzero++;
++            }
++            vkd3d_failure_log("gpu-readback", "%s %p %ux%u fmt %u (state %#x), middle row after the frame's commands: %u/%u texels nonzero; "
++                    "x=%u: %08x  x=%u: %08x  x=%u: %08x", vkd3d_diag_rb_role[i], (const void *)r, w, r->desc.Height, r->desc.Format,
++                    vkd3d_diag_rb_state[i], nonzero, w, w / 8, *(const uint32_t *)(row + (w / 8) * bpp), w / 2,
++                    *(const uint32_t *)(row + (w / 2) * bpp), 7 * w / 8, *(const uint32_t *)(row + (7 * w / 8) * bpp));
++        }
++        ID3D12Resource_Unmap(buf, 0, NULL);
++    }
++done:
++    if (fence) ID3D12Fence_Release(fence);
++    if (cl) ID3D12GraphicsCommandList_Release(cl);
++    if (alloc) ID3D12CommandAllocator_Release(alloc);
++    if (buf) ID3D12Resource_Release(buf);
++}
++#endif
++
++static size_t vkd3d_diag_format_table(char *out, size_t size, const struct vkd3d_descriptor_metadata_view *views,
++        uint32_t heap_size, uint32_t offset, unsigned int count)
++{
++    size_t pos = 0;
++    unsigned int j;
++    for (j = 0; j < count && pos + 32 < size; j++)
++    {
++        const struct vkd3d_descriptor_metadata_view *m;
++        if (!views || !heap_size)
++            return pos + snprintf(out + pos, size - pos, " (no descriptor metadata)");
++        if (offset + j >= heap_size)
++            return pos + snprintf(out + pos, size - pos, " out-of-heap(%u)", heap_size);
++        m = &views[offset + j];
++        if (!(m->info.flags & VKD3D_DESCRIPTOR_FLAG_NON_NULL))
++            pos += snprintf(out + pos, size - pos, " null");
++        else if ((m->info.flags & VKD3D_DESCRIPTOR_FLAG_IMAGE_VIEW) && m->info.image.view
++#ifdef _WIN32
++                && !IsBadReadPtr(m->info.image.view, sizeof(*m->info.image.view))
++#endif
++                && m->info.image.view->diag_resource)
++            pos += snprintf(out + pos, size - pos, " img(%ux%u fmt %u res %p%s%s)", m->info.image.view->diag_width,
++                    m->info.image.view->diag_height, m->info.image.view->diag_dxgi_format, m->info.image.view->diag_resource,
++                    (m->info.image.view->diag_resource_flags & VKD3D_RESOURCE_SWAPCHAIN_BACKBUFFER) ? " backbuffer" : "",
++                    m->info.image.view->refcount <= 0 ? " STALE view" : "");
++        else if (m->info.flags & VKD3D_DESCRIPTOR_FLAG_IMAGE_VIEW)
++            pos += snprintf(out + pos, size - pos, " img(fmt %u)", m->info.image.dxgi_format);
++        else
++            pos += snprintf(out + pos, size - pos, " buf(fmt %u, %u B)", m->info.buffer.dxgi_format, m->info.buffer.range);
++    }
++    return pos;
++}
++
++/* Diagnostics: describe draws into a swapchain backbuffer (the application's final composite), so a frame that
++ * reaches the swapchain black can be traced to an empty viewport/scissor, a disabled write mask, a depth/stencil
++ * test, or null input descriptors. Logged at most every 15 s, 8 times per process. VKD3D_BACKBUFFER_DRAW_LOG=0 disables. */
++static void d3d12_command_list_diag_backbuffer_draw(struct d3d12_command_list *list, const char *kind,
++        uint32_t count, uint32_t instances)
++{
++    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++    static uint64_t last_ns;
++    static unsigned int logged;
++    static int enabled = -1;
++    const struct vkd3d_pipeline_bindings *bindings = &list->graphics_bindings;
++    const struct d3d12_root_signature *rs = bindings->root_signature;
++    const struct d3d12_graphics_pipeline_state *g;
++    const struct vkd3d_dynamic_state *dyn = &list->dynamic_state;
++    char tables[1024];
++    size_t pos = 0;
++    uint64_t now, mask;
++    unsigned int i;
++
++    if (!vkd3d_diagnostics_enabled())
++        return;
++    if (list->diag_rt_used && list->diag_rt_ring[list->diag_rt_head] == list->rtvs[0].resource)
++        list->diag_rt_draws[list->diag_rt_head]++;
++    d3d12_command_list_diag_event(list, DIAG_EV_DRAW, 0, list->rtvs[0].resource, 1, 0);
++    if (!list->rtvs[0].resource || !(list->rtvs[0].resource->flags & VKD3D_RESOURCE_SWAPCHAIN_BACKBUFFER))
++        return;
++    if (enabled < 0)
++    {
++        char env[16];
++        enabled = vkd3d_diagnostics_enabled() && !(vkd3d_get_env_var("VKD3D_BACKBUFFER_DRAW_LOG", env, sizeof(env)) && env[0] == '0');
++    }
++    if (!enabled || logged >= 8)
++        return;
++    now = vkd3d_get_current_time_ns();
++    pthread_mutex_lock(&lock);
++    if ((last_ns && now - last_ns < 15000000000ull) || logged >= 8)
++    {
++        pthread_mutex_unlock(&lock);
++        return;
++    }
++    last_ns = now;
++    logged++;
++    pthread_mutex_unlock(&lock);
++
++    if (!list->state || list->state->pipeline_type != VKD3D_PIPELINE_TYPE_GRAPHICS)
++    {
++        vkd3d_failure_log("backbuffer-draw", "%s %u x%u into the backbuffer with no graphics PSO bound", kind, count, instances);
++        return;
++    }
++    g = &list->state->graphics;
++
++    /* Once per process, for the first draw after the swapchain has been recreated at least once (the steady state),
++     * dump the pixel shader and the root signature's table layout so the shader's inputs can be mapped. */
++    if (logged == 2)
++    {
++        FILE *f;
++        if (list->state->diag_ps_code && (f = fopen("C:\\gfx-bbdraw-ps.dxbc", "wb")))
++        {
++            fwrite(list->state->diag_ps_code, 1, list->state->diag_ps_size, f);
++            fclose(f);
++        }
++        if (rs && (f = fopen("C:\\gfx-bbdraw-rootsig.txt", "w")))
++        {
++            static const char *types[] = { "?", "CBV", "SRV", "UAV", "SAMPLER" };
++            unsigned int p, b;
++            for (p = 0; p < rs->parameter_count; p++)
++            {
++                const struct vkd3d_shader_root_parameter *rp = &rs->parameters[p];
++                fprintf(f, "param %u: type %u", p, rp->parameter_type);
++                if (rp->parameter_type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
++                {
++                    fprintf(f, ", table index %u, %u bindings\n", rp->descriptor_table.table_index, rp->descriptor_table.binding_count);
++                    for (b = 0; b < rp->descriptor_table.binding_count; b++)
++                    {
++                        const struct vkd3d_shader_resource_binding *rb = &rp->descriptor_table.first_binding[b];
++                        fprintf(f, "  %s space %u reg %u count %u -> table offset %u, visibility %u, flags %#x\n",
++                                rb->type < 5 ? types[rb->type] : "?", rb->register_space, rb->register_index,
++                                rb->register_count, rb->descriptor_offset, rb->shader_visibility, rb->flags);
++                    }
++                }
++                else if (rp->parameter_type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
++                    fprintf(f, ", constants index %u count %u\n", rp->constant.constant_index, rp->constant.constant_count);
++                else
++                    fprintf(f, ", root descriptor\n");
++            }
++            fclose(f);
++        }
++        vkd3d_failure_log("backbuffer-draw", "  dumped this draw's pixel shader (%s) and root signature layout to C:\\gfx-bbdraw-*",
++                list->state->diag_ps_code ? "ok" : "not retained");
++    }
++
++    vkd3d_failure_log("backbuffer-draw", "%s %u x%u into backbuffer %ux%u (fb %ux%u); viewport %.0f,%.0f %.0fx%.0f depth %.2f-%.2f (%u vp); "
++            "scissor %d,%d %ux%u; PSO RT0 vk format %d, write mask %#x, blend %u; rt_count %u; cull %#x; "
++            "depth test %u op %d, stencil %u, DSV %s; sample mask %#x",
++            kind, count, instances, list->rtvs[0].width, list->rtvs[0].height, list->fb_width, list->fb_height,
++            dyn->viewports[0].x, dyn->viewports[0].y, dyn->viewports[0].width, dyn->viewports[0].height,
++            dyn->viewports[0].minDepth, dyn->viewports[0].maxDepth, dyn->viewport_count,
++            dyn->scissors[0].offset.x, dyn->scissors[0].offset.y, dyn->scissors[0].extent.width, dyn->scissors[0].extent.height,
++            g->rtv_formats[0], g->blend_attachments[0].colorWriteMask, g->blend_attachments[0].blendEnable, g->rt_count,
++            g->rs_desc.cullMode, g->ds_desc.depthTestEnable, g->ds_desc.depthCompareOp, g->ds_desc.stencilTestEnable,
++            list->dsv.resource ? "bound" : "none", g->sample_mask);
++
++    tables[0] = '\0';
++    list->diag_bb_count = 0;
++    list->diag_bb_view = list->cbv_srv_uav_descriptors_view;
++    list->diag_bb_heap_size = list->diag_cbv_srv_uav_heap ? list->diag_cbv_srv_uav_heap->desc.NumDescriptors : 0;
++    list->diag_bb_pending = true;
++    if (rs)
++    {
++        mask = rs->descriptor_table_mask;
++        while (mask && pos + 96 < sizeof(tables))
++        {
++            const struct d3d12_descriptor_heap *heap = list->diag_cbv_srv_uav_heap;
++            uint32_t offset;
++
++            i = vkd3d_bitmask_iter64(&mask);
++            offset = bindings->descriptor_tables[i];
++            pos += snprintf(tables + pos, sizeof(tables) - pos, " [param %u @%u:", i, offset);
++            pos += vkd3d_diag_format_table(tables + pos, sizeof(tables) - pos, list->cbv_srv_uav_descriptors_view,
++                    heap ? heap->desc.NumDescriptors : 0, offset, i == 0 ? 10 : 4);
++            if (list->diag_bb_count < ARRAY_SIZE(list->diag_bb_offsets))
++            {
++                list->diag_bb_params[list->diag_bb_count] = i;
++                list->diag_bb_offsets[list->diag_bb_count++] = offset;
++            }
++            pos += snprintf(tables + pos, sizeof(tables) - pos, "]");
++        }
++        if (rs->root_constant_count && pos + 80 < sizeof(tables))
++        {
++            pos += snprintf(tables + pos, sizeof(tables) - pos, " root constants:");
++            for (i = 0; i < 8 && pos + 16 < sizeof(tables); i++)
++                pos += snprintf(tables + pos, sizeof(tables) - pos, " %#x", bindings->root_constants[i]);
++        }
++    }
++    vkd3d_failure_log("backbuffer-draw", "  root signature %s, %u params; tables:%s", rs ? "bound" : "NONE",
++            rs ? rs->parameter_count : 0, tables[0] ? tables : " none");
++    {
++        char ring[600];
++        size_t rp = 0;
++        unsigned int k, n = list->diag_rt_used;
++        for (k = 0; k < n && rp + 80 < sizeof(ring); k++)
++        {
++            unsigned int slot = (list->diag_rt_head + ARRAY_SIZE(list->diag_rt_ring) - (n - 1 - k)) % ARRAY_SIZE(list->diag_rt_ring);
++            rp += snprintf(ring + rp, sizeof(ring) - rp, " [%ux%u fmt %u res %p, %u draws]", list->diag_rt_w[slot],
++                    list->diag_rt_h[slot], list->diag_rt_fmt[slot], list->diag_rt_ring[slot], list->diag_rt_draws[slot]);
++        }
++        vkd3d_failure_log("backbuffer-draw", "  render targets bound earlier in this command list (oldest first):%s", n ? ring : " none");
++    }
++
++    /* Find the draw's first pixel-visible SRV (the image it samples) and list every recorded command since that
++     * image was last bound as a render target, marking ones that touch it or memory that may overlap it. */
++    if (rs && list->cbv_srv_uav_descriptors_view && list->diag_cbv_srv_uav_heap)
++    {
++        static const char *names[] = { "?", "bind RT", "barrier", "aliasing barrier", "UAV barrier", "clear RTV", "clear UAV",
++                "discard", "copy into", "dispatch", "  dispatch binds", "draws into" };
++        const struct d3d12_resource *t0 = NULL;
++        unsigned int p, b, k, start, total, shown = 0;
++        uint64_t t0_off = 0, t0_size = 0;
++
++        for (p = 0; p < rs->parameter_count && !t0; p++)
++        {
++            const struct vkd3d_shader_root_parameter *rp = &rs->parameters[p];
++            if (rp->parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
++                continue;
++            for (b = 0; b < rp->descriptor_table.binding_count && !t0; b++)
++            {
++                const struct vkd3d_shader_resource_binding *rb = &rp->descriptor_table.first_binding[b];
++                uint32_t idx = bindings->descriptor_tables[p] + rb->descriptor_offset;
++                const struct vkd3d_descriptor_metadata_view *m;
++                if (rb->type != VKD3D_SHADER_DESCRIPTOR_TYPE_SRV ||
++                        (rb->shader_visibility != VKD3D_SHADER_VISIBILITY_ALL && rb->shader_visibility != VKD3D_SHADER_VISIBILITY_PIXEL) ||
++                        idx >= list->diag_cbv_srv_uav_heap->desc.NumDescriptors)
++                    continue;
++                m = &list->cbv_srv_uav_descriptors_view[idx];
++                if ((m->info.flags & VKD3D_DESCRIPTOR_FLAG_IMAGE_VIEW) && m->info.image.view
++#ifdef _WIN32
++                        && !IsBadReadPtr(m->info.image.view, sizeof(*m->info.image.view))
++#endif
++                        && m->info.image.view->refcount > 0 && m->info.image.view->diag_resource)
++                    t0 = m->info.image.view->diag_resource;
++            }
++        }
++        if (!t0)
++            return;
++        t0_off = t0->mem.offset;
++        t0_size = (uint64_t)t0->desc.Width * t0->desc.Height * 4 * 5 / 4;
++        vkd3d_failure_log("backbuffer-draw", "  sampled image %p: %"PRIu64"x%u fmt %u, %s, heap %p offset %#"PRIx64", flags %#x",
++                (const void *)t0, t0->desc.Width, t0->desc.Height, t0->desc.Format,
++                (t0->flags & VKD3D_RESOURCE_PLACED) ? "placed" : (t0->flags & VKD3D_RESOURCE_COMMITTED) ? "committed" : "other",
++                (const void *)t0->heap, t0_off, t0->flags);
++
++        if (logged == 3 && !vkd3d_diag_rb_list)
++        {
++            unsigned int q2, n2 = list->diag_ev_count > 64 ? 64 : list->diag_ev_count;
++            vkd3d_diag_rb_count = 0;
++            vkd3d_diag_rb_res[vkd3d_diag_rb_count] = t0;
++            vkd3d_diag_rb_role[vkd3d_diag_rb_count] = "sampled by final draw";
++            vkd3d_diag_rb_state[vkd3d_diag_rb_count++] = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++            for (q2 = list->diag_ev_count - n2; q2 < list->diag_ev_count && vkd3d_diag_rb_count < 4; q2++)
++            {
++                const struct vkd3d_diag_event *e2 = &list->diag_ev[q2 % 64];
++                if (e2->kind == DIAG_EV_DISPATCH_RES && e2->sub == VKD3D_SHADER_DESCRIPTOR_TYPE_UAV && e2->res != t0)
++                {
++                    vkd3d_diag_rb_res[vkd3d_diag_rb_count] = e2->res;
++                    vkd3d_diag_rb_role[vkd3d_diag_rb_count] = "written by composite dispatch";
++                    vkd3d_diag_rb_state[vkd3d_diag_rb_count++] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++                }
++            }
++            /* Use the last state the application transitioned each image to in this list, if any. */
++            for (q2 = list->diag_ev_count - n2; q2 < list->diag_ev_count; q2++)
++            {
++                const struct vkd3d_diag_event *e2 = &list->diag_ev[q2 % 64];
++                unsigned int z;
++                if (e2->kind != DIAG_EV_BARRIER)
++                    continue;
++                for (z = 0; z < vkd3d_diag_rb_count; z++)
++                    if (e2->res == vkd3d_diag_rb_res[z])
++                        vkd3d_diag_rb_state[z] = e2->b;
++            }
++            vkd3d_diag_rb_list = list;
++        }
++
++        total = list->diag_ev_count;
++        start = total > 64 ? total - 64 : 0;
++        for (k = total; k > start; k--)
++            if (list->diag_ev[(k - 1) % 64].kind == DIAG_EV_RT && list->diag_ev[(k - 1) % 64].res == t0)
++            {
++                start = k - 1;
++                break;
++            }
++        for (k = start; k < total && shown < 40; k++)
++        {
++            const struct vkd3d_diag_event *e = &list->diag_ev[k % 64];
++            const void *r = e->res;
++            const char *mark = "";
++            char extra[96] = "";
++            if (r == t0)
++                mark = "  <== SAMPLED IMAGE";
++            else if (r && t0->heap && e->heap == t0->heap && e->off < t0_off + t0_size &&
++                    e->off + (uint64_t)e->w * (e->h ? e->h : 1) * 4 > t0_off)
++                mark = "  <== SAME HEAP, MAY OVERLAP";
++            if (e->kind == DIAG_EV_BARRIER)
++                snprintf(extra, sizeof(extra), " %#x -> %#x%s", e->a, e->b, e->sub ? " (split)" : "");
++            else if (e->kind == DIAG_EV_CLEAR_RTV)
++                snprintf(extra, sizeof(extra), " colour r=%.3f a=%.3f", e->a / 1000.0, e->b / 1000.0);
++            else if (e->kind == DIAG_EV_DISPATCH)
++                snprintf(extra, sizeof(extra), " %ux%u groups", e->a, e->b);
++            else if (e->kind == DIAG_EV_DISPATCH_RES)
++                snprintf(extra, sizeof(extra), " as %s param %u reg %u", e->sub == VKD3D_SHADER_DESCRIPTOR_TYPE_UAV ? "UAV" : "SRV", e->a, e->b);
++            else if (e->kind == DIAG_EV_DRAW)
++                snprintf(extra, sizeof(extra), " x%u", e->a);
++            else if (e->kind == DIAG_EV_ALIAS)
++                snprintf(extra, sizeof(extra), " (before %p)", (const void *)(uintptr_t)((uint64_t)e->b << 32 | e->a));
++            if (r)
++                vkd3d_failure_log("backbuffer-draw", "    %s %p %"PRIu64"x%u fmt %u heap %p off %#"PRIx64"%s%s",
++                        e->kind < ARRAY_SIZE(names) ? names[e->kind] : "?", r, (uint64_t)e->w, e->h,
++                        e->fmt, e->heap, e->off, extra, mark);
++            else
++                vkd3d_failure_log("backbuffer-draw", "    %s%s", e->kind < ARRAY_SIZE(names) ? names[e->kind] : "?", extra);
++            shown++;
++        }
++    }
++}
++
+ static void STDMETHODCALLTYPE d3d12_command_list_DrawInstanced(d3d12_command_list_iface *iface,
+         UINT vertex_count_per_instance, UINT instance_count, UINT start_vertex_location,
+         UINT start_instance_location)
+@@ -9174,6 +9730,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_DrawInstanced(d3d12_command_lis
+         WARN("Failed to begin render pass, ignoring draw call.\n");
+         return;
+     }
++    d3d12_command_list_diag_backbuffer_draw(list, "draw", vertex_count_per_instance, instance_count);
+ 
+     list->cmd.estimated_cost += VKD3D_COMMAND_COST_HIGH;
+ 
+@@ -9247,6 +9804,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_DrawIndexedInstanced(d3d12_comm
+         WARN("Failed to begin render pass, ignoring draw call.\n");
+         return;
+     }
++    d3d12_command_list_diag_backbuffer_draw(list, "indexed draw", index_count_per_instance, instance_count);
+ 
+     list->cmd.estimated_cost += VKD3D_COMMAND_COST_HIGH;
+ 
+@@ -9395,6 +9953,48 @@ static void STDMETHODCALLTYPE d3d12_command_list_Dispatch(d3d12_command_list_ifa
+     const VkPhysicalDeviceLimits *limits;
+ 
+     TRACE("iface %p, x %u, y %u, z %u.\n", iface, x, y, z);
++    list->diag_dispatches++;
++    d3d12_command_list_diag_event(list, DIAG_EV_DISPATCH, 0, NULL, x, y);
++    if (vkd3d_diagnostics_enabled() && list->compute_bindings.root_signature && list->cbv_srv_uav_descriptors_view && list->diag_cbv_srv_uav_heap)
++    {
++        const struct d3d12_root_signature *crs = list->compute_bindings.root_signature;
++        unsigned int p, b, found = 0;
++        for (p = 0; p < crs->parameter_count && found < 6; p++)
++        {
++            const struct vkd3d_shader_root_parameter *rp = &crs->parameters[p];
++            if (rp->parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
++                continue;
++            for (b = 0; b < rp->descriptor_table.binding_count && found < 6; b++)
++            {
++                const struct vkd3d_shader_resource_binding *rb = &rp->descriptor_table.first_binding[b];
++                uint32_t base = list->compute_bindings.descriptor_tables[p] + rb->descriptor_offset, n, k;
++                if (rb->type != VKD3D_SHADER_DESCRIPTOR_TYPE_UAV && rb->type != VKD3D_SHADER_DESCRIPTOR_TYPE_SRV)
++                    continue;
++                n = rb->register_count > 8 ? 8 : rb->register_count;
++                for (k = 0; k < n && found < 6; k++)
++                {
++                    const struct vkd3d_descriptor_metadata_view *m;
++                    if (base + k >= list->diag_cbv_srv_uav_heap->desc.NumDescriptors)
++                        break;
++                    m = &list->cbv_srv_uav_descriptors_view[base + k];
++                    if ((m->info.flags & VKD3D_DESCRIPTOR_FLAG_NON_NULL) && (m->info.flags & VKD3D_DESCRIPTOR_FLAG_IMAGE_VIEW) &&
++                            m->info.image.view
++#ifdef _WIN32
++                            && !IsBadReadPtr(m->info.image.view, sizeof(*m->info.image.view))
++#endif
++                            && m->info.image.view->diag_resource && m->info.image.view->refcount > 0)
++                    {
++                        struct vkd3d_diag_event *ev;
++                        d3d12_command_list_diag_event(list, DIAG_EV_DISPATCH_RES, rb->type, m->info.image.view->diag_resource, p, rb->register_index + k);
++                        ev = &list->diag_ev[(list->diag_ev_count - 1) % 64];
++                        ev->w = m->info.image.view->diag_width; ev->h = m->info.image.view->diag_height;
++                        ev->fmt = m->info.image.view->diag_dxgi_format;
++                        found++;
++                    }
++                }
++            }
++        }
++    }
+ 
+     d3d12_command_list_check_render_pass_validation(list, "Dispatch called within a render pass.\n", true);
+     d3d12_command_list_flush_dgc_batch(list);
+@@ -9454,6 +10054,32 @@ static void STDMETHODCALLTYPE d3d12_command_list_Dispatch(d3d12_command_list_ifa
+     VKD3D_BREADCRUMB_AUX32(z);
+     VKD3D_BREADCRUMB_COMMAND(DISPATCH);
+ 
++    /* Experiment: a full memory barrier after every dispatch, so compute writes are visible to later graphics work
++     * even when the application omits the barrier (Windows drivers tolerate that). Off by default; VKD3D_DISPATCH_BARRIER=1 enables.
++     * Did not fix Requiem's black screen. */
++    {
++        static int enabled = -1;
++        if (enabled < 0)
++        {
++            char env[16];
++            enabled = vkd3d_get_env_var("VKD3D_DISPATCH_BARRIER", env, sizeof(env)) && env[0] == '1';
++            if (enabled)
++                vkd3d_failure_log("info", "experiment: full memory barrier after every dispatch is on");
++        }
++        if (enabled)
++        {
++            VkMemoryBarrier2 mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
++            VkDependencyInfo dep = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
++            mb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
++            mb.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
++            mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++            mb.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
++            dep.memoryBarrierCount = 1;
++            dep.pMemoryBarriers = &mb;
++            VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep));
++        }
++    }
++
+     d3d12_command_list_check_compute_barrier(list);
+ }
+ 
+@@ -9469,6 +10095,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyBufferRegion(d3d12_command_
+     TRACE("iface %p, dst_resource %p, dst_offset %#"PRIx64", src_resource %p, "
+             "src_offset %#"PRIx64", byte_count %#"PRIx64".\n",
+             iface, dst, dst_offset, src, src_offset, byte_count);
++    list->diag_copies++;
++    list->diag_copy_bytes += byte_count;
+ 
+     d3d12_command_list_check_render_pass_validation(list, "CopyBufferRegion called within a render pass.\n", true);
+     d3d12_command_list_flush_dgc_batch(list);
+@@ -11143,6 +11771,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyTextureRegion(d3d12_command
+ 
+     TRACE("iface %p, dst %p, dst_x %u, dst_y %u, dst_z %u, src %p, src_box %p.\n",
+             iface, dst, dst_x, dst_y, dst_z, src, src_box);
++    list->diag_copies++;
++    if (dst && dst->pResource)
++        d3d12_command_list_diag_event(list, DIAG_EV_COPY_DST, 1, impl_from_ID3D12Resource(dst->pResource), 0, 0);
+ 
+     d3d12_command_list_check_render_pass_validation(list, "CopyTextureRegion called within a render pass.\n", true);
+     d3d12_command_list_flush_dgc_batch(list);
+@@ -11268,6 +11899,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyResource(d3d12_command_list
+     unsigned int i, j;
+ 
+     TRACE("iface %p, dst_resource %p, src_resource %p.\n", iface, dst, src);
++    list->diag_copies++;
++    if (dst)
++        d3d12_command_list_diag_event(list, DIAG_EV_COPY_DST, 0, impl_from_ID3D12Resource(dst), 0, 0);
+ 
+     d3d12_command_list_check_render_pass_validation(list, "CopyResource called within a render pass.\n", true);
+     d3d12_command_list_flush_dgc_batch(list);
+@@ -14048,6 +14682,21 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
+     unsigned int i, j;
+ 
+     TRACE("iface %p, barrier_count %u, barriers %p.\n", iface, barrier_count, barriers);
++    for (i = 0; vkd3d_diagnostics_enabled() && i < barrier_count; ++i)
++    {
++        const D3D12_RESOURCE_BARRIER *bb = &barriers[i];
++        if (bb->Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && bb->Transition.pResource)
++            d3d12_command_list_diag_event(list, DIAG_EV_BARRIER, bb->Flags, impl_from_ID3D12Resource(bb->Transition.pResource),
++                    bb->Transition.StateBefore, bb->Transition.StateAfter);
++        else if (bb->Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING)
++        {
++            d3d12_command_list_diag_event(list, DIAG_EV_ALIAS, 0, bb->Aliasing.pResourceAfter ? impl_from_ID3D12Resource(bb->Aliasing.pResourceAfter) : NULL,
++                    (uint32_t)(uintptr_t)(bb->Aliasing.pResourceBefore ? impl_from_ID3D12Resource(bb->Aliasing.pResourceBefore) : NULL),
++                    (uint32_t)((uintptr_t)(bb->Aliasing.pResourceBefore ? impl_from_ID3D12Resource(bb->Aliasing.pResourceBefore) : NULL) >> 32));
++        }
++        else if (bb->Type == D3D12_RESOURCE_BARRIER_TYPE_UAV)
++            d3d12_command_list_diag_event(list, DIAG_EV_UAVB, 0, bb->UAV.pResource ? impl_from_ID3D12Resource(bb->UAV.pResource) : NULL, 0, 0);
++    }
+ 
+     /* Ignore enhanced barriers. They are much harder to reason about due to the transient nature of Vulkan-style
+      * barriers. This is more or less just a workaround too for terribly written games,
+@@ -14501,6 +15150,7 @@ static void d3d12_command_list_set_descriptor_heaps_buffers(struct d3d12_command
+                 /* In case we need to hoist buffer descriptors. */
+                 d = d3d12_desc_decode_va(heap->cpu_va.ptr);
+                 list->cbv_srv_uav_descriptors_view = d.view;
++                list->diag_cbv_srv_uav_heap = heap;
+             }
+         }
+         else if (heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+@@ -14561,6 +15211,7 @@ static void d3d12_command_list_set_descriptor_heaps_sets(struct d3d12_command_li
+             struct d3d12_desc_split d;
+             d = d3d12_desc_decode_va(heap->cpu_va.ptr);
+             list->cbv_srv_uav_descriptors_view = d.view;
++                list->diag_cbv_srv_uav_heap = heap;
+         }
+     }
+ 
+@@ -15504,6 +16155,25 @@ static void STDMETHODCALLTYPE d3d12_command_list_OMSetRenderTargets(d3d12_comman
+ 
+     d3d12_command_list_invalidate_ds_state(list, prev_dsv_format);
+     d3d12_command_list_recompute_fb_size(list);
++
++    if (list->rtvs[0].resource && vkd3d_diagnostics_enabled())
++    {
++        const struct d3d12_resource *r = list->rtvs[0].resource;
++        unsigned int slot = list->diag_rt_used ? list->diag_rt_head : 0;
++        if (!list->diag_rt_used || list->diag_rt_ring[slot] != r)
++        {
++            if (list->diag_rt_used)
++                slot = list->diag_rt_head = (list->diag_rt_head + 1) % ARRAY_SIZE(list->diag_rt_ring);
++            list->diag_rt_ring[slot] = r;
++            d3d12_command_list_diag_event(list, DIAG_EV_RT, 0, r, 0, 0);
++            list->diag_rt_w[slot] = (uint32_t)r->desc.Width;
++            list->diag_rt_h[slot] = r->desc.Height;
++            list->diag_rt_fmt[slot] = r->desc.Format;
++            list->diag_rt_draws[slot] = 0;
++            if (list->diag_rt_used < ARRAY_SIZE(list->diag_rt_ring))
++                list->diag_rt_used++;
++        }
++    }
+ }
+ 
+ static bool d3d12_rect_fully_covers_region(const D3D12_RECT *a, const D3D12_RECT *b)
+@@ -15863,6 +16533,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_ClearRenderTargetView(d3d12_com
+ 
+     TRACE("iface %p, rtv %zx, color %p, rect_count %u, rects %p.\n",
+             iface, rtv.ptr, color, rect_count, rects);
++    if (rtv_desc && rtv_desc->resource)
++        d3d12_command_list_diag_event(list, DIAG_EV_CLEAR_RTV, 0, rtv_desc->resource,
++                (uint32_t)(color[0] * 1000.0f), (uint32_t)(color[3] * 1000.0f));
+ 
+     d3d12_command_list_check_render_pass_validation(list, "ClearRenderTargetView called within a render pass.\n", true);
+     d3d12_command_list_flush_dgc_batch(list);
+@@ -17058,6 +17731,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_ClearUnorderedAccessViewUint(d3
+ 
+     TRACE("iface %p, gpu_handle %#"PRIx64", cpu_handle %zx, resource %p, values %p, rect_count %u, rects %p.\n",
+             iface, gpu_handle.ptr, cpu_handle.ptr, resource, values, rect_count, rects);
++    if (resource)
++        d3d12_command_list_diag_event(list, DIAG_EV_CLEAR_UAV, 0, impl_from_ID3D12Resource(resource), 0, 0);
+ 
+     d3d12_command_list_check_render_pass_validation(list, "ClearUnorderedAccessViewUint called within a render pass.\n", true);
+     d3d12_command_list_flush_dgc_batch(list);
+@@ -17225,6 +17900,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_ClearUnorderedAccessViewFloat(d
+ 
+     TRACE("iface %p, gpu_handle %#"PRIx64", cpu_handle %zx, resource %p, values %p, rect_count %u, rects %p.\n",
+             iface, gpu_handle.ptr, cpu_handle.ptr, resource, values, rect_count, rects);
++    if (resource)
++        d3d12_command_list_diag_event(list, DIAG_EV_CLEAR_UAV, 0, impl_from_ID3D12Resource(resource), 0, 0);
+ 
+     d3d12_command_list_check_render_pass_validation(list, "ClearUnorderedAccessViewFloat called within a render pass.\n", true);
+     d3d12_command_list_flush_dgc_batch(list);
+@@ -17375,6 +18052,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_DiscardResource(d3d12_command_l
+     bool full_discard;
+ 
+     TRACE("iface %p, resource %p, region %p.\n", iface, resource, region);
++    if (resource)
++        d3d12_command_list_diag_event(list, DIAG_EV_DISCARD, 0, impl_from_ID3D12Resource(resource), 0, 0);
+ 
+     d3d12_command_list_check_render_pass_validation(list, "DiscardResource called within a render pass.\n", true);
+     d3d12_command_list_flush_dgc_batch(list);
+@@ -23548,6 +24227,10 @@ VKD3D_METHODENTRY_NONSTATIC(ULONG) d3d12_command_queue_Release(ID3D12CommandQueu
+     {
+         struct d3d12_device *device = command_queue->device;
+ 
++        pthread_mutex_lock(&vkd3d_queue_diag_lock);
++        list_remove(&command_queue->diag_entry);
++        pthread_mutex_unlock(&vkd3d_queue_diag_lock);
++
+         d3d_destruction_notifier_free(&command_queue->destruction_notifier);
+         vkd3d_private_store_destroy(&command_queue->private_store);
+ 
+@@ -23874,6 +24557,13 @@ VKD3D_METHODENTRY(void) d3d12_command_queue_CopyTileMappings(ID3D12CommandQueue
+             iface, dst_resource, dst_region_start_coordinate, src_resource,
+             src_region_start_coordinate, region_size, flags);
+ 
++    /* Fallback (committed) reserved resources have no sparse bindings to copy. */
++    if (!(dst_res->flags & VKD3D_RESOURCE_RESERVED) || !(src_res->flags & VKD3D_RESOURCE_RESERVED))
++    {
++        WARN("Ignoring CopyTileMappings on fallback reserved resource.\n");
++        return;
++    }
++
+     sub.type = VKD3D_SUBMISSION_BIND_SPARSE;
+     sub.bind_sparse.mode = VKD3D_SPARSE_MEMORY_BIND_MODE_COPY;
+     sub.bind_sparse.bind_count = region_size->NumTiles;
+@@ -24066,6 +24756,8 @@ VKD3D_METHODENTRY(void) d3d12_command_queue_ExecuteCommandLists(ID3D12CommandQue
+     if (!command_list_count)
+         return;
+ 
++    InterlockedIncrement(&command_queue->diag_ecl);
++
+     if (FAILED(hr = vkd3d_memory_transfer_queue_flush(&command_queue->device->memory_transfers)))
+     {
+         d3d12_device_mark_as_removed(command_queue->device, hr,
+@@ -24098,6 +24790,30 @@ VKD3D_METHODENTRY(void) d3d12_command_queue_ExecuteCommandLists(ID3D12CommandQue
+     {
+         cmd_list = d3d12_command_list_from_iface(command_lists[i]);
+ 
++        if (cmd_list)
++        {
++            InterlockedIncrement(&command_queue->diag_lists);
++            InterlockedAdd(&command_queue->diag_dispatches, cmd_list->diag_dispatches);
++            InterlockedAdd(&command_queue->diag_copies, cmd_list->diag_copies);
++            InterlockedAdd64(&command_queue->diag_copy_bytes, (LONG64)cmd_list->diag_copy_bytes);
++        }
++
++        if (cmd_list && cmd_list->diag_bb_pending)
++        {
++            char tables[768];
++            size_t pos = 0;
++            unsigned int t;
++            cmd_list->diag_bb_pending = false;
++            for (t = 0; t < cmd_list->diag_bb_count && pos + 96 < sizeof(tables); t++)
++            {
++                pos += snprintf(tables + pos, sizeof(tables) - pos, " [param %u @%u:", cmd_list->diag_bb_params[t], cmd_list->diag_bb_offsets[t]);
++                pos += vkd3d_diag_format_table(tables + pos, sizeof(tables) - pos, cmd_list->diag_bb_view,
++                        cmd_list->diag_bb_heap_size, cmd_list->diag_bb_offsets[t], t == 0 ? 10 : 4);
++                pos += snprintf(tables + pos, sizeof(tables) - pos, "]");
++            }
++            vkd3d_failure_log("backbuffer-draw", "  same tables at ExecuteCommandLists:%s", tables[0] ? tables : " none");
++        }
++
+         if (!cmd_list)
+         {
+             WARN("Unsupported command list type %p.\n", cmd_list);
+@@ -24435,6 +25151,21 @@ VKD3D_METHODENTRY(void) d3d12_command_queue_ExecuteCommandLists(ID3D12CommandQue
+ #endif
+     sub.execute.timeline_cookie = timeline_cookie;
+     d3d12_command_queue_add_submission(command_queue, &sub);
++
++#ifdef _WIN32
++    if (vkd3d_diag_rb_list && vkd3d_diag_rb_list != (void *)1 && !vkd3d_diag_rb_busy)
++    {
++        for (i = 0; i < command_list_count; i++)
++        {
++            if (d3d12_command_list_from_iface(command_lists[i]) == vkd3d_diag_rb_list)
++            {
++                vkd3d_diag_rb_list = (void *)1; /* done, never again */
++                vkd3d_diag_readback(command_queue);
++                break;
++            }
++        }
++    }
++#endif
+ }
+ 
+ VKD3D_METHODENTRY(void) d3d12_command_queue_SetMarker(ID3D12CommandQueue *iface,
+@@ -24464,6 +25195,8 @@ VKD3D_METHODENTRY(HRESULT) d3d12_command_queue_Signal(ID3D12CommandQueue *iface,
+ 
+     TRACE("iface %p, fence %p, value %#"PRIx64".\n", iface, fence_iface, value);
+ 
++    InterlockedIncrement(&command_queue->diag_signals);
++    command_queue->diag_last_signal_value = value;
+     d3d12_fence_iface_inc_ref((d3d12_fence_iface *)fence_iface);
+ 
+     sub.type = VKD3D_SUBMISSION_SIGNAL;
+@@ -24482,6 +25215,7 @@ VKD3D_METHODENTRY(HRESULT) d3d12_command_queue_Wait(ID3D12CommandQueue *iface,
+ 
+     TRACE("iface %p, fence %p, value %#"PRIx64".\n", iface, fence_iface, value);
+ 
++    InterlockedIncrement(&command_queue->diag_waits);
+     d3d12_fence_iface_inc_ref((d3d12_fence_iface *)fence_iface);
+ 
+     if (!is_shared_ID3D12Fence(fence_iface))
+@@ -26769,6 +27503,71 @@ fail:
+     return hr;
+ }
+ 
++/* Queue activity diagnostics: every queue is registered; vkd3d_queue_activity_report() (called from Present) logs
++ * each queue's submissions, copies, dispatches, signals and waits every 10 s. VKD3D_QUEUE_ACTIVITY_LOG=0 disables. */
++
++void vkd3d_queue_diag_set_creator(struct d3d12_command_queue *queue, const void *return_address)
++{
++#ifdef _WIN32
++    HMODULE module;
++    char path[MAX_PATH];
++    const char *base;
++    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++            (LPCSTR)return_address, &module) && GetModuleFileNameA(module, path, sizeof(path)))
++    {
++        base = strrchr(path, '\\');
++        snprintf(queue->diag_creator, sizeof(queue->diag_creator), "%s", base ? base + 1 : path);
++    }
++#endif
++}
++
++void vkd3d_queue_activity_report(void)
++{
++    static const char *types[] = { "direct", "bundle", "compute", "copy", "video decode", "video process", "video encode" };
++    enum { MAX_LINES = 16 };
++    char lines[MAX_LINES][320];
++    struct d3d12_command_queue *queue;
++    unsigned int count = 0, i;
++    static int enabled = -1;
++    uint64_t now, interval;
++
++    if (enabled < 0)
++    {
++        char env[16];
++        enabled = vkd3d_diagnostics_enabled() && !(vkd3d_get_env_var("VKD3D_QUEUE_ACTIVITY_LOG", env, sizeof(env)) && env[0] == '0');
++    }
++    if (!enabled)
++        return;
++    now = vkd3d_get_current_time_ns();
++    pthread_mutex_lock(&vkd3d_queue_diag_lock);
++    interval = now - vkd3d_queue_diag_last_report;
++    if (vkd3d_queue_diag_last_report && interval < 10000000000ull)
++    {
++        pthread_mutex_unlock(&vkd3d_queue_diag_lock);
++        return;
++    }
++    if (!vkd3d_queue_diag_last_report)
++        interval = 0;
++    vkd3d_queue_diag_last_report = now;
++    LIST_FOR_EACH_ENTRY(queue, &vkd3d_queue_diag_list, struct d3d12_command_queue, diag_entry)
++    {
++        LONG ecl = InterlockedExchange(&queue->diag_ecl, 0), lists = InterlockedExchange(&queue->diag_lists, 0);
++        LONG sig = InterlockedExchange(&queue->diag_signals, 0), waits = InterlockedExchange(&queue->diag_waits, 0);
++        LONG disp = InterlockedExchange(&queue->diag_dispatches, 0), copies = InterlockedExchange(&queue->diag_copies, 0);
++        LONG64 bytes = InterlockedExchange64(&queue->diag_copy_bytes, 0);
++        if (count >= MAX_LINES || !interval)
++            continue;
++        snprintf(lines[count++], sizeof(lines[0]), "queue %u (%s, created by %s): in %.0f s: %ld submits (%ld lists: %ld dispatches, "
++                "%ld copies %.1f MB), %ld signals (last value %"PRIu64"), %ld waits",
++                queue->diag_id, queue->desc.Type < ARRAY_SIZE(types) ? types[queue->desc.Type] : "?",
++                queue->diag_creator[0] ? queue->diag_creator : "?", interval / 1e9, (long)ecl, (long)lists, (long)disp,
++                (long)copies, bytes / 1e6, (long)sig, queue->diag_last_signal_value, (long)waits);
++    }
++    pthread_mutex_unlock(&vkd3d_queue_diag_lock);
++    for (i = 0; i < count; i++)
++        vkd3d_failure_log("queue-activity", "%s", lines[i]);
++}
++
+ HRESULT d3d12_command_queue_create(struct d3d12_device *device,
+         const D3D12_COMMAND_QUEUE_DESC *desc, uint32_t vk_family_index, struct d3d12_command_queue **queue)
+ {
+@@ -26789,6 +27588,11 @@ HRESULT d3d12_command_queue_create(struct d3d12_device *device,
+ 
+     TRACE("Created command queue %p.\n", object);
+ 
++    pthread_mutex_lock(&vkd3d_queue_diag_lock);
++    object->diag_id = ++vkd3d_queue_diag_next_id;
++    list_add_tail(&vkd3d_queue_diag_list, &object->diag_entry);
++    pthread_mutex_unlock(&vkd3d_queue_diag_lock);
++
+     *queue = object;
+ 
+     return S_OK;
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index b580de5..95aeb88 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -2447,6 +2447,14 @@ static bool vkd3d_supports_minimum_coopmat_caps(struct d3d12_device *device)
+     return true;
+ }
+ 
++/* Dev hack: VKD3D_RELAX_CAPS=1 turns selected hard device requirements into warnings,
++ * so we can map how far vkd3d-proton gets on incomplete drivers (e.g. MoltenVK). */
++static bool vkd3d_relax_caps(void)
++{
++    const char *v = getenv("VKD3D_RELAX_CAPS");
++    return v && *v && *v != '0';
++}
++
+ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+         const struct vkd3d_device_create_info *create_info,
+         struct vkd3d_physical_device_info *physical_device_info)
+@@ -2502,7 +2510,8 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+     if (!physical_device_info->xfb_properties.transformFeedbackQueries)
+     {
+         ERR("Lacking support for transform feedback.\n");
+-        return E_INVALIDARG;
++        if (!vkd3d_relax_caps()) return E_INVALIDARG;
++        WARN("VKD3D_RELAX_CAPS: continuing anyway.\n");
+     }
+ 
+     single_storage_texel =
+@@ -2517,7 +2526,8 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+     if (!single_storage_texel || !single_uniform_texel)
+     {
+         ERR("Lacking support for single texel alignment.\n");
+-        return E_INVALIDARG;
++        if (!vkd3d_relax_caps()) return E_INVALIDARG;
++        WARN("VKD3D_RELAX_CAPS: continuing anyway.\n");
+     }
+ 
+     /* Disable unused Vulkan features. The following features need to remain enabled
+@@ -2626,13 +2636,15 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+             !physical_device_info->robustness2_features.robustImageAccess2)
+     {
+         ERR("Robustness2 features not supported. This is required.\n");
+-        return E_INVALIDARG;
++        if (!vkd3d_relax_caps()) return E_INVALIDARG;
++        WARN("VKD3D_RELAX_CAPS: continuing anyway.\n");
+     }
+ 
+     if (!physical_device_info->robustness2_features.nullDescriptor)
+     {
+         ERR("Null descriptor in VK_EXT_robustness2 is not supported by this implementation. This is required for correct operation.\n");
+-        return E_INVALIDARG;
++        if (!vkd3d_relax_caps()) return E_INVALIDARG;
++        WARN("VKD3D_RELAX_CAPS: continuing anyway.\n");
+     }
+ 
+     if (vulkan_info->KHR_fragment_shading_rate)
+@@ -4005,6 +4017,28 @@ static UINT STDMETHODCALLTYPE d3d12_device_GetNodeCount(d3d12_device_iface *ifac
+     return 1;
+ }
+ 
++
++/* Failure log: record HRESULT failures returned to the application from object creation. */
++static HRESULT vkd3d_note_create(struct d3d12_device *device, const char *what, HRESULT hr)
++{
++    if (FAILED(hr))
++        vkd3d_failure_log("create-failed", "%s failed, hr %#x", what, (unsigned int)hr);
++    return hr;
++}
++
++static HRESULT vkd3d_note_resource_create(struct d3d12_device *device, const char *what, HRESULT hr,
++        const D3D12_RESOURCE_DESC1 *desc)
++{
++    if (FAILED(hr))
++    {
++        vkd3d_failure_log("create-failed", "%s failed, hr %#x: dim %u, DXGI format %u, %"PRIu64"x%ux%u, mips %u, "
++                "samples %u, layout %u, flags %#x", what, (unsigned int)hr, desc->Dimension, desc->Format, desc->Width,
++                desc->Height, desc->DepthOrArraySize, desc->MipLevels, desc->SampleDesc.Count, desc->Layout,
++                (unsigned int)desc->Flags);
++    }
++    return hr;
++}
++
+ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateCommandQueue(d3d12_device_iface *iface,
+         const D3D12_COMMAND_QUEUE_DESC *desc, REFIID riid, void **command_queue)
+ {
+@@ -4017,6 +4051,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateCommandQueue(d3d12_device_if
+ 
+     if (FAILED(hr = d3d12_command_queue_create(device, desc, VK_QUEUE_FAMILY_IGNORED, &object)))
+         return hr;
++    vkd3d_queue_diag_set_creator(object, __builtin_return_address(0));
+ 
+     return return_interface(&object->ID3D12CommandQueue_iface, &IID_ID3D12CommandQueue,
+             riid, command_queue);
+@@ -4061,11 +4096,11 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateGraphicsPipelineState(d3d12_
+     TRACE("iface %p, desc %p, riid %s, pipeline_state %p.\n",
+             iface, desc, debugstr_guid(riid), pipeline_state);
+ 
+-    if (FAILED(hr = vkd3d_pipeline_state_desc_from_d3d12_graphics_desc(&pipeline_desc, desc)))
++    if (FAILED(hr = vkd3d_note_create(device, "vkd3d_pipeline_state_desc_from_d3d12_graphics_desc", vkd3d_pipeline_state_desc_from_d3d12_graphics_desc(&pipeline_desc, desc))))
+         return hr;
+ 
+-    if (FAILED(hr = d3d12_pipeline_state_create(device,
+-            VK_PIPELINE_BIND_POINT_GRAPHICS, &pipeline_desc, &object)))
++    if (FAILED(hr = vkd3d_note_create(device, "d3d12_pipeline_state_create", d3d12_pipeline_state_create(device,
++            VK_PIPELINE_BIND_POINT_GRAPHICS, &pipeline_desc, &object))))
+         return hr;
+ 
+     return return_interface(&object->ID3D12PipelineState_iface,
+@@ -4083,11 +4118,11 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateComputePipelineState(d3d12_d
+     TRACE("iface %p, desc %p, riid %s, pipeline_state %p.\n",
+             iface, desc, debugstr_guid(riid), pipeline_state);
+ 
+-    if (FAILED(hr = vkd3d_pipeline_state_desc_from_d3d12_compute_desc(&pipeline_desc, desc)))
++    if (FAILED(hr = vkd3d_note_create(device, "vkd3d_pipeline_state_desc_from_d3d12_compute_desc", vkd3d_pipeline_state_desc_from_d3d12_compute_desc(&pipeline_desc, desc))))
+         return hr;
+ 
+-    if (FAILED(hr = d3d12_pipeline_state_create(device,
+-            VK_PIPELINE_BIND_POINT_COMPUTE, &pipeline_desc, &object)))
++    if (FAILED(hr = vkd3d_note_create(device, "d3d12_pipeline_state_create", d3d12_pipeline_state_create(device,
++            VK_PIPELINE_BIND_POINT_COMPUTE, &pipeline_desc, &object))))
+         return hr;
+ 
+     return return_interface(&object->ID3D12PipelineState_iface,
+@@ -4394,6 +4429,13 @@ static HRESULT d3d12_device_get_format_support(struct d3d12_device *device, D3D1
+                 }
+             }
+         }
++        /* Shared-exponent render targets are rare on native D3D12 hardware, so engines treat them as an optional
++         * fast path. On MoltenVK (Apple GPUs) they render but cannot blend natively and are very slow; hide them
++         * so applications take their standard (e.g. R11G11B10 / RGBA16F) path. */
++        if (data->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && vkd3d_relax_caps() && !getenv("VKD3D_ALLOW_R9G9B9E5_RT") &&
++                !(image_features & VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT))
++            image_features &= ~(VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT);
++
+         if (image_features & VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT)
+         {
+             data->Support1 |= D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET;
+@@ -4600,6 +4642,25 @@ static bool d3d12_barrier_layout_is_supported(D3D12_COMMAND_LIST_TYPE type, D3D1
+     return true;
+ }
+ 
++/* Experiment: report a discrete (non-UMA) GPU through D3D12_FEATURE_ARCHITECTURE(1). Some engines treat UMA as an
++ * integrated/low-power GPU. Enabled by VKD3D_REPORT_NON_UMA=1 or an existing C:\\gfx-nonuma.on file. */
++static bool vkd3d_report_non_uma(void)
++{
++    static int enabled = -1;
++    if (enabled < 0)
++    {
++        char env[16];
++        enabled = vkd3d_get_env_var("VKD3D_REPORT_NON_UMA", env, sizeof(env)) && env[0] == '1';
++#ifdef _WIN32
++        if (!enabled && GetFileAttributesA("C:\\gfx-nonuma.on") != INVALID_FILE_ATTRIBUTES)
++            enabled = 1;
++#endif
++        if (enabled)
++            vkd3d_failure_log("info", "experiment: reporting a non-UMA (discrete) GPU to the application");
++    }
++    return enabled;
++}
++
+ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_iface *iface,
+         D3D12_FEATURE feature, void *feature_data, UINT feature_data_size)
+ {
+@@ -4661,7 +4722,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_i
+             WARN("Assuming device does not support tile based rendering.\n");
+             data->TileBasedRenderer = FALSE;
+ 
+-            data->UMA = d3d12_device_is_uma(device, &coherent);
++            data->UMA = d3d12_device_is_uma(device, &coherent) && !vkd3d_report_non_uma();
+             data->CacheCoherentUMA = data->UMA ? coherent : FALSE;
+ 
+             TRACE("Tile based renderer %#x, UMA %#x, cache coherent UMA %#x.\n",
+@@ -4879,7 +4940,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_i
+             WARN("Assuming device does not support tile based rendering.\n");
+             data->TileBasedRenderer = FALSE;
+ 
+-            data->UMA = d3d12_device_is_uma(device, &coherent);
++            data->UMA = d3d12_device_is_uma(device, &coherent) && !vkd3d_report_non_uma();
+             data->CacheCoherentUMA = data->UMA ? coherent : FALSE;
+             data->IsolatedMMU = TRUE; /* Appears to be true Windows drivers */
+ 
+@@ -5565,7 +5626,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateDescriptorHeap(d3d12_device_
+     TRACE("iface %p, desc %p, riid %s, descriptor_heap %p.\n",
+             iface, desc, debugstr_guid(riid), descriptor_heap);
+ 
+-    if (FAILED(hr = d3d12_descriptor_heap_create(device, desc, &object)))
++    if (FAILED(hr = vkd3d_note_create(device, "d3d12_descriptor_heap_create", d3d12_descriptor_heap_create(device, desc, &object))))
+         return hr;
+ 
+     return return_interface(&object->ID3D12DescriptorHeap_iface,
+@@ -5594,7 +5655,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateRootSignature(d3d12_device_i
+ 
+     debug_ignored_node_mask(node_mask);
+ 
+-    if (FAILED(hr = d3d12_root_signature_create(device, bytecode, bytecode_length, &object)))
++    if (FAILED(hr = vkd3d_note_create(device, "d3d12_root_signature_create", d3d12_root_signature_create(device, bytecode, bytecode_length, &object))))
+         return hr;
+ 
+     return return_interface(&object->ID3D12RootSignature_iface,
+@@ -5618,8 +5679,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateRootSignatureFromSubobjectIn
+ 
+     /* NULL subobject_name segfaults on native, so don't need to check it. */
+ 
+-    if (FAILED(hr = d3d12_root_signature_create_from_subobject(device, library_blob, blob_length_in_bytes,
+-            subobject_name, &object)))
++    if (FAILED(hr = vkd3d_note_create(device, "d3d12_root_signature_create_from_subobject", d3d12_root_signature_create_from_subobject(device, library_blob, blob_length_in_bytes,
++            subobject_name, &object))))
+         return hr;
+ 
+     return return_interface(&object->ID3D12RootSignature_iface,
+@@ -6885,8 +6946,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_OpenSharedHandle(d3d12_device_ifac
+ 
+         if (SUCCEEDED(hr = d3d12_device_open_resource_descriptor(device, handle, &desc)))
+         {
+-            if (FAILED(hr = d3d12_resource_create_committed(device, &desc, &heap_props,
+-                    D3D12_HEAP_FLAG_SHARED, D3D12_RESOURCE_STATE_COMMON, NULL, 0, NULL, handle, &resource)))
++            if (FAILED(hr = vkd3d_note_resource_create(device, "d3d12_resource_create_committed", d3d12_resource_create_committed(device, &desc, &heap_props,
++                    D3D12_HEAP_FLAG_SHARED, D3D12_RESOURCE_STATE_COMMON, NULL, 0, NULL, handle, &resource), &desc)))
+             {
+                 WARN("Failed to open shared ID3D12Resource, hr %#x.\n", (int)hr);
+                 *object = NULL;
+@@ -7234,7 +7295,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateQueryHeap1(
+     TRACE("iface %p, desc %p, flags #%x, iid %s, heap %p.\n",
+             iface, desc, flags, debugstr_guid(iid), heap);
+ 
+-    if (FAILED(hr = d3d12_query_heap_create(device, desc, flags, &object)))
++    if (FAILED(hr = vkd3d_note_create(device, "d3d12_query_heap_create", d3d12_query_heap_create(device, desc, flags, &object))))
+         return hr;
+ 
+     return return_interface(&object->ID3D12QueryHeap_iface, &IID_ID3D12QueryHeap, iid, heap);
+@@ -7266,7 +7327,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateCommandSignature(d3d12_devic
+     TRACE("iface %p, desc %p, root_signature %p, iid %s, command_signature %p.\n",
+             iface, desc, root_signature, debugstr_guid(iid), command_signature);
+ 
+-    if (FAILED(hr = d3d12_command_signature_create(device, root_signature, desc, &object)))
++    if (FAILED(hr = vkd3d_note_create(device, "d3d12_command_signature_create", d3d12_command_signature_create(device, root_signature, desc, &object))))
+         return hr;
+ 
+     return return_interface(&object->ID3D12CommandSignature_iface,
+@@ -7526,10 +7587,10 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreatePipelineState(d3d12_device_i
+     TRACE("iface %p, desc %p, riid %s, pipeline_state %p.\n",
+             iface, desc, debugstr_guid(riid), pipeline_state);
+ 
+-    if (FAILED(hr = vkd3d_pipeline_state_desc_from_d3d12_stream_desc(&pipeline_desc, desc, &pipeline_type)))
++    if (FAILED(hr = vkd3d_note_create(device, "vkd3d_pipeline_state_desc_from_d3d12_stream_desc", vkd3d_pipeline_state_desc_from_d3d12_stream_desc(&pipeline_desc, desc, &pipeline_type))))
+         return hr;
+ 
+-    if (FAILED(hr = d3d12_pipeline_state_create(device, pipeline_type, &pipeline_desc, &object)))
++    if (FAILED(hr = vkd3d_note_create(device, "d3d12_pipeline_state_create", d3d12_pipeline_state_create(device, pipeline_type, &pipeline_desc, &object))))
+         return hr;
+ 
+     return return_interface(&object->ID3D12PipelineState_iface,
+@@ -7565,7 +7626,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_OpenExistingHeapFromAddress1(
+     heap_desc.Properties.VisibleNodeMask = 1;
+     heap_desc.SizeInBytes = size;
+ 
+-    if (FAILED(hr = d3d12_heap_create(device, &heap_desc, (void *)address, &object)))
++    if (FAILED(hr = vkd3d_note_create(device, "d3d12_heap_create", d3d12_heap_create(device, &heap_desc, (void *)address, &object))))
+     {
+         if (ppHeap)
+             *ppHeap = NULL;
+@@ -7718,7 +7779,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateHeap1(d3d12_device_iface *if
+     if (protected_session)
+         FIXME("Ignoring protected session %p.\n", protected_session);
+ 
+-    if (FAILED(hr = d3d12_heap_create(device, desc, NULL, &object)))
++    if (FAILED(hr = vkd3d_note_create(device, "d3d12_heap_create", d3d12_heap_create(device, desc, NULL, &object))))
+     {
+         *heap = NULL;
+         return hr;
+@@ -7744,8 +7805,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateReservedResource1(d3d12_devi
+ 
+     d3d12_resource_promote_desc(desc, &desc1);
+ 
+-    if (FAILED(hr = d3d12_resource_create_reserved(device, &desc1,
+-            initial_state, optimized_clear_value, 0, NULL, &object)))
++    if (FAILED(hr = vkd3d_note_resource_create(device, "d3d12_resource_create_reserved", d3d12_resource_create_reserved(device, &desc1,
++            initial_state, optimized_clear_value, 0, NULL, &object), &desc1)))
+         return hr;
+ 
+     return return_interface(&object->ID3D12Resource_iface, &IID_ID3D12Resource, iid, resource);
+@@ -8231,8 +8292,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateCommittedResource2(d3d12_dev
+     if (protected_session)
+         FIXME("Ignoring protected session %p.\n", protected_session);
+ 
+-    if (FAILED(hr = d3d12_resource_create_committed(device, desc, heap_properties,
+-            heap_flags, initial_state, optimized_clear_value, 0, NULL, NULL, &object)))
++    if (FAILED(hr = vkd3d_note_resource_create(device, "d3d12_resource_create_committed", d3d12_resource_create_committed(device, desc, heap_properties,
++            heap_flags, initial_state, optimized_clear_value, 0, NULL, NULL, &object), desc)))
+     {
+         if (resource)
+             *resource = NULL;
+@@ -8257,8 +8318,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreatePlacedResource1(d3d12_device
+             iface, heap, heap_offset, resource_desc, initial_state,
+             optimized_clear_value, debugstr_guid(iid), resource);
+ 
+-    if (FAILED(hr = d3d12_resource_create_placed(device, resource_desc, heap_object,
+-            heap_offset, initial_state, optimized_clear_value, 0, NULL, &object)))
++    if (FAILED(hr = vkd3d_note_resource_create(device, "d3d12_resource_create_placed", d3d12_resource_create_placed(device, resource_desc, heap_object,
++            heap_offset, initial_state, optimized_clear_value, 0, NULL, &object), resource_desc)))
+         return hr;
+ 
+     return return_interface(&object->ID3D12Resource_iface, &IID_ID3D12Resource, iid, resource);
+@@ -8561,9 +8622,9 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateCommittedResource3(d3d12_dev
+     /* For initial resource state, we cannot make use of the enhanced barrier layouts in any meaningful way.
+      * Just collapse them into the equivalent legacy layout.
+      * This can be refactored later if need be. */
+-    if (FAILED(hr = d3d12_resource_create_committed(device, desc, heap_properties,
++    if (FAILED(hr = vkd3d_note_resource_create(device, "d3d12_resource_create_committed", d3d12_resource_create_committed(device, desc, heap_properties,
+             heap_flags, vkd3d_barrier_layout_to_resource_state(initial_layout, desc->Flags),
+-            optimized_clear_value, num_castable_formats, castable_formats, NULL, &object)))
++            optimized_clear_value, num_castable_formats, castable_formats, NULL, &object), desc)))
+     {
+         if (resource)
+             *resource = NULL;
+@@ -8594,9 +8655,9 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreatePlacedResource2(d3d12_device
+         return E_INVALIDARG;
+     }
+ 
+-    if (FAILED(hr = d3d12_resource_create_placed(device, desc, heap_object,
++    if (FAILED(hr = vkd3d_note_resource_create(device, "d3d12_resource_create_placed", d3d12_resource_create_placed(device, desc, heap_object,
+             heap_offset, vkd3d_barrier_layout_to_resource_state(initial_layout, desc->Flags),
+-            optimized_clear_value, num_castable_formats, castable_formats, &object)))
++            optimized_clear_value, num_castable_formats, castable_formats, &object), desc)))
+         return hr;
+ 
+     return return_interface(&object->ID3D12Resource_iface, &IID_ID3D12Resource, iid, resource);
+@@ -8622,9 +8683,9 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateReservedResource2(d3d12_devi
+ 
+     d3d12_resource_promote_desc(desc, &desc1);
+ 
+-    if (FAILED(hr = d3d12_resource_create_reserved(device, &desc1,
++    if (FAILED(hr = vkd3d_note_resource_create(device, "d3d12_resource_create_reserved", d3d12_resource_create_reserved(device, &desc1,
+             vkd3d_barrier_layout_to_resource_state(initial_layout, desc1.Flags), optimized_clear_value,
+-            num_castable_formats, castable_formats, &object)))
++            num_castable_formats, castable_formats, &object), &desc1)))
+         return hr;
+ 
+     return return_interface(&object->ID3D12Resource_iface, &IID_ID3D12Resource, iid, resource);
+@@ -8976,6 +9037,12 @@ static D3D12_TILED_RESOURCES_TIER d3d12_device_determine_tiled_resources_tier(st
+     const VkPhysicalDeviceSparseProperties *sparse_properties = &device->device_info.properties2.properties.sparseProperties;
+     const VkPhysicalDeviceFeatures *features = &device->device_info.features2.features;
+ 
++    /* With no sparse binding, reserved resources are emulated with committed memory (see
++     * d3d12_resource_create_reserved). Applications such as RE Engine titles require tiled
++     * resources for their feature-level 12 path, so expose tier 2 when relaxing caps. */
++    if (!features->sparseBinding && vkd3d_relax_caps())
++        return D3D12_TILED_RESOURCES_TIER_2;
++
+     if (!features->sparseBinding || !features->sparseResidencyAliased ||
+             !features->sparseResidencyBuffer || !features->sparseResidencyImage2D ||
+             !sparse_properties->residencyStandard2DBlockShape ||
+@@ -9687,9 +9754,14 @@ static void d3d12_device_caps_init_feature_level(struct d3d12_device *device)
+ 
+     caps->max_feature_level = D3D_FEATURE_LEVEL_11_0;
+ 
++    /* UAVs reach shaders through the bindless descriptor heaps (update-after-bind), never through
++     * per-stage descriptor slots, so check the limits of that path. On MoltenVK the plain per-stage
++     * buffer limit is Metal's 31 discrete slots while argument buffers allow ~1M. */
+     if (caps->options.OutputMergerLogicOp && features->vertexPipelineStoresAndAtomics &&
+-            vk_info->device_limits.maxPerStageDescriptorStorageBuffers >= D3D12_UAV_SLOT_COUNT &&
+-            vk_info->device_limits.maxPerStageDescriptorStorageImages >= D3D12_UAV_SLOT_COUNT)
++            max(vk_info->device_limits.maxPerStageDescriptorStorageBuffers,
++                device->device_info.vulkan_1_2_properties.maxPerStageDescriptorUpdateAfterBindStorageBuffers) >= D3D12_UAV_SLOT_COUNT &&
++            max(vk_info->device_limits.maxPerStageDescriptorStorageImages,
++                device->device_info.vulkan_1_2_properties.maxPerStageDescriptorUpdateAfterBindStorageImages) >= D3D12_UAV_SLOT_COUNT)
+         caps->max_feature_level = D3D_FEATURE_LEVEL_11_1;
+ 
+     if (caps->max_feature_level >= D3D_FEATURE_LEVEL_11_1 &&
+@@ -9836,6 +9908,14 @@ static void d3d12_device_caps_init_shader_model(struct d3d12_device *device)
+             }
+         }
+ 
++        /* VKD3D_RELAX_CAPS: Metal has no per-shader FP32 denorm control. Expose SM 6.2+ anyway and let
++         * denorm-mode hints in shaders be ignored (hardware default behavior applies). */
++        if (!denorm_behavior && vkd3d_relax_caps())
++        {
++            WARN("VKD3D_RELAX_CAPS: exposing SM 6.2 without FP32 denorm controls.\n");
++            denorm_behavior = true;
++        }
++
+         if (denorm_behavior)
+         {
+             device->d3d12_caps.max_shader_model = D3D_SHADER_MODEL_6_2;
+@@ -10916,6 +10996,7 @@ bool d3d12_device_validate_shader_meta(struct d3d12_device *device, const struct
+ HRESULT d3d12_device_create(struct vkd3d_instance *instance,
+         const struct vkd3d_device_create_info *create_info, struct d3d12_device **device)
+ {
++    vkd3d_start_thread_sampler();
+     bool reject_existing_device = false;
+     bool forced_singletons = false;
+     struct d3d12_device *object;
+@@ -11266,6 +11347,11 @@ void d3d12_device_mark_as_removed(struct d3d12_device *device, HRESULT reason,
+             device, (int)reason, vkd3d_dbg_vsprintf(message, args));
+     va_end(args);
+ 
++    va_start(args, message);
++    vkd3d_failure_log("device-removed", "D3D12 device removed (reason %#x): %s", (unsigned int)reason,
++            vkd3d_dbg_vsprintf(message, args));
++    va_end(args);
++
+     vkd3d_atomic_uint32_store_explicit(&device->removed_reason, reason, vkd3d_memory_order_release);
+ }
+ 
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index 39e4b0b..a5b4334 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -2883,7 +2883,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_resource_GetHeapProperties(d3d12_resource
+         return S_OK;
+     }
+ 
+-    if (resource->flags & VKD3D_RESOURCE_RESERVED)
++    if (resource->flags & (VKD3D_RESOURCE_RESERVED | VKD3D_RESOURCE_EMULATED_RESERVED))
+     {
+         WARN("Cannot get heap properties for reserved resources.\n");
+         return E_INVALIDARG;
+@@ -4886,6 +4886,65 @@ fail:
+     return hr;
+ }
+ 
++/* CreateReservedResource rules for the reported tier (emulation path, where nothing Vulkan-side enforces them):
++ * buffers need ROW_MAJOR and no clear value; textures need 64KB_UNDEFINED_SWIZZLE, are 2D, single-plane, and
++ * below tier 4 an array may not have packed mips (mips smaller than a tile). */
++static HRESULT d3d12_resource_validate_emulated_reserved(struct d3d12_device *device,
++        const D3D12_RESOURCE_DESC1 *desc, const D3D12_CLEAR_VALUE *optimized_clear_value)
++{
++    static const struct { unsigned int byte_count, width, height; } tile_shapes[] =
++    {
++        { 1, 256, 256 }, { 2, 256, 128 }, { 4, 128, 128 }, { 8, 128, 64 }, { 16, 64, 64 },
++    };
++    const struct vkd3d_format *format;
++    unsigned int tile_w = 0, tile_h = 0, i;
++    unsigned int last_mip_w, last_mip_h;
++
++    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
++    {
++        if (desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR || optimized_clear_value)
++            return E_INVALIDARG;
++        return S_OK;
++    }
++
++    if (desc->Layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE)
++        return E_INVALIDARG;
++
++    /* Tier 3 is needed for 3D; 1D textures are never tiled. */
++    if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
++            !(desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
++              device->d3d12_caps.options.TiledResourcesTier >= D3D12_TILED_RESOURCES_TIER_3))
++        return E_INVALIDARG;
++
++    if (!(format = vkd3d_get_format(device, desc->Format, !!(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))))
++        return E_INVALIDARG;
++    if (vkd3d_popcount(format->vk_aspect_mask) != 1)
++        return E_INVALIDARG;
++
++    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc->DepthOrArraySize > 1 &&
++            device->d3d12_caps.options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_4)
++    {
++        for (i = 0; i < ARRAY_SIZE(tile_shapes); i++)
++        {
++            if (tile_shapes[i].byte_count == format->byte_count)
++            {
++                tile_w = tile_shapes[i].width * format->block_width;
++                tile_h = tile_shapes[i].height * format->block_height;
++            }
++        }
++        if (tile_w)
++        {
++            unsigned int levels = desc->MipLevels ? desc->MipLevels : max_miplevel_count(desc);
++            last_mip_w = max(1u, (unsigned int)(desc->Width >> (levels - 1)));
++            last_mip_h = max(1u, desc->Height >> (levels - 1));
++            if (last_mip_w < tile_w || last_mip_h < tile_h)
++                return E_INVALIDARG;
++        }
++    }
++
++    return S_OK;
++}
++
+ HRESULT d3d12_resource_create_reserved(struct d3d12_device *device,
+         const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES initial_state,
+         const D3D12_CLEAR_VALUE *optimized_clear_value,
+@@ -4896,6 +4955,21 @@ HRESULT d3d12_resource_create_reserved(struct d3d12_device *device,
+     struct d3d12_resource *object;
+     HRESULT hr;
+ 
++    /* No sparse binding at all (e.g. MoltenVK): emulate tiled resources with fully committed memory.
++     * Tile mapping updates become no-ops. Exact as long as the application writes tiles through the
++     * reserved resource itself; aliasing heap tiles between resources is not emulated. */
++    if (!device->device_info.features2.features.sparseBinding)
++    {
++        if (FAILED(hr = d3d12_resource_validate_emulated_reserved(device, desc, optimized_clear_value)))
++            return hr;
++        WARN("Emulating reserved resource with a committed resource (no sparse binding support).\n");
++        if (FAILED(hr = d3d12_resource_create_reserved_fallback(device, desc, initial_state,
++                optimized_clear_value, num_castable_formats, castable_formats, resource)))
++            return hr;
++        (*resource)->flags |= VKD3D_RESOURCE_EMULATED_RESERVED;
++        return S_OK;
++    }
++
+     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+     {
+         format = vkd3d_get_format(device, desc->Format, !!(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
+@@ -7186,7 +7260,18 @@ static struct vkd3d_view *vkd3d_create_texture_srv_view(struct d3d12_device *dev
+         }
+     }
+ 
+-    return vkd3d_view_map_create_view(&resource->view_map, device, &key);
++    {
++        struct vkd3d_view *view = vkd3d_view_map_create_view(&resource->view_map, device, &key);
++        if (view)
++        {
++            view->diag_resource = resource;
++            view->diag_width = (uint32_t)resource->desc.Width;
++            view->diag_height = resource->desc.Height;
++            view->diag_dxgi_format = resource->desc.Format;
++            view->diag_resource_flags = resource->flags;
++        }
++        return view;
++    }
+ }
+ 
+ static void vkd3d_create_texture_srv_embedded(vkd3d_cpu_descriptor_va_t desc_va,
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index b640fb7..222a551 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -2908,6 +2908,7 @@ void d3d12_pipeline_state_dec_ref(struct d3d12_pipeline_state *state)
+         if (state->pipeline_type == VKD3D_PIPELINE_TYPE_GRAPHICS || state->pipeline_type == VKD3D_PIPELINE_TYPE_MESH_GRAPHICS)
+             d3d12_pipeline_state_free_cached_desc(&state->graphics.cached_desc);
+         rwlock_destroy(&state->lock);
++        vkd3d_free(state->diag_ps_code);
+         vkd3d_free(state);
+     }
+ }
+@@ -6316,6 +6317,60 @@ static HRESULT d3d12_pipeline_create_private_root_signature(struct d3d12_device
+     return S_OK;
+ }
+ 
++/* Diagnostic: track PSOs whose cached blob was rejected (E_INVALIDARG) and whether the
++ * application later recreates the same PSO (same state hash) without the blob. */
++#define VKD3D_PSO_RETRY_MAX 256
++static pthread_mutex_t vkd3d_pso_retry_lock = PTHREAD_MUTEX_INITIALIZER;
++static uint64_t vkd3d_pso_retry_hashes[VKD3D_PSO_RETRY_MAX];
++static unsigned int vkd3d_pso_retry_count, vkd3d_pso_retry_done, vkd3d_pso_retry_total;
++static uint64_t vkd3d_pso_retry_last_report;
++
++static void vkd3d_pso_retry_note_rejected(uint64_t hash)
++{
++    pthread_mutex_lock(&vkd3d_pso_retry_lock);
++    vkd3d_pso_retry_total++;
++    if (vkd3d_pso_retry_count < VKD3D_PSO_RETRY_MAX)
++        vkd3d_pso_retry_hashes[vkd3d_pso_retry_count++] = hash;
++    pthread_mutex_unlock(&vkd3d_pso_retry_lock);
++}
++
++static void vkd3d_pso_retry_note_created(uint64_t hash)
++{
++    unsigned int i;
++    bool found = false;
++    pthread_mutex_lock(&vkd3d_pso_retry_lock);
++    for (i = 0; i < vkd3d_pso_retry_count; i++)
++    {
++        if (vkd3d_pso_retry_hashes[i] == hash)
++        {
++            vkd3d_pso_retry_hashes[i] = vkd3d_pso_retry_hashes[--vkd3d_pso_retry_count];
++            vkd3d_pso_retry_done++;
++            found = true;
++            break;
++        }
++    }
++    pthread_mutex_unlock(&vkd3d_pso_retry_lock);
++    if (found)
++        vkd3d_failure_log("pso-retry", "PSO with rejected cached blob was recreated successfully");
++}
++
++void vkd3d_pso_retry_report(void)
++{
++    unsigned int pending, done, total;
++    uint64_t now = vkd3d_get_current_time_ns();
++    pthread_mutex_lock(&vkd3d_pso_retry_lock);
++    if (!vkd3d_pso_retry_total || now - vkd3d_pso_retry_last_report < 60ull * 1000000000ull)
++    {
++        pthread_mutex_unlock(&vkd3d_pso_retry_lock);
++        return;
++    }
++    vkd3d_pso_retry_last_report = now;
++    pending = vkd3d_pso_retry_count; done = vkd3d_pso_retry_done; total = vkd3d_pso_retry_total;
++    pthread_mutex_unlock(&vkd3d_pso_retry_lock);
++    vkd3d_failure_log("pso-retry", "status: %u PSOs had their cached blob rejected, %u recreated without it, %u never recreated",
++            total, done, pending);
++}
++
+ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindPoint bind_point,
+         const struct d3d12_pipeline_state_desc *desc, struct d3d12_pipeline_state **state)
+ {
+@@ -6380,6 +6435,8 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
+ 
+         if (FAILED(hr))
+         {
++            if (hr == E_INVALIDARG)
++                vkd3d_pso_retry_note_rejected(object->pipeline_cache_compat.state_desc_compat_hash);
+             if (object->root_signature)
+                 d3d12_root_signature_dec_ref(object->root_signature);
+             rwlock_destroy(&object->lock);
+@@ -6517,6 +6574,29 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
+     }
+ 
+     TRACE("Created pipeline state %p.\n", object);
++    vkd3d_pso_retry_note_created(object->pipeline_cache_compat.state_desc_compat_hash);
++
++    if (vkd3d_diagnostics_enabled() && bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS && desc->rtv_formats.NumRenderTargets == 1 &&
++            desc->ps.BytecodeLength && desc->ps.BytecodeLength <= 1024 * 1024)
++    {
++        switch (desc->rtv_formats.RTFormats[0])
++        {
++            case DXGI_FORMAT_R10G10B10A2_UNORM:
++            case DXGI_FORMAT_R8G8B8A8_UNORM:
++            case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
++            case DXGI_FORMAT_B8G8R8A8_UNORM:
++            case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
++            case DXGI_FORMAT_R16G16B16A16_FLOAT:
++                if ((object->diag_ps_code = vkd3d_malloc(desc->ps.BytecodeLength)))
++                {
++                    memcpy(object->diag_ps_code, desc->ps.pShaderBytecode, desc->ps.BytecodeLength);
++                    object->diag_ps_size = desc->ps.BytecodeLength;
++                }
++                break;
++            default:
++                break;
++        }
++    }
+ 
+ #ifdef VKD3D_ENABLE_PROFILING
+     vkd3d_timestamp_profiler_register_pipeline_state(device->timestamp_profiler, object);
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 2c6e9c7..ff80f97 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -818,6 +818,7 @@ static HRESULT dxgi_vk_swap_chain_reallocate_user_buffers(struct dxgi_vk_swap_ch
+             goto err;
+ 
+         /* We need to hold a private reference to the resource, not a public one. */
++        chain->user.backbuffers[i]->flags |= VKD3D_RESOURCE_SWAPCHAIN_BACKBUFFER;
+         vkd3d_resource_incref((ID3D12Resource *)&chain->user.backbuffers[i]->ID3D12Resource_iface);
+         ID3D12Resource2_Release(&chain->user.backbuffers[i]->ID3D12Resource_iface);
+ 
+@@ -1129,6 +1130,18 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
+             iface, SyncInterval, PresentFlags, pPresentParameters);
+     (void)pPresentParameters;
+ 
++    vkd3d_pso_retry_report();
++    vkd3d_fence_stall_report();
++    vkd3d_queue_activity_report();
++
++    /* Like DXGI: once the device is removed, Present fails instead of silently presenting nothing,
++     * so the application notices (and can query GetDeviceRemovedReason / recreate the device). */
++    {
++        HRESULT removed = d3d12_device_removed_reason(chain->queue->device);
++        if (FAILED(removed))
++            return removed;
++    }
++
+     if (dxgi_vk_swap_chain_present_is_occluded(chain, PresentFlags))
+         return DXGI_STATUS_OCCLUDED;
+     if (PresentFlags & DXGI_PRESENT_TEST)
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index b0ebd55..3299f14 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -652,12 +652,14 @@ struct vkd3d_waiting_event
+     bool *latch;
+     uint32_t *payload;
+     struct vkd3d_queue_timeline_trace_cookie timeline_cookie;
++    uint64_t diag_start_ns;
+ };
+ 
+ struct vkd3d_fence_wait_ticket
+ {
+     uint64_t ticket;
+     uint64_t virtual_value;
++    uint64_t diag_start_ns;
+ };
+ 
+ struct d3d12_fence
+@@ -695,8 +697,18 @@ struct d3d12_fence
+ 
+     struct vkd3d_private_store private_store;
+     struct d3d_destruction_notifier destruction_notifier;
++
++    /* Stall diagnostics (vkd3d_fence_stall_report). */
++    struct list diag_entry;
++    uint32_t diag_id;
++    LONG diag_polls;
++    uint64_t diag_last_value;
+ };
+ 
++void vkd3d_fence_stall_report(void);
++void vkd3d_queue_activity_report(void);
++void vkd3d_queue_diag_set_creator(struct d3d12_command_queue *queue, const void *return_address);
++
+ static inline struct d3d12_fence *impl_from_ID3D12Fence1(ID3D12Fence1 *iface)
+ {
+     extern CONST_VTBL struct ID3D12Fence1Vtbl d3d12_fence_vtbl;
+@@ -1096,7 +1108,11 @@ enum vkd3d_resource_flag
+     VKD3D_RESOURCE_ZERO_INITIALIZED       = (1u << 8),
+     VKD3D_RESOURCE_RETAINED_GPU_REFERENCE = (1u << 9),
+     VKD3D_RESOURCE_COPY_QUEUE_COMPATIBLE  = (1u << 10),
+-    VKD3D_RESOURCE_INPUT_ATTACHMENT       = (1u << 11)
++    VKD3D_RESOURCE_INPUT_ATTACHMENT       = (1u << 11),
++    /* Reserved resource emulated with committed memory (no sparse binding); behaves as RESERVED at the API. */
++    VKD3D_RESOURCE_EMULATED_RESERVED      = (1u << 12),
++    /* Diagnostics: a DXGI swapchain backbuffer handed to the application. */
++    VKD3D_RESOURCE_SWAPCHAIN_BACKBUFFER   = (1u << 13)
+ };
+ 
+ #define VKD3D_INVALID_TILE_INDEX (~0u)
+@@ -1367,6 +1383,11 @@ struct vkd3d_view
+             unsigned int w_size;
+         } texture;
+     } info;
++    /* Diagnostics: the resource an SRV image view was made from. */
++    const void *diag_resource;
++    uint32_t diag_width, diag_height;
++    uint32_t diag_dxgi_format;
++    uint32_t diag_resource_flags;
+ };
+ 
+ void vkd3d_view_decref(struct vkd3d_view *view, struct d3d12_device *device);
+@@ -2427,6 +2448,9 @@ struct d3d12_pipeline_state
+     struct d3d12_root_signature *root_signature;
+     struct d3d12_device *device;
+     bool root_signature_compat_hash_is_dxbc_derived;
++    /* Diagnostics: copy of the pixel shader bytecode for PSOs that could draw into a swapchain backbuffer. */
++    void *diag_ps_code;
++    size_t diag_ps_size;
+     bool pso_is_loaded_from_cached_blob;
+     bool pso_is_fully_dynamic;
+ 
+@@ -2536,6 +2560,7 @@ struct vkd3d_pipeline_key
+ };
+ 
+ bool d3d12_pipeline_state_has_replaced_shaders(struct d3d12_pipeline_state *state);
++void vkd3d_pso_retry_report(void);
+ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindPoint bind_point,
+         const struct d3d12_pipeline_state_desc *desc, struct d3d12_pipeline_state **state);
+ VkPipeline d3d12_pipeline_state_get_or_create_pipeline(struct d3d12_pipeline_state *state,
+@@ -3533,6 +3558,28 @@ struct d3d12_command_list
+     size_t pending_queries_count;
+ 
+     const struct vkd3d_descriptor_metadata_view *cbv_srv_uav_descriptors_view;
++    const struct d3d12_descriptor_heap *diag_cbv_srv_uav_heap; /* diagnostics only */
++    /* Diagnostics: tables of the last backbuffer draw, re-read at ExecuteCommandLists. */
++    bool diag_bb_pending;
++    const struct vkd3d_descriptor_metadata_view *diag_bb_view;
++    uint32_t diag_bb_heap_size;
++    uint32_t diag_bb_count;
++    uint32_t diag_bb_params[4];
++    uint32_t diag_bb_offsets[4];
++    /* Diagnostics: last render targets bound with OMSetRenderTargets in this list (ring). */
++    const void *diag_rt_ring[6];
++    uint32_t diag_rt_w[6], diag_rt_h[6], diag_rt_fmt[6], diag_rt_draws[6];
++    uint32_t diag_rt_head, diag_rt_used;
++    /* Diagnostics: ring of resource-touching commands recorded in this list. */
++    struct vkd3d_diag_event
++    {
++        uint8_t kind; uint8_t sub; const void *res; uint32_t a, b;
++        /* Snapshot taken when recorded; never dereference res later (it may be destroyed). */
++        uint32_t w, h, fmt; const void *heap; uint64_t off;
++    } diag_ev[64];
++    uint32_t diag_ev_count;
++    uint32_t diag_dispatches, diag_copies;
++    uint64_t diag_copy_bytes;
+ 
+     struct d3d12_resource *vrs_image;
+ 
+@@ -3908,6 +3955,14 @@ struct d3d12_command_queue
+     d3d12_command_queue_iface ID3D12CommandQueue_iface;
+     d3d12_command_queue_vkd3d_ext_iface ID3D12CommandQueueExt_iface;
+ 
++    /* Diagnostics: activity counters, reported by vkd3d_queue_activity_report(). */
++    struct list diag_entry;
++    uint32_t diag_id;
++    char diag_creator[64];
++    LONG diag_ecl, diag_lists, diag_signals, diag_waits, diag_dispatches, diag_copies;
++    LONG64 diag_copy_bytes;
++    uint64_t diag_last_signal_value;
++
+     LONG refcount;
+ 
+     D3D12_COMMAND_QUEUE_DESC desc;
+diff --git a/tests/d3d12_pso.c b/tests/d3d12_pso.c
+index 4111a5f..ffee2e2 100644
+--- a/tests/d3d12_pso.c
++++ b/tests/d3d12_pso.c
+@@ -5478,3 +5478,92 @@ void test_unusual_builtin_stage_io_dxil(void)
+     test_unusual_builtin_stage_io(true);
+ }
+ 
++
++/* Renders through an output-merger logic op and checks the exact integer result (not just PSO creation). */
++void test_logic_op_rendering(void)
++{
++    static const struct { D3D12_LOGIC_OP op; unsigned int expected; } tests[] =
++    {
++        { D3D12_LOGIC_OP_XOR,  0x3c3c3c3c },  /* 0x33 ^ 0x0f */
++        { D3D12_LOGIC_OP_AND,  0x03030303 },  /* 0x33 & 0x0f */
++        { D3D12_LOGIC_OP_OR,   0x3f3f3f3f },  /* 0x33 | 0x0f */
++        { D3D12_LOGIC_OP_COPY, 0x0f0f0f0f },
++        { D3D12_LOGIC_OP_NOOP, 0x33333333 },
++    };
++    static const float clear_value[] = { 51.0f, 51.0f, 51.0f, 51.0f };
++    D3D12_FEATURE_DATA_D3D12_OPTIONS options;
++    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc;
++    D3D12_SUBRESOURCE_DATA subresource;
++    struct test_context_desc desc;
++    struct test_context context;
++    ID3D12DescriptorHeap *heap;
++    ID3D12PipelineState *pso;
++    ID3D12Resource *texture;
++    unsigned int data[32 * 32];
++    unsigned int i;
++    HRESULT hr;
++
++#include "shaders/depth_stencil/headers/ps_load_stencil.h"
++
++    memset(&desc, 0, sizeof(desc));
++    desc.rt_format = DXGI_FORMAT_R8G8B8A8_UINT;
++    desc.no_root_signature = true;
++    if (!init_test_context(&context, &desc))
++        return;
++
++    if (FAILED(ID3D12Device_CheckFeatureSupport(context.device, D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
++            !options.OutputMergerLogicOp)
++    {
++        skip("Logic ops not supported.\n");
++        destroy_test_context(&context);
++        return;
++    }
++
++    context.root_signature = create_texture_root_signature(context.device, D3D12_SHADER_VISIBILITY_PIXEL, 0, 0);
++    for (i = 0; i < ARRAY_SIZE(data); i++)
++        data[i] = 0x0f0f0f0f;
++    texture = create_default_texture(context.device, 32, 32, DXGI_FORMAT_R8G8B8A8_UINT, 0, D3D12_RESOURCE_STATE_COPY_DEST);
++    subresource.pData = data;
++    subresource.RowPitch = 32 * sizeof(*data);
++    subresource.SlicePitch = sizeof(data);
++    upload_texture_data(texture, &subresource, 1, context.queue, context.list);
++    reset_command_list(context.list, context.allocator);
++    transition_resource_state(context.list, texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++
++    heap = create_gpu_descriptor_heap(context.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
++    ID3D12Device_CreateShaderResourceView(context.device, texture, NULL, get_cpu_descriptor_handle(&context, heap, 0));
++
++    for (i = 0; i < ARRAY_SIZE(tests); i++)
++    {
++        vkd3d_test_set_context("logic op %u", tests[i].op);
++        init_pipeline_state_desc(&pso_desc, context.root_signature, desc.rt_format, NULL, &ps_load_stencil_dxbc, NULL);
++        pso_desc.BlendState.RenderTarget[0].LogicOpEnable = TRUE;
++        pso_desc.BlendState.RenderTarget[0].LogicOp = tests[i].op;
++        hr = ID3D12Device_CreateGraphicsPipelineState(context.device, &pso_desc, &IID_ID3D12PipelineState, (void **)&pso);
++        ok(hr == S_OK, "Failed to create pipeline, hr %#x.\n", (int)hr);
++        if (FAILED(hr))
++            continue;
++
++        ID3D12GraphicsCommandList_ClearRenderTargetView(context.list, context.rtv, clear_value, 0, NULL);
++        ID3D12GraphicsCommandList_OMSetRenderTargets(context.list, 1, &context.rtv, false, NULL);
++        ID3D12GraphicsCommandList_SetDescriptorHeaps(context.list, 1, &heap);
++        ID3D12GraphicsCommandList_SetGraphicsRootSignature(context.list, context.root_signature);
++        ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(context.list, 0,
++                ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(heap));
++        ID3D12GraphicsCommandList_SetPipelineState(context.list, pso);
++        ID3D12GraphicsCommandList_RSSetViewports(context.list, 1, &context.viewport);
++        ID3D12GraphicsCommandList_RSSetScissorRects(context.list, 1, &context.scissor_rect);
++        ID3D12GraphicsCommandList_IASetPrimitiveTopology(context.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++        ID3D12GraphicsCommandList_DrawInstanced(context.list, 3, 1, 0, 0);
++        transition_resource_state(context.list, context.render_target, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
++        check_sub_resource_uint(context.render_target, 0, context.queue, context.list, tests[i].expected, 0);
++        reset_command_list(context.list, context.allocator);
++        transition_resource_state(context.list, context.render_target, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
++        ID3D12PipelineState_Release(pso);
++    }
++    vkd3d_test_set_context(NULL);
++
++    ID3D12Resource_Release(texture);
++    ID3D12DescriptorHeap_Release(heap);
++    destroy_test_context(&context);
++}
+diff --git a/tests/d3d12_tests.h b/tests/d3d12_tests.h
+index f243ced..806bb98 100644
+--- a/tests/d3d12_tests.h
++++ b/tests/d3d12_tests.h
+@@ -51,6 +51,7 @@ decl_test(test_create_root_signature);
+ decl_test(test_root_signature_limits);
+ decl_test(test_create_compute_pipeline_state);
+ decl_test(test_create_graphics_pipeline_state);
++decl_test(test_logic_op_rendering);
+ decl_test(test_create_pipeline_state);
+ decl_test(test_create_fence);
+ decl_test(test_object_interface);

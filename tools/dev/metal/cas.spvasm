@@ -1,0 +1,43 @@
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %gid
+               OpExecutionMode %main LocalSize 64 1 1
+               OpDecorate %gid BuiltIn LocalInvocationIndex
+               OpDecorate %outbuf Binding 0
+               OpDecorate %outbuf DescriptorSet 0
+               OpDecorate %Out Block
+               OpMemberDecorate %Out 0 Offset 0
+               OpDecorate %arr_rt ArrayStride 4
+       %void = OpTypeVoid
+       %fn   = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+       %bool = OpTypeBool
+     %uint_0 = OpConstant %uint 0
+     %uint_1 = OpConstant %uint 1
+     %uint_2 = OpConstant %uint 2
+   %uint_264 = OpConstant %uint 264
+    %uint_16 = OpConstant %uint 16
+     %arr16  = OpTypeArray %uint %uint_16
+   %ptr_wg_arr = OpTypePointer Workgroup %arr16
+   %ptr_wg_u = OpTypePointer Workgroup %uint
+     %shared = OpVariable %ptr_wg_arr Workgroup
+    %arr_rt  = OpTypeRuntimeArray %uint
+       %Out  = OpTypeStruct %arr_rt
+   %ptr_sb   = OpTypePointer StorageBuffer %Out
+   %ptr_sb_u = OpTypePointer StorageBuffer %uint
+     %outbuf = OpVariable %ptr_sb StorageBuffer
+   %ptr_in_u = OpTypePointer Input %uint
+       %gid  = OpVariable %ptr_in_u Input
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+         %id = OpLoad %uint %gid
+          %p = OpAccessChain %ptr_wg_u %shared %uint_0
+        %old = OpLoad %uint %p
+        %new = OpIAdd %uint %old %id
+       %orig = OpAtomicCompareExchange %uint %p %uint_2 %uint_0 %uint_0 %new %old
+         %ok = OpIEqual %bool %orig %old
+         %ou = OpSelect %uint %ok %uint_1 %uint_0
+          %q = OpAccessChain %ptr_sb_u %outbuf %uint_0 %id
+               OpStore %q %ou
+               OpReturn
+               OpFunctionEnd
