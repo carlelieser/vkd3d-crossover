@@ -8,6 +8,7 @@ CX="$APP/Contents/SharedSupport/CrossOver"
 BOTTLES="$HOME/Library/Application Support/CrossOver/Bottles"
 LOGDIR="$HOME/Library/Logs/vkd3d-crossover"
 MARKER="$APP/Contents/SharedSupport/vkd3d-crossover"   # BUILDINFO of the installed build
+REPO="carlelieser/vkd3d-crossover"
 # DLLs installed into a bottle; d3d11 and dxgi must always come from the same implementation (DXVK).
 DLLS=(d3d12 d3d12core dxgi d3d11)
 # Games verified with this stack (per-game DLL overrides are set for these by default).

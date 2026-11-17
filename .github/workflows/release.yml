@@ -1,0 +1,62 @@
+# Build the release binaries from versions.lock + patches/ on macOS.
+# - Every push to main / pull request: build only (artifact kept for 14 days).
+# - Tag v*: build and publish a GitHub release with vkd3d-crossover-release.tar.gz (what scripts/install.sh downloads).
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore: ['**.md']
+  pull_request:
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          brew install mingw-w64 meson ninja glslang
+          xcodebuild -version
+
+      - name: Fetch sources (versions.lock)
+        run: tools/dev/fetch.sh
+
+      - name: Apply shipping patches
+        run: tools/dev/apply-patches.sh
+
+      - name: Build
+        run: tools/dev/build.sh --package
+
+      - name: Checksum
+        run: |
+          cd out
+          shasum -a 256 vkd3d-crossover-release.tar.gz > vkd3d-crossover-release.tar.gz.sha256
+          cat release/BUILDINFO
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vkd3d-crossover-release
+          path: |
+            out/vkd3d-crossover-release.tar.gz
+            out/vkd3d-crossover-release.tar.gz.sha256
+          retention-days: 14
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            out/vkd3d-crossover-release.tar.gz \
+            out/vkd3d-crossover-release.tar.gz.sha256 \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Built from versions.lock + patches/ at $GITHUB_SHA. Install: \`scripts/install.sh\` (downloads this release). See README.md."

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Build everything from the patched trees in src/ and collect the binaries in out/<variant>/.
 #
-#   tools/dev/build.sh [moltenvk|vkd3d-proton|dxvk ...]     (default: all)
+#   tools/dev/build.sh [--package] [moltenvk|vkd3d-proton|dxvk ...]     (default: all)
+#
+#   --package   also write out/vkd3d-crossover-<variant>.tar.gz (what GitHub releases ship)
 #
 # <variant> is what apply-patches.sh applied: "release" (shipping patches) or "dev" (+ diagnostics).
 # Needs: Xcode (MoltenVK), meson + ninja + mingw-w64 (vkd3d-proton, DXVK, 64-bit Windows DLLs).
@@ -10,7 +12,9 @@
 [ -f "$SRC/.variant" ] || die "run tools/dev/apply-patches.sh first"
 variant="$(cat "$SRC/.variant")"
 dest="$OUT/$variant"
-targets=("$@"); [ ${#targets[@]} -gt 0 ] || targets=(moltenvk vkd3d-proton dxvk)
+package=0 targets=()
+for a in "$@"; do case "$a" in --package) package=1 ;; *) targets+=("$a") ;; esac; done
+[ ${#targets[@]} -gt 0 ] || targets=(moltenvk vkd3d-proton dxvk)
 mkdir -p "$dest"
 
 build_moltenvk() {
@@ -36,7 +40,8 @@ build_moltenvk() {
 	  log "MoltenVK: library (private Metal API on: needed for logic ops / feature level 11_1+)"
 	  make macos MVK_USE_METAL_PRIVATE_API=1 )
 	cp "$m/Package/Release/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib" "$dest/"
-	if [ "$variant" = release ] && strings "$dest/libMoltenVK.dylib" | grep -q -e gfx-failures -e MVK_PASS_PROBE; then
+	# grep -c, not -q: with pipefail, -q's early exit (SIGPIPE in strings) would hide a leak
+	if [ "$variant" = release ] && [ "$(strings "$dest/libMoltenVK.dylib" | grep -c -e gfx-failures -e MVK_PASS_PROBE)" -gt 0 ]; then
 		die "release libMoltenVK.dylib contains dev diagnostics strings"
 	fi
 }
@@ -76,6 +81,23 @@ done
 	echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 	grep -v '^#' "$ROOT/versions.lock"
 } > "$dest/BUILDINFO"
+# Licenses of everything in the binaries, and where their source is (vkd3d-proton is LGPL-2.1).
+mkdir -p "$dest/licenses"
+cp "$SRC/moltenvk/LICENSE"                          "$dest/licenses/MoltenVK-Apache-2.0.txt"
+cp "$SRC/moltenvk/External/SPIRV-Cross/LICENSE"     "$dest/licenses/SPIRV-Cross-Apache-2.0.txt"
+cp "$SRC/vkd3d-proton/COPYING"                      "$dest/licenses/vkd3d-proton-LGPL-2.1.txt"
+cp "$SRC/vkd3d-proton/subprojects/dxil-spirv/LICENSE.MIT" "$dest/licenses/dxil-spirv-MIT.txt"
+cp "$SRC/dxvk/LICENSE"                              "$dest/licenses/DXVK-zlib.txt"
+cat > "$dest/licenses/SOURCE.txt" <<SRCEOF
+Source code for these binaries: each upstream project at the commit listed in BUILDINFO, plus the patches in
+https://github.com/carlelieser/vkd3d-crossover (patches/), at the vkd3d-crossover revision listed in BUILDINFO.
+Rebuild with tools/dev/fetch.sh, tools/dev/apply-patches.sh and tools/dev/build.sh from that repository.
+SRCEOF
 ( cd "$dest" && shasum -a 256 ./*.dylib ./*.dll 2>/dev/null > SHA256SUMS || true )
+if [ "$package" = 1 ]; then
+	tarball="$OUT/vkd3d-crossover-$variant.tar.gz"
+	tar -C "$OUT" -czf "$tarball" "$variant"
+	log "Package: $tarball"
+fi
 log "Done: $dest"
 ls -l "$dest"

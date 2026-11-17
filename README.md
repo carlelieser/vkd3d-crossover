@@ -6,7 +6,7 @@ including 64-bit atomics that M1 lacks in hardware.
 
 Verified with **Resident Evil Requiem** and **PRAGMATA SKETCHBOOK** (RE Engine) on an M1 Max.
 
-> Status: working, pre-release. Scripts and prebuilt releases are in progress; see [Roadmap](#roadmap).
+> Status: working, pre-release. Install scripts are done and tested; the first prebuilt release is pending — see [Roadmap](#roadmap).
 
 ---
 
@@ -120,10 +120,10 @@ device-generated commands (some ExecuteIndirect state).
 ## How it installs
 
 ### Quick start
-Prebuilt releases are coming; for now build first (see [Building from source](#building-from-source)), then:
+Clone this repository, then:
 
 ```sh
-scripts/install.sh                                         # clone CrossOver, install our MoltenVK
+scripts/install.sh                                         # latest release (or your local build), clone CrossOver
 scripts/setup-bottle.sh Steam-D3D12 --create --install-steam  # new bottle + DLLs + per-game overrides + Steam
 scripts/launch-steam.sh Steam-D3D12                        # start Steam (launch games from this window)
 ```
@@ -131,7 +131,11 @@ scripts/launch-steam.sh Steam-D3D12                        # start Steam (launch
 Then sign in to Steam and add your library folders (Steam → Settings → Storage; your home folder is drive `Y:`).
 Start games **from the Steam started by `launch-steam.sh`**, not from the CrossOver app — CrossOver's own MoltenVK
 is too old for vkd3d-proton. Enable another game with `scripts/setup-bottle.sh Steam-D3D12 --game Game.exe`.
-Re-run `scripts/install.sh --force` after updating CrossOver.
+Re-run `scripts/install.sh --force` after updating CrossOver. `scripts/doctor.sh Steam-D3D12` checks the whole setup;
+`scripts/uninstall.sh --bottle Steam-D3D12` undoes it (the bottle, Steam and your games are kept).
+
+**Resident Evil Requiem renders at a tiny resolution?** If it was ever started under Wine's old display-mode list, its
+saved mode is wrong. Close the game and run `scripts/fix-game-config.sh "<Requiem folder>"` once.
 
 ### What the scripts change
 
@@ -182,9 +186,9 @@ vkd3d-crossover/
 │  ├─ install.sh         clone CrossOver, install MoltenVK                      ✅
 │  ├─ setup-bottle.sh    bottle + DLLs + per-game overrides (--game), controllers, Steam  ✅
 │  ├─ launch-steam.sh    start a bottle's Steam through the cloned app          ✅
-│  ├─ fix-game-config.sh one-time reset of RE Engine's saved display mode       (planned)
-│  ├─ doctor.sh          check the setup                                        (planned)
-│  └─ uninstall.sh       remove the clone, restore the bottle                   (planned)
+│  ├─ fix-game-config.sh one-time reset of RE Engine's saved display mode       ✅
+│  ├─ doctor.sh          check the setup                                        ✅
+│  └─ uninstall.sh       remove the clone, restore the bottle                   ✅
 ├─ tools/dev/         developer scripts: fetch.sh, apply-patches.sh, build.sh, test harness, probes
 └─ .github/workflows/ build and publish releases
 ```
@@ -194,8 +198,8 @@ vkd3d-crossover/
 ## Roadmap
 
 1. ~~Split the work into topic patches (`patches/`), pin upstream versions.~~ Done: 58 shipping + 24 dev patches.
-2. Scripts: ~~install, bottle setup, Steam launcher, build-from-source~~ (done, tested on a fresh bottle); doctor, uninstall, game-config fixup.
-3. Prebuilt releases (GitHub Actions).
+2. ~~Scripts: install, bottle setup, Steam launcher, doctor, uninstall, game-config fixup, build-from-source.~~ Done.
+3. Prebuilt releases: GitHub Actions builds on every push; tagging `v*` publishes the release `install.sh` downloads.
 4. Remove the dev-only capability bypasses (report only what is real).
 5. **Upstream the generic fixes** to SPIRV-Cross, MoltenVK, dxil-spirv, vkd3d-proton and DXVK. The more lands
    upstream, the more this project shrinks to an installer — which is the goal.
