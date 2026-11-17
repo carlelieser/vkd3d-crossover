@@ -1,0 +1,51 @@
+From 543a0656f8a060f7b2fb5551db46e5916cab3e6f Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:12:05 -0500
+Subject: [PATCH 19/28] fix: apply logic ops independently of format
+ blendability
+
+Problem: Logic ops were reported but never applied (feature level 11_1 needs OutputMergerLogicOp).
+
+Root cause: MoltenVK set the private-API logic op only inside the blending branch, i.e. for blendable formats; D3D12 logic ops are used on integer formats, which are not blendable.
+
+Fix: Set the logic op whenever logicOpEnable is set and the attachment is used.
+
+Verified by: New vkd3d-proton test test_logic_op_rendering (XOR/AND/OR/COPY/NOOP on R8G8B8A8_UINT, exact values) 84/84 (was 4/5 failing).
+
+Off switch: none
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm | 14 ++++++++------
+ 1 file changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 7722be4..05e3c5f 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -2144,6 +2144,14 @@ void MVKGraphicsPipeline::addFragmentOutputToPipeline(MTLRenderPipelineDescripto
+             } else {
+                 colorDesc.writeMask = mvkMTLColorWriteMaskFromVkChannelFlags(pCA->colorWriteMask);
+             }
++#if MVK_USE_METAL_PRIVATE_API
++			// Logic ops are pipeline-wide and apply to integer formats, which do not support blending,
++			// so they must not depend on the blend capability of the attachment format.
++			if (mtlPixFmt && getMVKConfig().useMetalPrivateAPI && pCreateInfo->pColorBlendState->logicOpEnable) {
++				plDesc.logicOperationEnabledMVK = YES;
++				plDesc.logicOperationMVK = mvkMTLLogicOperationFromVkLogicOp(pCreateInfo->pColorBlendState->logicOp);
++			}
++#endif
+             // Don't set the blend state if we're not using this attachment.
+             // The pixel format will be MTLPixelFormatInvalid in that case, and
+             // Metal asserts if we turn on blending with that pixel format.
+@@ -2159,12 +2167,6 @@ void MVKGraphicsPipeline::addFragmentOutputToPipeline(MTLRenderPipelineDescripto
+                 colorDesc.alphaBlendOperation = mvkMTLBlendOperationFromVkBlendOp(pCA->alphaBlendOp);
+                 colorDesc.sourceAlphaBlendFactor = mvkMTLBlendFactorFromVkBlendFactor(pCA->srcAlphaBlendFactor);
+                 colorDesc.destinationAlphaBlendFactor = mvkMTLBlendFactorFromVkBlendFactor(pCA->dstAlphaBlendFactor);
+-#if MVK_USE_METAL_PRIVATE_API
+-				if (getMVKConfig().useMetalPrivateAPI) {
+-					plDesc.logicOperationEnabledMVK = pCreateInfo->pColorBlendState->logicOpEnable;
+-					plDesc.logicOperationMVK = mvkMTLLogicOperationFromVkLogicOp(pCreateInfo->pColorBlendState->logicOp);
+-				}
+-#endif
+             } else if (mtlPixFmt && !supportsBlend && pCA->blendEnable) {
+                 reportWarning(VK_ERROR_FEATURE_NOT_PRESENT, "Blending is enabled for attachment with format %s, which does not support it.", getPixelFormats()->getName(attachFmt));
+             }

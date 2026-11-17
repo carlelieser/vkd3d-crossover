@@ -1,0 +1,574 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 12:00:00 +0000
+Subject: [PATCH 01/13] feat(dev): add always-on failure log
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Dev only, not for release builds.
+
+Problem: a game presented at ~90 FPS with a black window and nothing in the
+logs; failures returned to the game (E_FAIL sources, skipped draws, device
+loss) were silent unless VKD3D_DEBUG was raised (N§21).
+
+Root cause: n/a (diagnostic).
+
+Fix: C:\gfx-failures.log, one file per bottle shared with MoltenVK, one line
+per event (time, exe and pid, category). Each distinct message, with numbers
+and hex collapsed, is written in full 3 times, then summarised as
+"repeat: +N more" every 10 s. Categories: error / fixme (every ERR and
+FIXME, regardless of VKD3D_DEBUG), create-failed (device Create* returning a
+failure, with the resource description), info (cached PSO blob rejected),
+draw-skipped, device-removed (N§22).
+
+Verified by: on the demo, lines from both layers; its create-failed lines are
+all stale cached PSO blobs (N§22).
+
+Off switch: VKD3D_FAILURE_LOG=0 (or a path to write elsewhere).
+---
+ include/private/vkd3d_debug.h |   5 +
+ libs/vkd3d-common/debug.c     | 232 ++++++++++++++++++++++++++++++++++
+ libs/vkd3d/cache.c            |   2 +
+ libs/vkd3d/command.c          |   7 +
+ libs/vkd3d/device.c           |  87 ++++++++-----
+ 5 files changed, 303 insertions(+), 30 deletions(-)
+
+diff --git a/include/private/vkd3d_debug.h b/include/private/vkd3d_debug.h
+index 90e7a36..4fdaa0f 100644
+--- a/include/private/vkd3d_debug.h
++++ b/include/private/vkd3d_debug.h
+@@ -72,6 +72,11 @@ void vkd3d_dbg_printf(enum vkd3d_dbg_channel channel, enum vkd3d_dbg_level level
+         const char *fmt, ...) VKD3D_PRINTF_FUNC(4, 5);
+ void vkd3d_dbg_flush(void);
+ 
++/* Always-on, deduplicated failure log shared with MoltenVK. VKD3D_FAILURE_LOG = path or "0";
++ * default C:\\gfx-failures.log. */
++bool vkd3d_failure_log_enabled(void);
++void vkd3d_failure_log(const char *category, const char *fmt, ...) VKD3D_PRINTF_FUNC(2, 3);
++
+ #define VKD3D_DEBUG_BUFFER_SIZE 512
+ char *vkd3d_dbg_get_buffer(void);
+ 
+diff --git a/libs/vkd3d-common/debug.c b/libs/vkd3d-common/debug.c
+index 32503a8..e4d1087 100644
+--- a/libs/vkd3d-common/debug.c
++++ b/libs/vkd3d-common/debug.c
+@@ -172,12 +172,244 @@ void vkd3d_dbg_flush(void)
+     }
+ }
+ 
++/* Failure log. */
++struct vkd3d_failure_entry
++{
++    uint32_t hash;
++    uint32_t count;
++    uint32_t reported;
++    char key[160];
++};
++
++#define VKD3D_FAILURE_ENTRIES 1024
++static struct vkd3d_failure_entry *vkd3d_failure_entries;
++static pthread_once_t vkd3d_failure_once = PTHREAD_ONCE_INIT;
++static spinlock_t vkd3d_failure_spin;
++static uint64_t vkd3d_failure_last_summary_ns;
++#ifdef _WIN32
++static HANDLE vkd3d_failure_file = INVALID_HANDLE_VALUE;
++#else
++static FILE *vkd3d_failure_file;
++#endif
++
++static void vkd3d_failure_write(const char *str, size_t len)
++{
++#ifdef _WIN32
++    DWORD written;
++    if (vkd3d_failure_file != INVALID_HANDLE_VALUE)
++        WriteFile(vkd3d_failure_file, str, (DWORD)len, &written, NULL);
++#else
++    if (vkd3d_failure_file)
++    {
++        fwrite(str, 1, len, vkd3d_failure_file);
++        fflush(vkd3d_failure_file);
++    }
++#endif
++}
++
++static void vkd3d_failure_writef(const char *category, const char *fmt, ...) VKD3D_PRINTF_FUNC(2, 3);
++
++static void vkd3d_failure_write_line(const char *category, const char *msg, uint32_t occurrence)
++{
++    char line[2048];
++    size_t len = 0;
++    int lines = 0;
++    const char *p;
++#ifdef _WIN32
++    SYSTEMTIME st;
++    char exe[MAX_PATH] = "?";
++    const char *exe_name;
++    GetLocalTime(&st);
++    GetModuleFileNameA(NULL, exe, sizeof(exe));
++    exe_name = strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe;
++    len = snprintf(line, sizeof(line), "%02u:%02u:%02u.%03u vkd3d[%s:%04lx] %s: ", st.wHour, st.wMinute, st.wSecond,
++            st.wMilliseconds, exe_name, (unsigned long)GetCurrentProcessId(), category);
++#else
++    len = snprintf(line, sizeof(line), "vkd3d %s: ", category);
++#endif
++    if (occurrence > 1 && len < sizeof(line))
++        len += snprintf(line + len, sizeof(line) - len, "[#%u] ", occurrence);
++    for (p = msg; *p && len + 8 < sizeof(line); p++)
++    {
++        if (*p == '\n')
++        {
++            if (!p[1])
++                break;
++            if (++lines >= 8)
++                break;
++            memcpy(line + len, "\n    ", 5);
++            len += 5;
++            continue;
++        }
++        line[len++] = *p;
++    }
++    line[len++] = '\n';
++    vkd3d_failure_write(line, len);
++}
++
++static void vkd3d_failure_writef(const char *category, const char *fmt, ...)
++{
++    char msg[512];
++    va_list args;
++    va_start(args, fmt);
++    vsnprintf(msg, sizeof(msg), fmt, args);
++    va_end(args);
++    vkd3d_failure_write_line(category, msg, 1);
++}
++
++static void vkd3d_failure_init_once(void)
++{
++    char path[MAX_PATH];
++
++    if (vkd3d_get_env_var("VKD3D_FAILURE_LOG", path, sizeof(path)))
++    {
++        if (!strcmp(path, "0") || !strcmp(path, "off"))
++            return;
++    }
++    else
++    {
++        strcpy(path, "C:\\gfx-failures.log");
++    }
++#ifdef _WIN32
++    vkd3d_failure_file = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++            NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
++    if (vkd3d_failure_file == INVALID_HANDLE_VALUE)
++        return;
++#else
++    if (!(vkd3d_failure_file = fopen(path, "a")))
++        return;
++#endif
++    vkd3d_failure_entries = calloc(VKD3D_FAILURE_ENTRIES, sizeof(*vkd3d_failure_entries));
++    vkd3d_failure_last_summary_ns = vkd3d_get_current_time_ns();
++    vkd3d_failure_writef("process", "vkd3d-proton loaded");
++}
++
++bool vkd3d_failure_log_enabled(void)
++{
++    pthread_once(&vkd3d_failure_once, vkd3d_failure_init_once);
++    return vkd3d_failure_entries != NULL;
++}
++
++/* Collapses numbers and hex so failures that differ only in handles or sizes share one entry. */
++static uint32_t vkd3d_failure_make_key(const char *category, const char *msg, char *key, size_t key_size)
++{
++    uint32_t hash = 2166136261u;
++    size_t len = 0;
++    const char *p;
++
++    for (p = category; *p && len + 2 < key_size; p++)
++        key[len++] = *p;
++    key[len++] = ':';
++    for (p = msg; *p && *p != '\n' && len + 1 < key_size; p++)
++    {
++        if (p[0] == '0' && p[1] == 'x')
++        {
++            key[len++] = '#';
++            p += 2;
++            while (isxdigit((unsigned char)*p))
++                p++;
++            p--;
++            continue;
++        }
++        if (isdigit((unsigned char)*p))
++        {
++            key[len++] = '#';
++            while (isdigit((unsigned char)p[1]))
++                p++;
++            continue;
++        }
++        key[len++] = *p;
++    }
++    key[len] = '\0';
++    for (p = key; *p; p++)
++        hash = (hash ^ (uint8_t)*p) * 16777619u;
++    return hash;
++}
++
++static void vkd3d_failure_log_message(const char *category, const char *msg)
++{
++    struct vkd3d_failure_entry *entry = NULL;
++    char key[160];
++    uint32_t hash, i, occurrence;
++    uint64_t now;
++
++    if (!vkd3d_failure_log_enabled())
++        return;
++
++    hash = vkd3d_failure_make_key(category, msg, key, sizeof(key));
++
++    spinlock_acquire(&vkd3d_failure_spin);
++    for (i = 0; i < VKD3D_FAILURE_ENTRIES; i++)
++    {
++        struct vkd3d_failure_entry *e = &vkd3d_failure_entries[(hash + i) % VKD3D_FAILURE_ENTRIES];
++        if (!e->count)
++        {
++            e->hash = hash;
++            strcpy(e->key, key);
++            entry = e;
++            break;
++        }
++        if (e->hash == hash && !strcmp(e->key, key))
++        {
++            entry = e;
++            break;
++        }
++    }
++    occurrence = entry ? ++entry->count : 1;
++    if (entry && occurrence <= 3)
++        entry->reported = occurrence;
++
++    now = vkd3d_get_current_time_ns();
++    if (now - vkd3d_failure_last_summary_ns > 10000000000ull)
++    {
++        vkd3d_failure_last_summary_ns = now;
++        for (i = 0; i < VKD3D_FAILURE_ENTRIES; i++)
++        {
++            struct vkd3d_failure_entry *e = &vkd3d_failure_entries[i];
++            if (e->count > e->reported)
++            {
++                vkd3d_failure_writef("repeat", "+%u more: %s", e->count - e->reported, e->key);
++                e->reported = e->count;
++            }
++        }
++    }
++    spinlock_release(&vkd3d_failure_spin);
++
++    if (occurrence <= 3)
++        vkd3d_failure_write_line(category, msg, occurrence);
++}
++
++void vkd3d_failure_log(const char *category, const char *fmt, ...)
++{
++    char msg[2048];
++    va_list args;
++
++    if (!vkd3d_failure_log_enabled())
++        return;
++    va_start(args, fmt);
++    vsnprintf(msg, sizeof(msg), fmt, args);
++    va_end(args);
++    vkd3d_failure_log_message(category, msg);
++}
++
+ void vkd3d_dbg_printf(enum vkd3d_dbg_channel channel, enum vkd3d_dbg_level level, const char *function, const char *fmt, ...)
+ {
+     unsigned int tid;
+     FILE *log_file;
+     va_list args;
+ 
++    /* Mirror errors and FIXMEs (unimplemented paths) into the failure log, regardless of VKD3D_DEBUG. */
++    if ((level == VKD3D_DBG_LEVEL_ERR || level == VKD3D_DBG_LEVEL_FIXME) && vkd3d_failure_log_enabled())
++    {
++        char msg[2048];
++        int n = snprintf(msg, sizeof(msg), "%s: ", function);
++        va_start(args, fmt);
++        if (n > 0 && n < (int)sizeof(msg))
++            vsnprintf(msg + n, sizeof(msg) - n, fmt, args);
++        va_end(args);
++        vkd3d_failure_log_message(level == VKD3D_DBG_LEVEL_ERR ? "error" : "fixme", msg);
++    }
++
+     if (vkd3d_dbg_get_level(channel) < level)
+         return;
+     assert(level < ARRAY_SIZE(debug_level_names));
+diff --git a/libs/vkd3d/cache.c b/libs/vkd3d/cache.c
+index 14a5755..2e692e1 100644
+--- a/libs/vkd3d/cache.c
++++ b/libs/vkd3d/cache.c
+@@ -459,6 +459,8 @@ HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
+             INFO("PSO compatibility hash mismatch.\n");
+         else
+             WARN("PSO compatibility hash mismatch.\n");
++        vkd3d_failure_log("info", "cached PSO blob rejected: it was saved for a PSO with a different description "
++                "(E_INVALIDARG, as D3D12 requires); see the pso-retry lines for whether the game rebuilds it");
+         return E_INVALIDARG;
+     }
+ 
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 4c83a16..f331017 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -7627,7 +7627,11 @@ static bool d3d12_command_list_update_graphics_pipeline(struct d3d12_command_lis
+     {
+         if (!(vk_pipeline = d3d12_pipeline_state_get_or_create_pipeline(list->state,
+                 &list->dynamic_state, list->dsv.format, &new_active_flags)))
++        {
++            vkd3d_failure_log("draw-skipped", "draw skipped: could not create a pipeline variant for PSO %p",
++                    (void *)list->state);
+             return false;
++        }
+     }
+ 
+     if (d3d12_command_list_has_depth_stencil_view(list))
+@@ -8915,7 +8919,10 @@ static bool d3d12_command_list_begin_render_pass(struct d3d12_command_list *list
+     /* It's not possible to modify rendering info while a render pass is in flight. */
+     if (!(list->rendering_info.state_flags & VKD3D_RENDERING_ACTIVE))
+         if (!d3d12_command_list_update_rendering_info(list))
++        {
++            vkd3d_failure_log("draw-skipped", "draw skipped: could not set up render targets");
+             return false;
++        }
+ 
+     if (pipeline_type != VKD3D_PIPELINE_TYPE_NONE)
+     {
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 3daa90b..d85dd7c 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -4017,6 +4017,28 @@ static UINT STDMETHODCALLTYPE d3d12_device_GetNodeCount(d3d12_device_iface *ifac
+     return 1;
+ }
+ 
++
++/* Failure log: record HRESULT failures returned to the application from object creation. */
++static HRESULT vkd3d_note_create(struct d3d12_device *device, const char *what, HRESULT hr)
++{
++    if (FAILED(hr))
++        vkd3d_failure_log("create-failed", "%s failed, hr %#x", what, (unsigned int)hr);
++    return hr;
++}
++
++static HRESULT vkd3d_note_resource_create(struct d3d12_device *device, const char *what, HRESULT hr,
++        const D3D12_RESOURCE_DESC1 *desc)
++{
++    if (FAILED(hr))
++    {
++        vkd3d_failure_log("create-failed", "%s failed, hr %#x: dim %u, DXGI format %u, %"PRIu64"x%ux%u, mips %u, "
++                "samples %u, layout %u, flags %#x", what, (unsigned int)hr, desc->Dimension, desc->Format, desc->Width,
++                desc->Height, desc->DepthOrArraySize, desc->MipLevels, desc->SampleDesc.Count, desc->Layout,
++                (unsigned int)desc->Flags);
++    }
++    return hr;
++}
++
+ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateCommandQueue(d3d12_device_iface *iface,
+         const D3D12_COMMAND_QUEUE_DESC *desc, REFIID riid, void **command_queue)
+ {
+@@ -4073,11 +4095,11 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateGraphicsPipelineState(d3d12_
+     TRACE("iface %p, desc %p, riid %s, pipeline_state %p.\n",
+             iface, desc, debugstr_guid(riid), pipeline_state);
+ 
+-    if (FAILED(hr = vkd3d_pipeline_state_desc_from_d3d12_graphics_desc(&pipeline_desc, desc)))
++    if (FAILED(hr = vkd3d_note_create(device, "vkd3d_pipeline_state_desc_from_d3d12_graphics_desc", vkd3d_pipeline_state_desc_from_d3d12_graphics_desc(&pipeline_desc, desc))))
+         return hr;
+ 
+-    if (FAILED(hr = d3d12_pipeline_state_create(device,
+-            VK_PIPELINE_BIND_POINT_GRAPHICS, &pipeline_desc, &object)))
++    if (FAILED(hr = vkd3d_note_create(device, "d3d12_pipeline_state_create", d3d12_pipeline_state_create(device,
++            VK_PIPELINE_BIND_POINT_GRAPHICS, &pipeline_desc, &object))))
+         return hr;
+ 
+     return return_interface(&object->ID3D12PipelineState_iface,
+@@ -4095,11 +4117,11 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateComputePipelineState(d3d12_d
+     TRACE("iface %p, desc %p, riid %s, pipeline_state %p.\n",
+             iface, desc, debugstr_guid(riid), pipeline_state);
+ 
+-    if (FAILED(hr = vkd3d_pipeline_state_desc_from_d3d12_compute_desc(&pipeline_desc, desc)))
++    if (FAILED(hr = vkd3d_note_create(device, "vkd3d_pipeline_state_desc_from_d3d12_compute_desc", vkd3d_pipeline_state_desc_from_d3d12_compute_desc(&pipeline_desc, desc))))
+         return hr;
+ 
+-    if (FAILED(hr = d3d12_pipeline_state_create(device,
+-            VK_PIPELINE_BIND_POINT_COMPUTE, &pipeline_desc, &object)))
++    if (FAILED(hr = vkd3d_note_create(device, "d3d12_pipeline_state_create", d3d12_pipeline_state_create(device,
++            VK_PIPELINE_BIND_POINT_COMPUTE, &pipeline_desc, &object))))
+         return hr;
+ 
+     return return_interface(&object->ID3D12PipelineState_iface,
+@@ -5584,7 +5606,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateDescriptorHeap(d3d12_device_
+     TRACE("iface %p, desc %p, riid %s, descriptor_heap %p.\n",
+             iface, desc, debugstr_guid(riid), descriptor_heap);
+ 
+-    if (FAILED(hr = d3d12_descriptor_heap_create(device, desc, &object)))
++    if (FAILED(hr = vkd3d_note_create(device, "d3d12_descriptor_heap_create", d3d12_descriptor_heap_create(device, desc, &object))))
+         return hr;
+ 
+     return return_interface(&object->ID3D12DescriptorHeap_iface,
+@@ -5613,7 +5635,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateRootSignature(d3d12_device_i
+ 
+     debug_ignored_node_mask(node_mask);
+ 
+-    if (FAILED(hr = d3d12_root_signature_create(device, bytecode, bytecode_length, &object)))
++    if (FAILED(hr = vkd3d_note_create(device, "d3d12_root_signature_create", d3d12_root_signature_create(device, bytecode, bytecode_length, &object))))
+         return hr;
+ 
+     return return_interface(&object->ID3D12RootSignature_iface,
+@@ -5637,8 +5659,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateRootSignatureFromSubobjectIn
+ 
+     /* NULL subobject_name segfaults on native, so don't need to check it. */
+ 
+-    if (FAILED(hr = d3d12_root_signature_create_from_subobject(device, library_blob, blob_length_in_bytes,
+-            subobject_name, &object)))
++    if (FAILED(hr = vkd3d_note_create(device, "d3d12_root_signature_create_from_subobject", d3d12_root_signature_create_from_subobject(device, library_blob, blob_length_in_bytes,
++            subobject_name, &object))))
+         return hr;
+ 
+     return return_interface(&object->ID3D12RootSignature_iface,
+@@ -6904,8 +6926,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_OpenSharedHandle(d3d12_device_ifac
+ 
+         if (SUCCEEDED(hr = d3d12_device_open_resource_descriptor(device, handle, &desc)))
+         {
+-            if (FAILED(hr = d3d12_resource_create_committed(device, &desc, &heap_props,
+-                    D3D12_HEAP_FLAG_SHARED, D3D12_RESOURCE_STATE_COMMON, NULL, 0, NULL, handle, &resource)))
++            if (FAILED(hr = vkd3d_note_resource_create(device, "d3d12_resource_create_committed", d3d12_resource_create_committed(device, &desc, &heap_props,
++                    D3D12_HEAP_FLAG_SHARED, D3D12_RESOURCE_STATE_COMMON, NULL, 0, NULL, handle, &resource), &desc)))
+             {
+                 WARN("Failed to open shared ID3D12Resource, hr %#x.\n", (int)hr);
+                 *object = NULL;
+@@ -7253,7 +7275,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateQueryHeap1(
+     TRACE("iface %p, desc %p, flags #%x, iid %s, heap %p.\n",
+             iface, desc, flags, debugstr_guid(iid), heap);
+ 
+-    if (FAILED(hr = d3d12_query_heap_create(device, desc, flags, &object)))
++    if (FAILED(hr = vkd3d_note_create(device, "d3d12_query_heap_create", d3d12_query_heap_create(device, desc, flags, &object))))
+         return hr;
+ 
+     return return_interface(&object->ID3D12QueryHeap_iface, &IID_ID3D12QueryHeap, iid, heap);
+@@ -7285,7 +7307,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateCommandSignature(d3d12_devic
+     TRACE("iface %p, desc %p, root_signature %p, iid %s, command_signature %p.\n",
+             iface, desc, root_signature, debugstr_guid(iid), command_signature);
+ 
+-    if (FAILED(hr = d3d12_command_signature_create(device, root_signature, desc, &object)))
++    if (FAILED(hr = vkd3d_note_create(device, "d3d12_command_signature_create", d3d12_command_signature_create(device, root_signature, desc, &object))))
+         return hr;
+ 
+     return return_interface(&object->ID3D12CommandSignature_iface,
+@@ -7545,10 +7567,10 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreatePipelineState(d3d12_device_i
+     TRACE("iface %p, desc %p, riid %s, pipeline_state %p.\n",
+             iface, desc, debugstr_guid(riid), pipeline_state);
+ 
+-    if (FAILED(hr = vkd3d_pipeline_state_desc_from_d3d12_stream_desc(&pipeline_desc, desc, &pipeline_type)))
++    if (FAILED(hr = vkd3d_note_create(device, "vkd3d_pipeline_state_desc_from_d3d12_stream_desc", vkd3d_pipeline_state_desc_from_d3d12_stream_desc(&pipeline_desc, desc, &pipeline_type))))
+         return hr;
+ 
+-    if (FAILED(hr = d3d12_pipeline_state_create(device, pipeline_type, &pipeline_desc, &object)))
++    if (FAILED(hr = vkd3d_note_create(device, "d3d12_pipeline_state_create", d3d12_pipeline_state_create(device, pipeline_type, &pipeline_desc, &object))))
+         return hr;
+ 
+     return return_interface(&object->ID3D12PipelineState_iface,
+@@ -7584,7 +7606,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_OpenExistingHeapFromAddress1(
+     heap_desc.Properties.VisibleNodeMask = 1;
+     heap_desc.SizeInBytes = size;
+ 
+-    if (FAILED(hr = d3d12_heap_create(device, &heap_desc, (void *)address, &object)))
++    if (FAILED(hr = vkd3d_note_create(device, "d3d12_heap_create", d3d12_heap_create(device, &heap_desc, (void *)address, &object))))
+     {
+         if (ppHeap)
+             *ppHeap = NULL;
+@@ -7737,7 +7759,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateHeap1(d3d12_device_iface *if
+     if (protected_session)
+         FIXME("Ignoring protected session %p.\n", protected_session);
+ 
+-    if (FAILED(hr = d3d12_heap_create(device, desc, NULL, &object)))
++    if (FAILED(hr = vkd3d_note_create(device, "d3d12_heap_create", d3d12_heap_create(device, desc, NULL, &object))))
+     {
+         *heap = NULL;
+         return hr;
+@@ -7763,8 +7785,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateReservedResource1(d3d12_devi
+ 
+     d3d12_resource_promote_desc(desc, &desc1);
+ 
+-    if (FAILED(hr = d3d12_resource_create_reserved(device, &desc1,
+-            initial_state, optimized_clear_value, 0, NULL, &object)))
++    if (FAILED(hr = vkd3d_note_resource_create(device, "d3d12_resource_create_reserved", d3d12_resource_create_reserved(device, &desc1,
++            initial_state, optimized_clear_value, 0, NULL, &object), &desc1)))
+         return hr;
+ 
+     return return_interface(&object->ID3D12Resource_iface, &IID_ID3D12Resource, iid, resource);
+@@ -8250,8 +8272,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateCommittedResource2(d3d12_dev
+     if (protected_session)
+         FIXME("Ignoring protected session %p.\n", protected_session);
+ 
+-    if (FAILED(hr = d3d12_resource_create_committed(device, desc, heap_properties,
+-            heap_flags, initial_state, optimized_clear_value, 0, NULL, NULL, &object)))
++    if (FAILED(hr = vkd3d_note_resource_create(device, "d3d12_resource_create_committed", d3d12_resource_create_committed(device, desc, heap_properties,
++            heap_flags, initial_state, optimized_clear_value, 0, NULL, NULL, &object), desc)))
+     {
+         if (resource)
+             *resource = NULL;
+@@ -8276,8 +8298,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreatePlacedResource1(d3d12_device
+             iface, heap, heap_offset, resource_desc, initial_state,
+             optimized_clear_value, debugstr_guid(iid), resource);
+ 
+-    if (FAILED(hr = d3d12_resource_create_placed(device, resource_desc, heap_object,
+-            heap_offset, initial_state, optimized_clear_value, 0, NULL, &object)))
++    if (FAILED(hr = vkd3d_note_resource_create(device, "d3d12_resource_create_placed", d3d12_resource_create_placed(device, resource_desc, heap_object,
++            heap_offset, initial_state, optimized_clear_value, 0, NULL, &object), resource_desc)))
+         return hr;
+ 
+     return return_interface(&object->ID3D12Resource_iface, &IID_ID3D12Resource, iid, resource);
+@@ -8580,9 +8602,9 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateCommittedResource3(d3d12_dev
+     /* For initial resource state, we cannot make use of the enhanced barrier layouts in any meaningful way.
+      * Just collapse them into the equivalent legacy layout.
+      * This can be refactored later if need be. */
+-    if (FAILED(hr = d3d12_resource_create_committed(device, desc, heap_properties,
++    if (FAILED(hr = vkd3d_note_resource_create(device, "d3d12_resource_create_committed", d3d12_resource_create_committed(device, desc, heap_properties,
+             heap_flags, vkd3d_barrier_layout_to_resource_state(initial_layout, desc->Flags),
+-            optimized_clear_value, num_castable_formats, castable_formats, NULL, &object)))
++            optimized_clear_value, num_castable_formats, castable_formats, NULL, &object), desc)))
+     {
+         if (resource)
+             *resource = NULL;
+@@ -8613,9 +8635,9 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreatePlacedResource2(d3d12_device
+         return E_INVALIDARG;
+     }
+ 
+-    if (FAILED(hr = d3d12_resource_create_placed(device, desc, heap_object,
++    if (FAILED(hr = vkd3d_note_resource_create(device, "d3d12_resource_create_placed", d3d12_resource_create_placed(device, desc, heap_object,
+             heap_offset, vkd3d_barrier_layout_to_resource_state(initial_layout, desc->Flags),
+-            optimized_clear_value, num_castable_formats, castable_formats, &object)))
++            optimized_clear_value, num_castable_formats, castable_formats, &object), desc)))
+         return hr;
+ 
+     return return_interface(&object->ID3D12Resource_iface, &IID_ID3D12Resource, iid, resource);
+@@ -8641,9 +8663,9 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateReservedResource2(d3d12_devi
+ 
+     d3d12_resource_promote_desc(desc, &desc1);
+ 
+-    if (FAILED(hr = d3d12_resource_create_reserved(device, &desc1,
++    if (FAILED(hr = vkd3d_note_resource_create(device, "d3d12_resource_create_reserved", d3d12_resource_create_reserved(device, &desc1,
+             vkd3d_barrier_layout_to_resource_state(initial_layout, desc1.Flags), optimized_clear_value,
+-            num_castable_formats, castable_formats, &object)))
++            num_castable_formats, castable_formats, &object), &desc1)))
+         return hr;
+ 
+     return return_interface(&object->ID3D12Resource_iface, &IID_ID3D12Resource, iid, resource);
+@@ -11304,6 +11326,11 @@ void d3d12_device_mark_as_removed(struct d3d12_device *device, HRESULT reason,
+             device, (int)reason, vkd3d_dbg_vsprintf(message, args));
+     va_end(args);
+ 
++    va_start(args, message);
++    vkd3d_failure_log("device-removed", "D3D12 device removed (reason %#x): %s", (unsigned int)reason,
++            vkd3d_dbg_vsprintf(message, args));
++    va_end(args);
++
+     vkd3d_atomic_uint32_store_explicit(&device->removed_reason, reason, vkd3d_memory_order_release);
+ }
+ 

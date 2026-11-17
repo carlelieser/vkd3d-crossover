@@ -1,0 +1,36 @@
+From 32ba2dce38028a1153cc300f63df12510593e437 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:12:08 -0500
+Subject: [PATCH 24/28] fix: count translated vertex bindings only for static
+ strides
+
+Problem: "Vertex shader requires per-vertex output buffer, but there is no free slot" pipeline failures.
+
+Root cause: initReservedVertexAttributeBufferCount() counted attributes whose offset exceeds the stride even with dynamic or zero strides, where addVertexInputToPipeline() translates nothing; the phantom slots crowded out the implicit buffers.
+
+Fix: Count them only for a static, nonzero stride, matching addVertexInputToPipeline().
+
+Verified by: PRAGMATA SKETCHBOOK demo: 0 pipeline failures.
+
+Off switch: none
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index e476cc9..515e6b6 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -2420,7 +2420,11 @@ void MVKGraphicsPipeline::initReservedVertexAttributeBufferCount(const VkGraphic
+ 			if (pVKVA->binding == pVKVB->binding) {
+ 				uint32_t attrSize = getPixelFormats()->getBytesPerBlock(pVKVA->format);
+ 				uint32_t vaOffset = pVKVA->offset;
+-				if (vaOffset && vaOffset + attrSize > pVKVB->stride) {
++				// Must match addVertexInputToPipeline(): offsets are only translated for a static, nonzero
++				// stride. With dynamic strides (e.g. vkd3d-proton) or a zero stride, nothing is translated, and
++				// counting those attributes would reserve phantom slots that crowd out the implicit buffers.
++				bool isVtxStrideStatic = !_dynamicStateFlags.has(MVKRenderStateFlag::VertexStride);
++				if (isVtxStrideStatic && pVKVB->stride && vaOffset && vaOffset + attrSize > pVKVB->stride) {
+ 					xltdBuffCnt++;
+ 				}
+ 			}

@@ -1,0 +1,43 @@
+From 9cff51ebf8e49b039e3b9ce42fb6c0ef986f5ac5 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:12:04 -0500
+Subject: [PATCH 18/28] fix: emulate sample masks in the shader with the
+ private API
+
+Problem: SV_Coverage lacked the sample mask with MVK_USE_METAL_PRIVATE_API=1 (test_coverage 0 -> 5 failures).
+
+Root cause: Metal's private hardware sampleMask is applied after the fragment shader, so the shader's input coverage does not include it.
+
+Fix: Always use the shader sample-mask emulation (additional_fixed_sample_mask) and do not set the private sampleMask.
+
+Verified by: test_coverage back to 0 failures; vkd3d-proton sweep (597 tests) 0 regressions.
+
+Off switch: none
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 7a6dc98..7722be4 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -1841,7 +1841,9 @@ bool MVKGraphicsPipeline::addFragmentShaderToPipeline(MTLRenderPipelineDescripto
+ 		}
+ 		if (_isRasterizing && pCreateInfo->pMultisampleState) {		// Must ignore allowed bad pMultisampleState pointer if rasterization disabled
+ #if MVK_USE_METAL_PRIVATE_API
+-			if (!getMVKConfig().useMetalPrivateAPI) {
++			// Always emulate the sample mask in the shader: Metal's private hardware sampleMask is applied after
++			// the fragment shader, so the shader's input coverage (SV_Coverage) would not include the mask.
++			if (true) {
+ #endif
+ 				if (pCreateInfo->pMultisampleState->pSampleMask && pCreateInfo->pMultisampleState->pSampleMask[0] != 0xffffffff) {
+ 					shaderConfig.options.mslOptions.additional_fixed_sample_mask = pCreateInfo->pMultisampleState->pSampleMask[0];
+@@ -2190,7 +2192,7 @@ void MVKGraphicsPipeline::addFragmentOutputToPipeline(MTLRenderPipelineDescripto
+     if (_isRasterizing && pCreateInfo->pMultisampleState) {
+         plDesc.rasterSampleCount = mvkSampleCountFromVkSampleCountFlagBits(pCreateInfo->pMultisampleState->rasterizationSamples);
+ #if MVK_USE_METAL_PRIVATE_API
+-        if (getMVKConfig().useMetalPrivateAPI && pCreateInfo->pMultisampleState->pSampleMask) {
++        if (false && getMVKConfig().useMetalPrivateAPI && pCreateInfo->pMultisampleState->pSampleMask) {	// see sample mask emulation above
+             plDesc.sampleMaskMVK = pCreateInfo->pMultisampleState->pSampleMask[0];
+         }
+ #endif

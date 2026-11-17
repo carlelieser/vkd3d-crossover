@@ -1,0 +1,261 @@
+From d86f6dc231784e146be3321a50607c526cf775c7 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:12:13 -0500
+Subject: [PATCH 03/10] chore(dev): add frame statistics
+
+Problem: Needed fps, GPU busy time and compile cost per interval to profile stutter.
+
+Root cause: Diagnostics only; no defect.
+
+Fix: MVKFrameStats.h: every 2 s of presents one line in $WINEPREFIX/drive_c/gfx-frames.log with fps, average/worst interval, GPU busy per frame, command buffers per frame, SPIR-V->MSL / MSL->library / render / compute PSO compile counts and time, and draws waited on deferred PSOs.
+
+Verified by: Used for the hoist and deferred-PSO measurements.
+
+Off switch: off by default; MVK_FRAME_STATS=1 enables
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm   |  3 +
+ MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm      |  2 +
+ .../MoltenVK/GPUObjects/MVKShaderModule.mm    |  3 +
+ MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm  |  2 +
+ MoltenVK/MoltenVK/Utility/MVKDeferredPSO.h    |  9 ++
+ MoltenVK/MoltenVK/Utility/MVKFrameStats.h     | 82 +++++++++++++++++++
+ 6 files changed, 101 insertions(+)
+ create mode 100644 MoltenVK/MoltenVK/Utility/MVKFrameStats.h
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index e67b5d8..572ad85 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include "../Utility/MVKDeferredPSO.h"
++#include "../Utility/MVKFrameStats.h"
+ #include "MVKPipeline.h"
+ #include "MVKCommandBuffer.h"
+ #include "MVKInlineObjectConstructor.h"
+@@ -3457,6 +3458,7 @@ MVKPipelineCache::~MVKPipelineCache() {
+ #pragma mark MVKRenderPipelineCompiler
+ 
+ id<MTLRenderPipelineState> MVKRenderPipelineCompiler::newMTLRenderPipelineState(MTLRenderPipelineDescriptor* mtlRPLDesc) {
++	MVKFrameStatTimer frameStatTimer(kMVKStatRenderPSO);
+ 	unique_lock<mutex> lock(_completionLock);
+ 
+ 	compile(lock, ^{
+@@ -3512,6 +3514,7 @@ MVKRenderPipelineCompiler::~MVKRenderPipelineCompiler() {
+ #pragma mark MVKComputePipelineCompiler
+ 
+ id<MTLComputePipelineState> MVKComputePipelineCompiler::newMTLComputePipelineState(MTLComputePipelineDescriptor* plDesc) {
++	MVKFrameStatTimer frameStatTimer(kMVKStatComputePSO);
+ 	unique_lock<mutex> lock(_completionLock);
+ 
+ 	compile(lock, ^{
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
+index 4936615..ed0d2e9 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
+@@ -16,6 +16,7 @@
+  * limitations under the License.
+  */
+ 
++#include "../Utility/MVKFrameStats.h"
+ #include "MVKInstance.h"
+ #include "MVKQueue.h"
+ #include "MVKSurface.h"
+@@ -565,6 +566,7 @@ VkResult MVKQueueCommandBufferSubmission::commitActiveMTLCommandBuffer(bool sign
+ 	uint64_t startTime = getPerformanceTimestamp();
+ 	[mtlCmdBuff addCompletedHandler: ^(id<MTLCommandBuffer> mtlCB) {
+ 		addPerformanceInterval(getPerformanceStats().queue.mtlCommandBufferExecution, startTime);
++		mvkFrameStatsAddCommandBuffer(mtlCB.GPUStartTime, mtlCB.GPUEndTime);
+ 		// The semaphore signals were encoded into this command buffer; if it failed they never ran.
+ 		// Deliver them from the host so waiters (e.g. D3D12 fences on timeline semaphores) are released.
+ 		if (signalCompletion && mtlCB.status == MTLCommandBufferStatusError) {
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+index cf37228..ceddb2c 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include "../Utility/MVKDeferredPSO.h"
++#include "../Utility/MVKFrameStats.h"
+ #include "MVKShaderModule.h"
+ #include "MVKPipeline.h"
+ #include "MVKFoundation.h"
+@@ -463,6 +464,7 @@ static void mvkLogAtomic64Use(SPIRVToMSLConversionConfiguration* pShaderConfig,
+ 
+ bool MVKShaderModule::convert(SPIRVToMSLConversionConfiguration* pShaderConfig,
+ 							  SPIRVToMSLConversionResult& conversionResult) {
++	MVKFrameStatTimer frameStatTimer(kMVKStatSPIRVToMSL);
+ 	const auto& mvkCfg = getMVKConfig();
+ 	bool shouldLogCode = mvkCfg.debugMode;
+ 	bool shouldLogEstimatedGLSL = shouldLogCode && mvkCfg.shaderLogEstimatedGLSL;
+@@ -616,6 +618,7 @@ id<MTLLibrary> MVKShaderLibraryCompiler::newMTLLibrary(NSString* mslSourceCode,
+ 													   const SPIRVToMSLConversionResultInfo& shaderConversionResults,
+ 													   const vector<pair<MSLSpecializationMacroInfo, MVKShaderMacroValue>>& specializationMacroDef) {
+ 	if (MVKDeferredPSOScheduler::enabled()) { MVKDeferredPSOScheduler::get(getMTLDevice()).yieldToUrgent(); }
++	MVKFrameStatTimer frameStatTimer(kMVKStatMSLCompile);
+ 	unique_lock<mutex> lock(_completionLock);
+ 
+ 	compile(lock, ^{
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm b/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm
+index 77c51b7..41a4df0 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm
+@@ -16,6 +16,7 @@
+  * limitations under the License.
+  */
+ 
++#include "../Utility/MVKFrameStats.h"
+ #include "MVKSurface.h"
+ #include "MVKSwapchain.h"
+ #include "MVKImage.h"
+@@ -184,6 +185,7 @@ struct MVKPresentProbe {
+ };
+ 
+ void MVKSwapchain::probePresentedImage(id<MTLTexture> mtlTexture, id<MTLCommandBuffer> mtlCmdBuff) {
++	mvkFrameStatsOnPresent();
+ 	if ( !mtlTexture || !mvkFailureLogEnabled() ) { return; }
+ 	if ( !_presentProbe ) { _presentProbe = std::make_shared<MVKPresentProbe>(); }
+ 	auto probe = _presentProbe;
+diff --git a/MoltenVK/MoltenVK/Utility/MVKDeferredPSO.h b/MoltenVK/MoltenVK/Utility/MVKDeferredPSO.h
+index 6c956d8..9143a29 100644
+--- a/MoltenVK/MoltenVK/Utility/MVKDeferredPSO.h
++++ b/MoltenVK/MoltenVK/Utility/MVKDeferredPSO.h
+@@ -17,6 +17,7 @@
+ 
+ #import <Metal/Metal.h>
+ #include "MVKBaseObject.h"
++#include "MVKFrameStats.h"
+ #include <mutex>
+ #include <condition_variable>
+ #include <deque>
+@@ -31,6 +32,7 @@ struct MVKDeferredRenderPSO {
+ 	std::mutex lock;
+ 	std::condition_variable done;
+ 	int status = 0;								// 0 queued, 1 submitted, 2 done (guarded: 0->1 by scheduler lock, 1->2 by lock)
++	uint64_t submitNs = 0;
+ 	~MVKDeferredRenderPSO() { [desc release]; [state release]; }
+ };
+ 
+@@ -78,6 +80,7 @@ public:
+ 			if (job->status == 0) { job->status = 1; _inflight++; urgent = true; }
+ 			_waiting++;		// pauses background submissions until every waiting draw has its pipeline
+ 		}
++		uint64_t t0 = mvkFrameStatsEnabled() ? mvkFrameStatsNowNs() : 0;
+ 		if (urgent) { submitJob(job, /*alreadyMarked*/ true); }
+ 		{
+ 			std::unique_lock<std::mutex> lk(job->lock);
+@@ -91,6 +94,10 @@ public:
+ 		}
+ 		_urgentClear.notify_all();
+ 		for (auto& j : resume) { submitJob(j); }
++		if (t0) {
++			uint64_t waited = mvkFrameStatsNowNs() - t0;
++			if (waited > 100000) { mvkFrameStatNs[kMVKStatPSOWait] += waited; mvkFrameStatCount[kMVKStatPSOWait]++; }
++		}
+ 		return [job->state retain];
+ 	}
+ 
+@@ -112,11 +119,13 @@ private:
+ 
+ 	// Called without the scheduler lock held (Metal may run the completion handler on this thread).
+ 	void submitJob(std::shared_ptr<MVKDeferredRenderPSO> job, bool alreadyMarked = true) {
++		job->submitNs = mvkFrameStatsEnabled() ? mvkFrameStatsNowNs() : 0;
+ 		[_dev newRenderPipelineStateWithDescriptor: job->desc
+ 								 completionHandler: ^(id<MTLRenderPipelineState> ps, NSError* error) {
+ 			if ( !ps ) {
+ 				mvkLogFailure("deferred-pso", "render pipeline compile failed: %s", error ? error.localizedDescription.UTF8String : "?");
+ 			}
++			if (job->submitNs) { mvkFrameStatNs[kMVKStatRenderPSO] += mvkFrameStatsNowNs() - job->submitNs; mvkFrameStatCount[kMVKStatRenderPSO]++; }
+ 			{
+ 				std::lock_guard<std::mutex> g(job->lock);
+ 				job->state = [ps retain];
+diff --git a/MoltenVK/MoltenVK/Utility/MVKFrameStats.h b/MoltenVK/MoltenVK/Utility/MVKFrameStats.h
+new file mode 100644
+index 0000000..f62c4cf
+--- /dev/null
++++ b/MoltenVK/MoltenVK/Utility/MVKFrameStats.h
+@@ -0,0 +1,82 @@
++/*
++ * MVKFrameStats.h — lightweight frame profiling for MoltenVK under vkd3d-proton (diagnostics).
++ * MVK_FRAME_STATS=1 enables. Every 2 s of presents it writes one "frame-stats" line to the failure log:
++ * FPS, average and worst present-to-present interval, GPU busy time per frame (sum of Metal command buffer
++ * GPU time), command buffers per frame, and shader/pipeline compile work done during that interval.
++ */
++#pragma once
++
++#include "MVKBaseObject.h"
++#include <atomic>
++#include <mach/mach_time.h>
++#include <stdlib.h>
++#include <stdio.h>
++#include <string>
++#include <ctime>
++#include <unistd.h>
++
++enum MVKFrameStatKind { kMVKStatSPIRVToMSL = 0, kMVKStatMSLCompile, kMVKStatRenderPSO, kMVKStatComputePSO, kMVKStatPSOWait, kMVKStatCount };
++
++inline bool mvkFrameStatsEnabled() {
++	static const bool enabled = getenv("MVK_FRAME_STATS") && getenv("MVK_FRAME_STATS")[0] == '1';
++	return enabled;
++}
++
++inline uint64_t mvkFrameStatsNowNs() {
++	static mach_timebase_info_data_t tb = [] { mach_timebase_info_data_t t; mach_timebase_info(&t); return t; }();
++	return mach_absolute_time() * tb.numer / tb.denom;
++}
++
++inline std::atomic<uint64_t> mvkFrameStatNs[kMVKStatCount];
++inline std::atomic<uint32_t> mvkFrameStatCount[kMVKStatCount];
++inline std::atomic<uint64_t> mvkFrameStatGPUNs;
++inline std::atomic<uint32_t> mvkFrameStatCmdBufs;
++
++struct MVKFrameStatTimer {
++	int kind; uint64_t t0;
++	MVKFrameStatTimer(int k) : kind(k), t0(mvkFrameStatsEnabled() ? mvkFrameStatsNowNs() : 0) {}
++	~MVKFrameStatTimer() {
++		if ( !t0 ) { return; }
++		mvkFrameStatNs[kind] += mvkFrameStatsNowNs() - t0;
++		mvkFrameStatCount[kind]++;
++	}
++};
++
++inline void mvkFrameStatsAddCommandBuffer(double gpuStart, double gpuEnd) {
++	if ( !mvkFrameStatsEnabled() ) { return; }
++	if (gpuEnd > gpuStart) { mvkFrameStatGPUNs += (uint64_t)((gpuEnd - gpuStart) * 1e9); }
++	mvkFrameStatCmdBufs++;
++}
++
++inline void mvkFrameStatsOnPresent() {
++	if ( !mvkFrameStatsEnabled() ) { return; }
++	static std::atomic<uint64_t> windowStart{0}, lastPresent{0}, worstNs{0};
++	static std::atomic<uint32_t> frames{0};
++	uint64_t now = mvkFrameStatsNowNs();
++	uint64_t prev = lastPresent.exchange(now);
++	if ( !windowStart.load() ) { windowStart = now; return; }
++	if (prev && now - prev > worstNs.load()) { worstNs = now - prev; }
++	uint32_t f = ++frames;
++	uint64_t elapsed = now - windowStart.load();
++	if (elapsed < 2000000000ull) { return; }
++	windowStart = now; frames = 0;
++	uint64_t worst = worstNs.exchange(0), gpu = mvkFrameStatGPUNs.exchange(0);
++	uint32_t cbs = mvkFrameStatCmdBufs.exchange(0);
++	uint64_t ns[kMVKStatCount]; uint32_t n[kMVKStatCount];
++	for (int k = 0; k < kMVKStatCount; k++) { ns[k] = mvkFrameStatNs[k].exchange(0); n[k] = mvkFrameStatCount[k].exchange(0); }
++	double sec = elapsed / 1e9, fps = f / sec;
++	// Own file, never collapsed: $WINEPREFIX/drive_c/gfx-frames.log
++	static FILE* out = [] {
++		const char* pfx = getenv("WINEPREFIX");
++		std::string path = std::string(pfx ? pfx : "/tmp") + (pfx ? "/drive_c/gfx-frames.log" : "/gfx-frames.log");
++		FILE* f = fopen(path.c_str(), "a");
++		if (f) { setvbuf(f, nullptr, _IOLBF, 0); }
++		return f;
++	}();
++	if ( !out ) { return; }
++	time_t tnow = time(nullptr); struct tm lt; localtime_r(&tnow, &lt);
++	fprintf(out, "%02d:%02d:%02d [%d] %.1f fps (avg %.1f ms, worst %.1f ms) | GPU busy %.1f ms/frame (%.0f%% of frame time), %.1f cmd bufs/frame"
++				  " | compiles: SPIR-V->MSL %u (%.0f ms), MSL->lib %u (%.0f ms), render PSO %u (%.0f ms), compute PSO %u (%.0f ms) | draws waited on PSO %u (%.0f ms)\n",
++				  lt.tm_hour, lt.tm_min, lt.tm_sec, (int)getpid(), fps, 1000.0 / fps, worst / 1e6, gpu / 1e6 / f, 100.0 * (gpu / 1e9) / sec, (double)cbs / f,
++				  n[0], ns[0] / 1e6, n[1], ns[1] / 1e6, n[2], ns[2] / 1e6, n[3], ns[3] / 1e6, n[4], ns[4] / 1e6);
++}

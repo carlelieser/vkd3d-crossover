@@ -1,0 +1,217 @@
+From eadf46d0ec330b332a413bea78235dea950f02db Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:12:06 -0500
+Subject: [PATCH 20/28] feat: implement
+ VK_EXT_dynamic_rendering_unused_attachments
+
+Problem: Undefined draws when PSO RTV/DSV formats differ from the bound targets; vkd3d-proton warns the extension "is required for correct operation".
+
+Root cause: D3D12 allows a pipeline to write a slot with nothing bound, or to leave a bound target undeclared. Metal requires pipeline formats to equal the render pass attachments, and vkd3d-proton has no fallback without this extension.
+
+Fix: MVKGraphicsPipeline keeps its final render pipeline descriptor. At draw time (prepareDraw) the bound subpass formats are compared; when only presence differs, a variant is compiled and cached per (pipeline, bound presence): bound-but-undeclared slots get the bound format with writeMask None, declared-but-unbound slots get no format, depth/stencil follow the bound attachments, retrying with the pipeline's own depth/stencil when the shader writes them. Plain pipelines only; tessellation, mesh and multiview keep the old behaviour. Extension and feature advertised.
+
+Verified by: test_unused_attachments_mix_and_match 1978 -> 0 failures; test_null_rtv and test_unbound_rtv_rendering pass; test_renderpass_rendering 0 errors.
+
+Off switch: none
+---
+ .../Commands/MVKCommandEncoderState.mm        | 14 +++++
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm     |  6 ++
+ .../GPUObjects/MVKDeviceFeatureStructs.def    |  1 +
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h    | 16 +++++
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm   | 61 +++++++++++++++++++
+ MoltenVK/MoltenVK/Layers/MVKExtensions.def    |  1 +
+ 6 files changed, 99 insertions(+)
+
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+index 02fa230..7e5d77a 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+@@ -1482,6 +1482,20 @@ void MVKMetalGraphicsCommandEncoderState::prepareDraw(
+ 		const MVKRenderSubpass* subpass = mvkEncoder.getSubpass();
+ 		if (subpass->isMultiview() && !pipeline->isTessellationPipeline() && !pipeline->isMeshPipeline()) {
+ 			mtlPipeline = pipeline->getMultiviewPipelineState(subpass->getViewCountInMetalPass(mvkEncoder.getMultiviewPassIndex()));
++		} else if (!pipeline->isTessellationPipeline() && !pipeline->isMeshPipeline()) {
++			// Match the pipeline's attachment formats to what is actually bound (unused/null attachments).
++			MVKPixelFormats* pixFmts = mvkEncoder.getPixelFormats();
++			MTLPixelFormat color[8] = {};
++			MVKRenderSubpass* sp = const_cast<MVKRenderSubpass*>(subpass);	// accessors are non-const but side-effect free
++			uint32_t caCnt = std::min(sp->getColorAttachmentCount(), 8u);
++			for (uint32_t i = 0; i < caCnt; i++) {
++				if (sp->isColorAttachmentUsed(i)) { color[i] = pixFmts->getMTLPixelFormat(sp->getColorAttachmentFormat(i)); }
++			}
++			MTLPixelFormat depth = pixFmts->getMTLPixelFormat(sp->getDepthFormat());
++			MTLPixelFormat stencil = pixFmts->getMTLPixelFormat(sp->getStencilFormat());
++			if ( !pixFmts->isDepthFormat(depth) ) { depth = MTLPixelFormatInvalid; }
++			if ( !pixFmts->isStencilFormat(stencil) ) { stencil = MTLPixelFormatInvalid; }
++			mtlPipeline = pipeline->getPipelineStateForAttachments(color, depth, stencil);
+ 		} else {
+ 			mtlPipeline = pipeline->getMainPipelineState();
+ 		}
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index 8147faf..a2066d7 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -689,6 +689,12 @@ void MVKPhysicalDevice::getFeatures(VkPhysicalDeviceFeatures2* features) {
+ 				formatFeatures->formatA4B4G4R4 = canSupport4444;
+ 				break;
+ 			}
++			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT: {
++				// Pipelines get attachment-format variants matching the bound attachments at draw time.
++				auto* unusedFeatures = (VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT*)next;
++				unusedFeatures->dynamicRenderingUnusedAttachments = true;
++				break;
++			}
+ 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT: {
+ 				auto* depthFeatures = (VkPhysicalDeviceDepthClipControlFeaturesEXT*)next;
+ 				depthFeatures->depthClipControl = true;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def
+index 0c73e52..e890594 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def
+@@ -99,6 +99,7 @@ MVK_DEVICE_FEATURE_EXTN(ShaderSubgroupUniformControlFlow, SHADER_SUBGROUP_UNIFOR
+ MVK_DEVICE_FEATURE_EXTN(SwapchainMaintenance1,            SWAPCHAIN_MAINTENANCE_1,              KHR,   1)
+ MVK_DEVICE_FEATURE_EXTN(4444Formats,                      4444_FORMATS,                         EXT,   2)
+ MVK_DEVICE_FEATURE_EXTN(DepthClipControl,                 DEPTH_CLIP_CONTROL,                   EXT,   1)
++MVK_DEVICE_FEATURE_EXTN(DynamicRenderingUnusedAttachments, DYNAMIC_RENDERING_UNUSED_ATTACHMENTS, EXT, 1)
+ MVK_DEVICE_FEATURE_EXTN(DepthClipEnable,                  DEPTH_CLIP_ENABLE,                    EXT,   1)
+ MVK_DEVICE_FEATURE_EXTN(ExtendedDynamicState,             EXTENDED_DYNAMIC_STATE,               EXT,   1)
+ MVK_DEVICE_FEATURE_EXTN(ExtendedDynamicState2,            EXTENDED_DYNAMIC_STATE_2,             EXT,   3)
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+index 4ef5d30..4e56480 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+@@ -28,6 +28,7 @@
+ #include "MVKBitArray.h"
+ #include "MVKInlineArray.h"
+ #include <MoltenVKShaderConverter/SPIRVReflection.h>
++#include <mutex>
+ #include <MoltenVKShaderConverter/SPIRVToMSLConverter.h>
+ #include <unordered_map>
+ #include <unordered_set>
+@@ -268,6 +269,13 @@ public:
+ 	/** Returns the MTLRenderPipelineState for the final stage of the pipeline */
+ 	id<MTLRenderPipelineState> getMainPipelineState() const { return _mtlPipelineState; }
+ 
++	/**
++	 * VK_EXT_dynamic_rendering_unused_attachments: returns a pipeline state whose attachment formats match the
++	 * bound attachments (color[8], depth, stencil), compiling and caching a variant when they differ only by
++	 * unused/null attachments. Returns the main state when they already match or no variant can be built.
++	 */
++	id<MTLRenderPipelineState> getPipelineStateForAttachments(const MTLPixelFormat* color, MTLPixelFormat depth, MTLPixelFormat stencil);
++
+ 	/** Returns the MTLRenderPipelineState for the final stage of the pipeline */
+ 	id<MTLRenderPipelineState> getMultiviewPipelineState(uint32_t mv) const {
+ 		return _multiviewMTLPipelineStates.empty() ? _mtlPipelineState : _multiviewMTLPipelineStates.find(mv)->second;
+@@ -411,6 +419,14 @@ protected:
+ 	id<MTLComputePipelineState> _mtlTessControlStageState = nil;
+ 	id<MTLRenderPipelineState> _mtlPipelineState = nil;
+ 
++	// Attachment-format variants (VK_EXT_dynamic_rendering_unused_attachments).
++	MTLRenderPipelineDescriptor* _variantBaseDesc = nil;
++	MTLPixelFormat _plColorFormats[8] = {};
++	MTLPixelFormat _plDepthFormat = MTLPixelFormatInvalid;
++	MTLPixelFormat _plStencilFormat = MTLPixelFormatInvalid;
++	std::unordered_map<std::string, id<MTLRenderPipelineState>> _attachmentVariants;
++	std::mutex _attachmentVariantLock;
++
+ 	MVKShaderImplicitRezBinding _reservedVertexAttributeBufferCount;
+ 	VkPrimitiveTopology _vkPrimitiveTopology;
+ 	uint32_t _outputControlPointCount;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 05e3c5f..60a7a13 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -1037,6 +1037,59 @@ id<MTLRenderPipelineState> MVKGraphicsPipeline::getOrCompilePipeline(MTLRenderPi
+ 	return plState;
+ }
+ 
++id<MTLRenderPipelineState> MVKGraphicsPipeline::getPipelineStateForAttachments(const MTLPixelFormat* color,
++																			   MTLPixelFormat depth,
++																			   MTLPixelFormat stencil) {
++	bool same = depth == _plDepthFormat && stencil == _plStencilFormat;
++	for (uint32_t i = 0; same && i < 8; i++) { same = color[i] == _plColorFormats[i]; }
++	if (same || !_variantBaseDesc) { return getMainPipelineState(); }
++
++	// Only presence may differ (an attachment unused by the pipeline, or a pipeline output with nothing bound).
++	// Different real formats in the same slot are not allowed by Vulkan; keep the main state for those.
++	for (uint32_t i = 0; i < 8; i++) {
++		if (color[i] && _plColorFormats[i] && color[i] != _plColorFormats[i]) { return getMainPipelineState(); }
++	}
++	if ((depth && _plDepthFormat && depth != _plDepthFormat) || (stencil && _plStencilFormat && stencil != _plStencilFormat)) {
++		return getMainPipelineState();
++	}
++
++	std::string key((const char*)color, sizeof(MTLPixelFormat) * 8);
++	key.append((const char*)&depth, sizeof(depth));
++	key.append((const char*)&stencil, sizeof(stencil));
++
++	std::lock_guard<std::mutex> lock(_attachmentVariantLock);
++	auto it = _attachmentVariants.find(key);
++	if (it != _attachmentVariants.end()) { return it->second ? it->second : getMainPipelineState(); }
++
++	id<MTLRenderPipelineState> variant = nil;
++	@autoreleasepool {
++		MTLRenderPipelineDescriptor* desc = [[_variantBaseDesc copy] autorelease];
++		for (uint32_t i = 0; i < 8; i++) {
++			MTLRenderPipelineColorAttachmentDescriptor* ca = desc.colorAttachments[i];
++			if (color[i] == _plColorFormats[i]) { continue; }
++			// Bound but unused by the pipeline: match the format, write nothing.
++			// Pipeline output with nothing bound: no attachment, writes discarded.
++			ca.pixelFormat = color[i];
++			ca.blendingEnabled = NO;
++			ca.writeMask = MTLColorWriteMaskNone;
++		}
++		desc.depthAttachmentPixelFormat = depth;
++		desc.stencilAttachmentPixelFormat = stencil;
++		// Compile directly (silently): a shader that writes depth / stencil ref cannot drop those formats,
++		// so on failure retry keeping the pipeline's own depth/stencil formats.
++		NSError* err = nil;
++		if ( !variant ) { variant = [getMTLDevice() newRenderPipelineStateWithDescriptor: desc error: &err]; }	// retained
++		if ( !variant && (depth != _plDepthFormat || stencil != _plStencilFormat) ) {
++			desc.depthAttachmentPixelFormat = depth ? depth : _plDepthFormat;
++			desc.stencilAttachmentPixelFormat = stencil ? stencil : _plStencilFormat;
++			err = nil;
++			variant = [getMTLDevice() newRenderPipelineStateWithDescriptor: desc error: &err];	// retained
++		}
++	}
++	_attachmentVariants[key] = variant;
++	return variant ? variant : getMainPipelineState();
++}
++
+ id<MTLRenderPipelineState> MVKGraphicsPipeline::getOrCompileMeshPipeline(id meshPLDesc,
+ 																		 id<MTLRenderPipelineState>& plState) {
+ 	if ( !plState ) {
+@@ -1178,6 +1231,12 @@ void MVKGraphicsPipeline::initMTLRenderPipelineState(const VkGraphicsPipelineCre
+ 				}
+ 			} else {
+ 				getOrCompilePipeline(plDesc, _mtlPipelineState);
++				if (_mtlPipelineState) {
++					_variantBaseDesc = [plDesc copy];	// retained; used to build attachment-format variants
++					for (uint32_t i = 0; i < 8; i++) { _plColorFormats[i] = plDesc.colorAttachments[i].pixelFormat; }
++					_plDepthFormat = plDesc.depthAttachmentPixelFormat;
++					_plStencilFormat = plDesc.stencilAttachmentPixelFormat;
++				}
+ 			}
+ 			[plDesc release];																				// temp release
+ 		} else {
+@@ -2532,6 +2591,8 @@ MVKGraphicsPipeline::~MVKGraphicsPipeline() {
+ 		[_mtlTessVertexStageIndex32State release];
+ 		[_mtlTessControlStageState release];
+ 		[_mtlPipelineState release];
++		[_variantBaseDesc release];
++		for (auto& v : _attachmentVariants) { [v.second release]; }
+ 		if (_ownsVertexModule) delete _vertexModule;
+ 		if (_ownsTessCtlModule) delete _tessCtlModule;
+ 		if (_ownsTessEvalModule) delete _tessEvalModule;
+diff --git a/MoltenVK/MoltenVK/Layers/MVKExtensions.def b/MoltenVK/MoltenVK/Layers/MVKExtensions.def
+index d86cb32..594be9e 100644
+--- a/MoltenVK/MoltenVK/Layers/MVKExtensions.def
++++ b/MoltenVK/MoltenVK/Layers/MVKExtensions.def
+@@ -139,6 +139,7 @@ MVK_EXTENSION(EXT_debug_utils,                          EXT_DEBUG_UTILS,
+ MVK_EXTENSION(EXT_depth_clip_control,                   EXT_DEPTH_CLIP_CONTROL,                   DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(EXT_depth_clip_enable,                    EXT_DEPTH_CLIP_ENABLE,                    DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(EXT_descriptor_indexing,                  EXT_DESCRIPTOR_INDEXING,                  DEVICE,   10.11,  8.0,  1.0)
++MVK_EXTENSION(EXT_dynamic_rendering_unused_attachments, EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS, DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(EXT_extended_dynamic_state,               EXT_EXTENDED_DYNAMIC_STATE,               DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(EXT_extended_dynamic_state2,              EXT_EXTENDED_DYNAMIC_STATE_2,             DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(EXT_extended_dynamic_state3,              EXT_EXTENDED_DYNAMIC_STATE_3,             DEVICE,   10.11,  8.0,  1.0)

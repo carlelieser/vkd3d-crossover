@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:08:40 -0500
+Subject: [PATCH 13/20] fix: keep __restrict on aliased argument buffer
+ descriptors
+
+Problem: Metal compile error "casts away qualifiers" for shaders with
+aliased descriptors in argument buffers.
+
+Root cause: the reinterpret_cast emitted for an aliased descriptor
+dropped the base descriptor's __restrict qualifier.
+
+Fix: emit __restrict in the target type of both aliased descriptor casts.
+
+Verified by: see NOTES.md Finding 7.
+
+Off switch: none.
+---
+ spirv_msl.cpp | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 0f679dc..1f8a913 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -20976,15 +20976,16 @@ void CompilerMSL::emit_argument_buffer_aliased_descriptor(const SPIRVariable &al
+ 
+ 		if (is_var_runtime_size_array(aliased_var))
+ 		{
++			// Keep the base descriptor's __restrict qualifier, otherwise the cast "casts away qualifiers".
+ 			name = join("reinterpret_cast<",
+-			            type_to_glsl(var_type, aliased_var.self, true), " ", descriptor_storage, " *>(&",
+-			            unqualified_name, ")");
++			            type_to_glsl(var_type, aliased_var.self, true), " __restrict ",
++			            descriptor_storage, " *>(&", unqualified_name, ")");
+ 		}
+ 		else
+ 		{
+ 			name = join(needs_post_cast_deref ? "*" : "", "reinterpret_cast<",
+-			            type_to_glsl(var_type, aliased_var.self, true), " ", descriptor_storage, " ",
+-			            ref_type,
++			            type_to_glsl(var_type, aliased_var.self, true), " __restrict ",
++			            descriptor_storage, " ", ref_type,
+ 			            ">(", unqualified_name, ");");
+ 		}
+ 
+-- 
+2.51.0
+

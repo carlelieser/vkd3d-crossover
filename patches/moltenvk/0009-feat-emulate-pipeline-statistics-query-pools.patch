@@ -1,0 +1,151 @@
+From 10af061f67fd0abf8eb67a854b8d8dc766d037fa Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:11:56 -0500
+Subject: [PATCH 09/28] feat: emulate pipeline-statistics query pools
+
+Problem: "Fatal D3D error (1, E_FAIL)" source: D3D12 PIPELINE_STATISTICS query heaps could not be created.
+
+Root cause: Apple GPUs expose no statistics counters and MoltenVK refused pipeline-statistics query pools.
+
+Fix: Unless pipelineStatisticsQuery is enabled, create MVKEmulatedPipelineStatisticsQueryPool: one value per enabled statistic, all zero, normal availability. Host readback of query results now handles several values per query.
+
+Verified by: test_create_query_heap 8/8 (was a crash); test_query_pipeline_statistics 6 failures (expects real counts, expected).
+
+Off switch: none
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm    |  5 +-
+ MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.h  | 25 ++++++++-
+ MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.mm | 54 ++++++++++++++++++--
+ 3 files changed, 77 insertions(+), 7 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index a03822d..84716f2 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -4421,7 +4421,10 @@ MVKQueryPool* MVKDevice::createQueryPool(const VkQueryPoolCreateInfo* pCreateInf
+ 			case VK_QUERY_TYPE_TIMESTAMP:
+ 				return new MVKTimestampQueryPool(this, pCreateInfo);
+ 			case VK_QUERY_TYPE_PIPELINE_STATISTICS:
+-				return new MVKPipelineStatisticsQueryPool(this, pCreateInfo);
++				// Apple GPUs expose no statistics counters: use the zero-reporting emulation unless the
++				// feature is genuinely enabled.
++				if (_enabledFeatures.pipelineStatisticsQuery) { return new MVKPipelineStatisticsQueryPool(this, pCreateInfo); }
++				return new MVKEmulatedPipelineStatisticsQueryPool(this, pCreateInfo);
+ 			default:
+ 				return new MVKUnsupportedQueryPool(this, pCreateInfo);
+ 		}
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.h b/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.h
+index 665c548..0f76812 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.h
+@@ -70,7 +70,7 @@ public:
+ 						VkQueryResultFlags flags);
+ 
+ 	/** Encodes commands to copy the results of the specified queries into device memory. */
+-	void encodeCopyResults(MVKCommandEncoder* cmdEncoder,
++	virtual void encodeCopyResults(MVKCommandEncoder* cmdEncoder,
+ 						   uint32_t firstQuery,
+ 						   uint32_t queryCount,
+ 						   MVKBuffer* destBuffer,
+@@ -243,6 +243,29 @@ protected:
+ };
+ 
+ 
++#pragma mark -
++#pragma mark MVKEmulatedPipelineStatisticsQueryPool
++
++/**
++ * A pipeline-statistics query pool for devices without Metal statistics counters (all Apple GPUs).
++ * Queries complete normally and every statistic reads as zero. This lets layers such as vkd3d-proton create
++ * D3D12 pipeline-statistics query heaps (commonly created by engines at startup for profiling).
++ */
++class MVKEmulatedPipelineStatisticsQueryPool : public MVKQueryPool {
++
++public:
++	void encodeCopyResults(MVKCommandEncoder* cmdEncoder, uint32_t firstQuery, uint32_t queryCount,
++	                       MVKBuffer* destBuffer, VkDeviceSize destOffset, VkDeviceSize stride,
++	                       VkQueryResultFlags flags) override;
++
++	MVKEmulatedPipelineStatisticsQueryPool(MVKDevice* device, const VkQueryPoolCreateInfo* pCreateInfo);
++
++protected:
++	NSData* getQuerySourceData(uint32_t firstQuery, uint32_t queryCount) override;
++	void propagateDebugName() override {}
++};
++
++
+ #pragma mark -
+ #pragma mark MVKUnsupportedQueryPool
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.mm b/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.mm
+index e5d4bae..6fa98d7 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.mm
+@@ -132,11 +132,14 @@ VkResult MVKQueryPool::getResult(uint32_t query, NSData* srcData, uint32_t srcDa
+ 
+ 	// Output the results of this query
+ 	if (shouldOutput) {
+-		uint64_t rsltVal = ((uint64_t*)srcData.bytes)[query - srcDataQueryOffset];
+-		if (shouldOutput64Bit) {
+-			*(uint64_t*)pDstData = rsltVal;
+-		} else {
+-			*(uint32_t*)pDstData = (uint32_t)rsltVal;
++		// Queries may have several values (e.g. pipeline statistics); srcData holds _queryElementCount per query.
++		for (uint32_t e = 0; e < _queryElementCount; e++) {
++			uint64_t rsltVal = ((uint64_t*)srcData.bytes)[(query - srcDataQueryOffset) * _queryElementCount + e];
++			if (shouldOutput64Bit) {
++				((uint64_t*)pDstData)[e] = rsltVal;
++			} else {
++				((uint32_t*)pDstData)[e] = (uint32_t)rsltVal;
++			}
+ 		}
+ 	}
+ 
+@@ -434,6 +437,47 @@ MVKPipelineStatisticsQueryPool::MVKPipelineStatisticsQueryPool(MVKDevice* device
+ }
+ 
+ 
++#pragma mark -
++#pragma mark MVKEmulatedPipelineStatisticsQueryPool
++
++MVKEmulatedPipelineStatisticsQueryPool::MVKEmulatedPipelineStatisticsQueryPool(MVKDevice* device, const VkQueryPoolCreateInfo* pCreateInfo) :
++	MVKQueryPool(device, pCreateInfo, std::max<uint32_t>(__builtin_popcount(pCreateInfo->pipelineStatistics), 1)) {}
++
++NSData* MVKEmulatedPipelineStatisticsQueryPool::getQuerySourceData(uint32_t firstQuery, uint32_t queryCount) {
++	return [NSMutableData dataWithLength: (NSUInteger)queryCount * _queryElementCount * sizeof(uint64_t)];	// all zero
++}
++
++void MVKEmulatedPipelineStatisticsQueryPool::encodeCopyResults(MVKCommandEncoder* cmdEncoder, uint32_t firstQuery, uint32_t queryCount,
++                                                               MVKBuffer* destBuffer, VkDeviceSize destOffset, VkDeviceSize stride,
++                                                               VkQueryResultFlags flags) {
++	if (queryCount == 0) { return; }
++	// Build the destination contents on the CPU (zeros, plus availability if requested) and blit them in.
++	bool is64 = mvkIsAnyFlagEnabled(flags, VK_QUERY_RESULT_64_BIT);
++	bool withAvail = mvkIsAnyFlagEnabled(flags, VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
++	bool partial = mvkIsAnyFlagEnabled(flags, VK_QUERY_RESULT_PARTIAL_BIT);
++	size_t elemSize = is64 ? sizeof(uint64_t) : sizeof(uint32_t);
++	size_t perQuery = (_queryElementCount + (withAvail ? 1 : 0)) * elemSize;
++	NSUInteger total = (NSUInteger)((queryCount - 1) * stride + perQuery);
++	const MVKMTLBufferAllocation* tmp = cmdEncoder->getTempMTLBuffer(total);
++	uint8_t* p = (uint8_t*)tmp->getContents();
++	memset(p, 0, total);
++	_availabilityLock.lock();
++	for (uint32_t i = 0; i < queryCount; i++) {
++		bool avail = _availability[firstQuery + i] == Available;
++		uint8_t* q = p + i * stride;
++		if (withAvail) {
++			if (is64) { ((uint64_t*)q)[_queryElementCount] = avail; } else { ((uint32_t*)q)[_queryElementCount] = avail; }
++		}
++		(void)partial;
++	}
++	_availabilityLock.unlock();
++	id<MTLBlitCommandEncoder> blit = cmdEncoder->getMTLBlitEncoder(kMVKCommandUseCopyQueryPoolResults);
++	[blit copyFromBuffer: tmp->_mtlBuffer sourceOffset: tmp->_offset
++	            toBuffer: destBuffer->getMTLBuffer() destinationOffset: destBuffer->getMTLBufferOffset() + destOffset
++	                size: total];
++}
++
++
+ #pragma mark -
+ #pragma mark MVKUnsupportedQueryPool
+ 

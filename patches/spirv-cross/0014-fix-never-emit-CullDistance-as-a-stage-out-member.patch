@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:08:55 -0500
+Subject: [PATCH 14/20] fix: never emit CullDistance as a stage-out member
+
+Problem: shaders writing a standalone CullDistance output fail to compile
+in Metal (out.gl_CullDistance has no such member).
+
+Root cause: Metal has no cull-distance output; CullDistance only exists
+as a local array copied to [[user(cullN)]] varyings, but builtin_to_glsl
+still qualified it with the stage-out struct.
+
+Fix: name CullDistance outputs as the local array. Primitives are not
+culled by it (Metal has no equivalent).
+
+Verified by: compile errors gone in the vkd3d-proton test sweep,
+59 -> 12 failures in the affected tests (see NOTES.md Finding 12).
+
+Off switch: none.
+---
+ spirv_msl.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 1f8a913..3bf914f 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -19137,6 +19137,10 @@ string CompilerMSL::builtin_to_glsl(BuiltIn builtin, StorageClass storage)
+ 	case BuiltInClipDistance:
+ 	case BuiltInCullDistance:
+ 	case BuiltInLayer:
++		// Metal has no cull-distance output; CullDistance only exists as a local array (copied to
++		// [[user(cullN)]] varyings), never as a member of the stage-out struct.
++		if (builtin == BuiltInCullDistance && storage == StorageClassOutput)
++			break;
+ 		if (is_tesc_shader())
+ 			break;
+ 		if (is_mesh_shader())
+-- 
+2.51.0
+

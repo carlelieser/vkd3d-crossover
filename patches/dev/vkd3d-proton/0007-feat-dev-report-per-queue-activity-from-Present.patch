@@ -1,0 +1,285 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 12:00:00 +0000
+Subject: [PATCH 07/13] feat(dev): report per-queue activity from Present
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Dev only, not for release builds.
+
+Problem: needed to see whether Requiem's streaming and other queues were
+still submitting work during the black screen (N§29).
+
+Root cause: n/a (diagnostic).
+
+Fix: every queue is registered with the DLL that created it; every 10 s,
+from Present, log per queue the submits, command lists, dispatches, copies
+(count and MB), signals (with the last value) and waits. Counters are
+updated even with diagnostics off; only the report is gated.
+
+Verified by: Requiem: streaming had stopped and no DirectStorage queues were
+present (N§29).
+
+Off switch: needs VKD3D_DIAGNOSTICS=1; VKD3D_QUEUE_ACTIVITY_LOG=0 disables.
+---
+ libs/vkd3d/command.c       | 98 ++++++++++++++++++++++++++++++++++++++
+ libs/vkd3d/device.c        |  1 +
+ libs/vkd3d/swapchain.c     |  1 +
+ libs/vkd3d/vkd3d_private.h | 12 +++++
+ 4 files changed, 112 insertions(+)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index d865c91..bc3521c 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -883,6 +883,10 @@ static void d3d12_fence_inc_ref(struct d3d12_fence *fence)
+ /* Fence stall diagnostics: every live fence is registered; vkd3d_fence_stall_report() (called from Present)
+  * logs CPU waits (SetEventOnCompletion) and queue Waits pending for 5 s or more, and fences polled in a
+  * loop (GetCompletedValue) whose value does not move. Disabled with VKD3D_FENCE_STALL_LOG=0. */
++static pthread_mutex_t vkd3d_queue_diag_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct list vkd3d_queue_diag_list = LIST_INIT(vkd3d_queue_diag_list);
++static uint32_t vkd3d_queue_diag_next_id;
++static uint64_t vkd3d_queue_diag_last_report;
+ static pthread_mutex_t vkd3d_fence_diag_lock = PTHREAD_MUTEX_INITIALIZER;
+ static struct list vkd3d_fence_diag_list = LIST_INIT(vkd3d_fence_diag_list);
+ static uint32_t vkd3d_fence_diag_next_id;
+@@ -7297,6 +7301,8 @@ static void d3d12_command_list_reset_api_state(struct d3d12_command_list *list,
+     memset(list->so_counter_buffer_offsets, 0, sizeof(list->so_counter_buffer_offsets));
+ 
+     list->cbv_srv_uav_descriptors_view = NULL;
++    list->diag_dispatches = list->diag_copies = 0;
++    list->diag_copy_bytes = 0;
+     list->vrs_image = NULL;
+ 
+     ID3D12GraphicsCommandList10_SetPipelineState(iface, initial_pipeline_state);
+@@ -9518,6 +9524,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_Dispatch(d3d12_command_list_ifa
+     const VkPhysicalDeviceLimits *limits;
+ 
+     TRACE("iface %p, x %u, y %u, z %u.\n", iface, x, y, z);
++    list->diag_dispatches++;
+ 
+     d3d12_command_list_check_render_pass_validation(list, "Dispatch called within a render pass.\n", true);
+     d3d12_command_list_flush_dgc_batch(list);
+@@ -9592,6 +9599,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyBufferRegion(d3d12_command_
+     TRACE("iface %p, dst_resource %p, dst_offset %#"PRIx64", src_resource %p, "
+             "src_offset %#"PRIx64", byte_count %#"PRIx64".\n",
+             iface, dst, dst_offset, src, src_offset, byte_count);
++    list->diag_copies++;
++    list->diag_copy_bytes += byte_count;
+ 
+     d3d12_command_list_check_render_pass_validation(list, "CopyBufferRegion called within a render pass.\n", true);
+     d3d12_command_list_flush_dgc_batch(list);
+@@ -11266,6 +11275,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyTextureRegion(d3d12_command
+ 
+     TRACE("iface %p, dst %p, dst_x %u, dst_y %u, dst_z %u, src %p, src_box %p.\n",
+             iface, dst, dst_x, dst_y, dst_z, src, src_box);
++    list->diag_copies++;
+ 
+     d3d12_command_list_check_render_pass_validation(list, "CopyTextureRegion called within a render pass.\n", true);
+     d3d12_command_list_flush_dgc_batch(list);
+@@ -11391,6 +11401,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyResource(d3d12_command_list
+     unsigned int i, j;
+ 
+     TRACE("iface %p, dst_resource %p, src_resource %p.\n", iface, dst, src);
++    list->diag_copies++;
+ 
+     d3d12_command_list_check_render_pass_validation(list, "CopyResource called within a render pass.\n", true);
+     d3d12_command_list_flush_dgc_batch(list);
+@@ -23671,6 +23682,10 @@ VKD3D_METHODENTRY_NONSTATIC(ULONG) d3d12_command_queue_Release(ID3D12CommandQueu
+     {
+         struct d3d12_device *device = command_queue->device;
+ 
++        pthread_mutex_lock(&vkd3d_queue_diag_lock);
++        list_remove(&command_queue->diag_entry);
++        pthread_mutex_unlock(&vkd3d_queue_diag_lock);
++
+         d3d_destruction_notifier_free(&command_queue->destruction_notifier);
+         vkd3d_private_store_destroy(&command_queue->private_store);
+ 
+@@ -24196,6 +24211,8 @@ VKD3D_METHODENTRY(void) d3d12_command_queue_ExecuteCommandLists(ID3D12CommandQue
+     if (!command_list_count)
+         return;
+ 
++    InterlockedIncrement(&command_queue->diag_ecl);
++
+     if (FAILED(hr = vkd3d_memory_transfer_queue_flush(&command_queue->device->memory_transfers)))
+     {
+         d3d12_device_mark_as_removed(command_queue->device, hr,
+@@ -24228,6 +24245,14 @@ VKD3D_METHODENTRY(void) d3d12_command_queue_ExecuteCommandLists(ID3D12CommandQue
+     {
+         cmd_list = d3d12_command_list_from_iface(command_lists[i]);
+ 
++        if (cmd_list)
++        {
++            InterlockedIncrement(&command_queue->diag_lists);
++            InterlockedAdd(&command_queue->diag_dispatches, cmd_list->diag_dispatches);
++            InterlockedAdd(&command_queue->diag_copies, cmd_list->diag_copies);
++            InterlockedAdd64(&command_queue->diag_copy_bytes, (LONG64)cmd_list->diag_copy_bytes);
++        }
++
+         if (!cmd_list)
+         {
+             WARN("Unsupported command list type %p.\n", cmd_list);
+@@ -24594,6 +24619,8 @@ VKD3D_METHODENTRY(HRESULT) d3d12_command_queue_Signal(ID3D12CommandQueue *iface,
+ 
+     TRACE("iface %p, fence %p, value %#"PRIx64".\n", iface, fence_iface, value);
+ 
++    InterlockedIncrement(&command_queue->diag_signals);
++    command_queue->diag_last_signal_value = value;
+     d3d12_fence_iface_inc_ref((d3d12_fence_iface *)fence_iface);
+ 
+     sub.type = VKD3D_SUBMISSION_SIGNAL;
+@@ -24612,6 +24639,7 @@ VKD3D_METHODENTRY(HRESULT) d3d12_command_queue_Wait(ID3D12CommandQueue *iface,
+ 
+     TRACE("iface %p, fence %p, value %#"PRIx64".\n", iface, fence_iface, value);
+ 
++    InterlockedIncrement(&command_queue->diag_waits);
+     d3d12_fence_iface_inc_ref((d3d12_fence_iface *)fence_iface);
+ 
+     if (!is_shared_ID3D12Fence(fence_iface))
+@@ -26899,6 +26927,71 @@ fail:
+     return hr;
+ }
+ 
++/* Queue activity diagnostics: every queue is registered; vkd3d_queue_activity_report() (called from Present) logs
++ * each queue's submissions, copies, dispatches, signals and waits every 10 s. VKD3D_QUEUE_ACTIVITY_LOG=0 disables. */
++
++void vkd3d_queue_diag_set_creator(struct d3d12_command_queue *queue, const void *return_address)
++{
++#ifdef _WIN32
++    HMODULE module;
++    char path[MAX_PATH];
++    const char *base;
++    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++            (LPCSTR)return_address, &module) && GetModuleFileNameA(module, path, sizeof(path)))
++    {
++        base = strrchr(path, '\\');
++        snprintf(queue->diag_creator, sizeof(queue->diag_creator), "%s", base ? base + 1 : path);
++    }
++#endif
++}
++
++void vkd3d_queue_activity_report(void)
++{
++    static const char *types[] = { "direct", "bundle", "compute", "copy", "video decode", "video process", "video encode" };
++    enum { MAX_LINES = 16 };
++    char lines[MAX_LINES][320];
++    struct d3d12_command_queue *queue;
++    unsigned int count = 0, i;
++    static int enabled = -1;
++    uint64_t now, interval;
++
++    if (enabled < 0)
++    {
++        char env[16];
++        enabled = vkd3d_diagnostics_enabled() && !(vkd3d_get_env_var("VKD3D_QUEUE_ACTIVITY_LOG", env, sizeof(env)) && env[0] == '0');
++    }
++    if (!enabled)
++        return;
++    now = vkd3d_get_current_time_ns();
++    pthread_mutex_lock(&vkd3d_queue_diag_lock);
++    interval = now - vkd3d_queue_diag_last_report;
++    if (vkd3d_queue_diag_last_report && interval < 10000000000ull)
++    {
++        pthread_mutex_unlock(&vkd3d_queue_diag_lock);
++        return;
++    }
++    if (!vkd3d_queue_diag_last_report)
++        interval = 0;
++    vkd3d_queue_diag_last_report = now;
++    LIST_FOR_EACH_ENTRY(queue, &vkd3d_queue_diag_list, struct d3d12_command_queue, diag_entry)
++    {
++        LONG ecl = InterlockedExchange(&queue->diag_ecl, 0), lists = InterlockedExchange(&queue->diag_lists, 0);
++        LONG sig = InterlockedExchange(&queue->diag_signals, 0), waits = InterlockedExchange(&queue->diag_waits, 0);
++        LONG disp = InterlockedExchange(&queue->diag_dispatches, 0), copies = InterlockedExchange(&queue->diag_copies, 0);
++        LONG64 bytes = InterlockedExchange64(&queue->diag_copy_bytes, 0);
++        if (count >= MAX_LINES || !interval)
++            continue;
++        snprintf(lines[count++], sizeof(lines[0]), "queue %u (%s, created by %s): in %.0f s: %ld submits (%ld lists: %ld dispatches, "
++                "%ld copies %.1f MB), %ld signals (last value %"PRIu64"), %ld waits",
++                queue->diag_id, queue->desc.Type < ARRAY_SIZE(types) ? types[queue->desc.Type] : "?",
++                queue->diag_creator[0] ? queue->diag_creator : "?", interval / 1e9, (long)ecl, (long)lists, (long)disp,
++                (long)copies, bytes / 1e6, (long)sig, queue->diag_last_signal_value, (long)waits);
++    }
++    pthread_mutex_unlock(&vkd3d_queue_diag_lock);
++    for (i = 0; i < count; i++)
++        vkd3d_failure_log("queue-activity", "%s", lines[i]);
++}
++
+ HRESULT d3d12_command_queue_create(struct d3d12_device *device,
+         const D3D12_COMMAND_QUEUE_DESC *desc, uint32_t vk_family_index, struct d3d12_command_queue **queue)
+ {
+@@ -26919,6 +27012,11 @@ HRESULT d3d12_command_queue_create(struct d3d12_device *device,
+ 
+     TRACE("Created command queue %p.\n", object);
+ 
++    pthread_mutex_lock(&vkd3d_queue_diag_lock);
++    object->diag_id = ++vkd3d_queue_diag_next_id;
++    list_add_tail(&vkd3d_queue_diag_list, &object->diag_entry);
++    pthread_mutex_unlock(&vkd3d_queue_diag_lock);
++
+     *queue = object;
+ 
+     return S_OK;
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 8f76a1a..34fc15c 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -4051,6 +4051,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateCommandQueue(d3d12_device_if
+ 
+     if (FAILED(hr = d3d12_command_queue_create(device, desc, VK_QUEUE_FAMILY_IGNORED, &object)))
+         return hr;
++    vkd3d_queue_diag_set_creator(object, __builtin_return_address(0));
+ 
+     return return_interface(&object->ID3D12CommandQueue_iface, &IID_ID3D12CommandQueue,
+             riid, command_queue);
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index e48d892..05e11dc 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -1131,6 +1131,7 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
+ 
+     vkd3d_pso_retry_report();
+     vkd3d_fence_stall_report();
++    vkd3d_queue_activity_report();
+ 
+     /* Like DXGI: once the device is removed, Present fails instead of silently presenting nothing,
+      * so the application notices (and can query GetDeviceRemovedReason / recreate the device). */
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index a68caa3..f09c7cc 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -706,6 +706,8 @@ struct d3d12_fence
+ };
+ 
+ void vkd3d_fence_stall_report(void);
++void vkd3d_queue_activity_report(void);
++void vkd3d_queue_diag_set_creator(struct d3d12_command_queue *queue, const void *return_address);
+ 
+ static inline struct d3d12_fence *impl_from_ID3D12Fence1(ID3D12Fence1 *iface)
+ {
+@@ -3546,6 +3548,8 @@ struct d3d12_command_list
+     size_t pending_queries_count;
+ 
+     const struct vkd3d_descriptor_metadata_view *cbv_srv_uav_descriptors_view;
++    uint32_t diag_dispatches, diag_copies;
++    uint64_t diag_copy_bytes;
+ 
+     struct d3d12_resource *vrs_image;
+ 
+@@ -3921,6 +3925,14 @@ struct d3d12_command_queue
+     d3d12_command_queue_iface ID3D12CommandQueue_iface;
+     d3d12_command_queue_vkd3d_ext_iface ID3D12CommandQueueExt_iface;
+ 
++    /* Diagnostics: activity counters, reported by vkd3d_queue_activity_report(). */
++    struct list diag_entry;
++    uint32_t diag_id;
++    char diag_creator[64];
++    LONG diag_ecl, diag_lists, diag_signals, diag_waits, diag_dispatches, diag_copies;
++    LONG64 diag_copy_bytes;
++    uint64_t diag_last_signal_value;
++
+     LONG refcount;
+ 
+     D3D12_COMMAND_QUEUE_DESC desc;

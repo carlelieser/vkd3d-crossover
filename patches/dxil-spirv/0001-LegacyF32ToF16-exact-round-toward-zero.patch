@@ -1,3 +1,33 @@
+From 547373b2be83ffc05349996a2e6206e8c080150a Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:00:16 -0500
+Subject: [PATCH] LegacyF32ToF16: exact round-toward-zero
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: packed fp16 values became +-Inf where D3D gives +-65504. In RE Engine
+the hair-strand colour (packed fp16, then R11G11B10) turned Inf and bloom/TAA
+spread it into blown-out highlights.
+
+Root cause: D3D defines f32tof16 as round-toward-zero (overflow saturates to the
+largest finite half). dxil-spirv emits GLSL.std.450 PackHalf2x16, which rounds to
+nearest on most non-AMD implementations, Metal included, so overflow gives Inf.
+(The existing comment already notes RTZ is required.)
+
+Fix: pack, unpack, and if the rounded magnitude exceeds the input's, step the
+packed magnitude back by one ulp (packed - 1; sign is bit 15). Exact RTZ; NaN and
+Inf inputs are unchanged (the comparison is false).
+
+Verified by: vkd3d-proton test_fp16_rounding_behavior (sm62 + legacy, ~16.7M
+cases), test_shader_instructions (5347), sm69_long_vector_intrinsics: 0 failures.
+In-game: Inf values gone from the hair resolve (NOTES.md §34).
+
+Off switch: DXIL_SPIRV_F16_RTE=1 restores plain packHalf2x16.
+---
+ opcodes/dxil/dxil_arithmetic.cpp | 76 +++++++++++++++++++++++++++++---
+ 1 file changed, 69 insertions(+), 7 deletions(-)
+
 diff --git a/opcodes/dxil/dxil_arithmetic.cpp b/opcodes/dxil/dxil_arithmetic.cpp
 index 7032448..35db8f9 100644
 --- a/opcodes/dxil/dxil_arithmetic.cpp
@@ -87,3 +117,6 @@ index 7032448..35db8f9 100644
  	impl.add(op);
  	impl.decorate_relaxed_precision(instruction->getType(), op->id, false);
  
+-- 
+2.51.0
+

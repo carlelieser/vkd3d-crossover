@@ -1,0 +1,304 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 12:00:00 +0000
+Subject: [PATCH 03/13] feat(dev): add in-process thread sampler
+
+Dev only, not for release builds. Not documented in OVERVIEW.md or NOTES.md;
+facts below come from the code comment.
+
+Problem: needed thread stacks of a game that stalls, without attaching a
+debugger (visible to anti-debug checks).
+
+Root cause: n/a (diagnostic).
+
+Fix: 60 s and 150 s after the first D3D12 device, every other thread of the
+process is briefly suspended, its registers and top of stack copied into
+preallocated memory, then resumed. Return-address candidates in executable
+module code are written as module+offset (nearest export when available) to
+C:\gfx-threads.log; a TEB stack scan is the fallback when suspension fails.
+
+Verified by: no record in OVERVIEW.md / NOTES.md.
+
+Off switch: needs VKD3D_DIAGNOSTICS=1; VKD3D_THREAD_SAMPLER=0 disables.
+---
+ include/private/vkd3d_debug.h |   1 +
+ libs/vkd3d-common/debug.c     | 236 ++++++++++++++++++++++++++++++++++
+ libs/vkd3d/device.c           |   1 +
+ 3 files changed, 238 insertions(+)
+
+diff --git a/include/private/vkd3d_debug.h b/include/private/vkd3d_debug.h
+index f21f9e7..3ac649c 100644
+--- a/include/private/vkd3d_debug.h
++++ b/include/private/vkd3d_debug.h
+@@ -75,6 +75,7 @@ void vkd3d_dbg_flush(void);
+ /* Always-on, deduplicated failure log shared with MoltenVK. VKD3D_FAILURE_LOG = path or "0";
+  * default C:\\gfx-failures.log. */
+ bool vkd3d_failure_log_enabled(void);
++void vkd3d_start_thread_sampler(void);
+ bool vkd3d_diagnostics_enabled(void);
+ void vkd3d_failure_log(const char *category, const char *fmt, ...) VKD3D_PRINTF_FUNC(2, 3);
+ 
+diff --git a/libs/vkd3d-common/debug.c b/libs/vkd3d-common/debug.c
+index db69b50..e0dec0c 100644
+--- a/libs/vkd3d-common/debug.c
++++ b/libs/vkd3d-common/debug.c
+@@ -713,6 +713,224 @@ union vkd3d_config_flags vkd3d_parse_debug_options(const char *string,
+ }
+ 
+ #ifdef _WIN32
++/* In-process thread sampler (diagnostics; needs VKD3D_DIAGNOSTICS=1, VKD3D_THREAD_SAMPLER=0 disables).
++ * At 60 s and 150 s after the first D3D12 device, every thread of this process is briefly suspended; its
++ * registers and the top of its stack are copied into preallocated memory (no locks or allocations while a
++ * thread is suspended), then it is resumed. Return-address candidates that point into executable module code
++ * are written as module+offset (nearest export when available) to C:\gfx-threads.log. Unlike attaching a
++ * debugger, this is invisible to anti-debug checks. */
++#include <tlhelp32.h>
++
++#define VKD3D_SAMPLER_STACK_BYTES (64 * 1024)
++#define VKD3D_SAMPLER_MAX_FRAMES 28
++
++static const char *vkd3d_sampler_export_name(HMODULE mod, uintptr_t addr, uintptr_t *offset)
++{
++    const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)mod;
++    const IMAGE_NT_HEADERS64 *nt;
++    const IMAGE_EXPORT_DIRECTORY *exp;
++    const DWORD *funcs, *names;
++    const WORD *ords;
++    const char *best = NULL;
++    uintptr_t base = (uintptr_t)mod, best_rva = 0, rva = addr - base;
++    DWORD i, size;
++
++    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
++        return NULL;
++    nt = (const IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
++    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT)
++        return NULL;
++    size = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
++    if (!size)
++        return NULL;
++    exp = (const IMAGE_EXPORT_DIRECTORY *)(base + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
++    funcs = (const DWORD *)(base + exp->AddressOfFunctions);
++    names = (const DWORD *)(base + exp->AddressOfNames);
++    ords = (const WORD *)(base + exp->AddressOfNameOrdinals);
++    for (i = 0; i < exp->NumberOfNames; i++)
++    {
++        DWORD f = funcs[ords[i]];
++        if (f <= rva && f > best_rva)
++        {
++            best_rva = f;
++            best = (const char *)(base + names[i]);
++        }
++    }
++    if (best)
++        *offset = rva - best_rva;
++    return best;
++}
++
++static bool vkd3d_sampler_is_code(uintptr_t addr)
++{
++    MEMORY_BASIC_INFORMATION mbi;
++    if (addr < 0x10000 || !VirtualQuery((void *)addr, &mbi, sizeof(mbi)))
++        return false;
++    return mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE &&
++            (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
++}
++
++static void vkd3d_sampler_describe(uintptr_t addr, char *out, size_t out_size)
++{
++    char path[MAX_PATH], *name;
++    const char *exp;
++    uintptr_t exp_off = 0;
++    HMODULE mod = NULL;
++
++    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++            (const char *)addr, &mod) || !mod)
++    {
++        snprintf(out, out_size, "%#" PRIxPTR, addr);
++        return;
++    }
++    GetModuleFileNameA(mod, path, sizeof(path));
++    name = strrchr(path, '\\');
++    name = name ? name + 1 : path;
++    if ((exp = vkd3d_sampler_export_name(mod, addr, &exp_off)) && exp_off < 0x4000)
++        snprintf(out, out_size, "%s!%s+%#" PRIxPTR, name, exp, exp_off);
++    else
++        snprintf(out, out_size, "%s+%#" PRIxPTR, name, addr - (uintptr_t)mod);
++}
++
++typedef struct
++{
++    LONG ExitStatus;
++    void *TebBaseAddress;
++    void *UniqueProcess;
++    void *UniqueThread;
++    ULONG_PTR AffinityMask;
++    LONG Priority;
++    LONG BasePriority;
++} VKD3D_THREAD_BASIC_INFORMATION;
++typedef LONG (WINAPI *PFN_NtQueryInformationThread)(HANDLE, int, void *, ULONG, ULONG *);
++
++static void vkd3d_sampler_dump(FILE *f, int pass)
++{
++    static uint64_t stack[VKD3D_SAMPLER_STACK_BYTES / 8];
++    PFN_NtQueryInformationThread query_thread = (PFN_NtQueryInformationThread)(void *)GetProcAddress(
++            GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
++    DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
++    char exe[MAX_PATH] = "?";
++    THREADENTRY32 te;
++    HANDLE snap;
++    char desc[300];
++
++    GetModuleFileNameA(NULL, exe, sizeof(exe));
++    fprintf(f, "==== thread snapshot %d (%s, pid %#lx) ====\n", pass, strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe, (unsigned long)pid);
++    if ((snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)) == INVALID_HANDLE_VALUE)
++        return;
++    te.dwSize = sizeof(te);
++    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te))
++    {
++        CONTEXT ctx;
++        MEMORY_BASIC_INFORMATION mbi;
++        uintptr_t frames[VKD3D_SAMPLER_MAX_FRAMES];
++        size_t nwords = 0, nframes = 0, i;
++        DWORD susp = (DWORD)-1, err_susp = 0, err_ctx = 0;
++        BOOL got_ctx = FALSE, approximate = FALSE;
++        PWSTR wname = NULL;
++        HANDLE th;
++
++        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self)
++            continue;
++        if (!(th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID)))
++        {
++            fprintf(f, "-- thread %#lx: OpenThread failed (%lu)\n", (unsigned long)te.th32ThreadID, (unsigned long)GetLastError());
++            continue;
++        }
++        memset(&ctx, 0, sizeof(ctx));
++        ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
++        susp = SuspendThread(th);
++        if (susp == (DWORD)-1)
++            err_susp = GetLastError();
++        else
++        {
++            got_ctx = GetThreadContext(th, &ctx);
++            if (!got_ctx)
++                err_ctx = GetLastError();
++            if (got_ctx && ctx.Rsp && VirtualQuery((void *)ctx.Rsp, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT)
++            {
++                uintptr_t end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
++                size_t bytes = end - ctx.Rsp;
++                if (bytes > sizeof(stack))
++                    bytes = sizeof(stack);
++                memcpy(stack, (const void *)ctx.Rsp, bytes);
++                nwords = bytes / 8;
++            }
++            ResumeThread(th);
++        }
++        /* Fallback without suspension: stack bounds from the TEB, scan the top 16 KiB below StackBase. */
++        if (!nwords && query_thread)
++        {
++            VKD3D_THREAD_BASIC_INFORMATION tbi;
++            memset(&tbi, 0, sizeof(tbi));
++            if (query_thread(th, 0 /* ThreadBasicInformation */, &tbi, sizeof(tbi), NULL) >= 0 && tbi.TebBaseAddress)
++            {
++                const NT_TIB *tib = (const NT_TIB *)tbi.TebBaseAddress;
++                uintptr_t base = (uintptr_t)tib->StackBase, limit = (uintptr_t)tib->StackLimit;
++                uintptr_t start = base - 16384 > limit ? base - 16384 : limit;
++                if (base > start && VirtualQuery((void *)start, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT)
++                {
++                    size_t bytes = base - start;
++                    memcpy(stack, (const void *)start, bytes);
++                    nwords = bytes / 8;
++                    approximate = TRUE;
++                }
++            }
++        }
++        if (got_ctx && ctx.Rip && vkd3d_sampler_is_code(ctx.Rip))
++            frames[nframes++] = ctx.Rip;
++        for (i = 0; i < nwords && nframes < VKD3D_SAMPLER_MAX_FRAMES; i++)
++            if (vkd3d_sampler_is_code(stack[i]))
++                frames[nframes++] = stack[i];
++        desc[0] = '\0';
++        if (SUCCEEDED(GetThreadDescription(th, &wname)) && wname && wname[0])
++            WideCharToMultiByte(CP_UTF8, 0, wname, -1, desc, sizeof(desc), NULL, NULL);
++        if (wname)
++            LocalFree(wname);
++        CloseHandle(th);
++        fprintf(f, "-- thread %#lx%s%s%s", (unsigned long)te.th32ThreadID, desc[0] ? " \"" : "", desc, desc[0] ? "\"" : "");
++        if (susp == (DWORD)-1)
++            fprintf(f, " [suspend failed %lu]", (unsigned long)err_susp);
++        else if (!got_ctx)
++            fprintf(f, " [context failed %lu]", (unsigned long)err_ctx);
++        else if (!ctx.Rsp)
++            fprintf(f, " [context empty]");
++        if (approximate)
++            fprintf(f, " [approximate: TEB stack scan]");
++        fprintf(f, "\n");
++        for (i = 0; i < nframes; i++)
++        {
++            char where[300];
++            vkd3d_sampler_describe(frames[i], where, sizeof(where));
++            fprintf(f, "   %s\n", where);
++        }
++    }
++    CloseHandle(snap);
++    fflush(f);
++}
++
++static DWORD WINAPI vkd3d_sampler_thread(void *arg)
++{
++    static const DWORD delays_ms[] = { 60000, 90000 };
++    char path[MAX_PATH];
++    FILE *f;
++    int pass;
++
++    (void)arg;
++    snprintf(path, sizeof(path), "C:\\gfx-threads.log");
++    for (pass = 0; pass < 2; pass++)
++    {
++        Sleep(delays_ms[pass]);
++        if (!(f = fopen(path, "a")))
++            return 0;
++        vkd3d_sampler_dump(f, pass + 1);
++        fclose(f);
++        vkd3d_failure_log("thread-sampler", "thread snapshot %d written to %s", pass + 1, path);
++    }
++    return 0;
++}
++
+ /* Master switch for the black-screen diagnostics (fence/queue reports, backbuffer-draw logger, event recording,
+  * GPU readback, thread sampler). Off by default; VKD3D_DIAGNOSTICS=1 enables. */
+ bool vkd3d_diagnostics_enabled(void)
+@@ -725,4 +943,22 @@ bool vkd3d_diagnostics_enabled(void)
+     }
+     return enabled;
+ }
++
++void vkd3d_start_thread_sampler(void)
++{
++    static LONG started;
++    char env[16];
++    HANDLE t;
++
++    if (!vkd3d_diagnostics_enabled() || (vkd3d_get_env_var("VKD3D_THREAD_SAMPLER", env, sizeof(env)) && env[0] == '0'))
++        return;
++    if (InterlockedExchange(&started, 1))
++        return;
++    if ((t = CreateThread(NULL, 0, vkd3d_sampler_thread, NULL, 0, NULL)))
++        CloseHandle(t);
++}
++#else
++void vkd3d_start_thread_sampler(void)
++{
++}
+ #endif
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index d85dd7c..8f76a1a 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -10976,6 +10976,7 @@ bool d3d12_device_validate_shader_meta(struct d3d12_device *device, const struct
+ HRESULT d3d12_device_create(struct vkd3d_instance *instance,
+         const struct vkd3d_device_create_info *create_info, struct d3d12_device **device)
+ {
++    vkd3d_start_thread_sampler();
+     bool reject_existing_device = false;
+     bool forced_singletons = false;
+     struct d3d12_device *object;

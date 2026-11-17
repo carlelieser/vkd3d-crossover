@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 12:00:00 +0000
+Subject: [PATCH 05/13] feat(dev): log rejected cached PSO blobs to
+ C:\gfx-pso-mismatch.log
+
+Dev only, not for release builds. ON BY DEFAULT today; to be gated behind
+VKD3D_DIAGNOSTICS (OVERVIEW.md section 6).
+
+Problem: needed to cross-check rejected cached PSO blobs against the game's
+own cache file offline.
+
+Root cause: n/a (diagnostic).
+
+Fix: one raw line per rejected blob (never collapsed) with the requested and
+stored state hashes, whether root signature and shaders match, and the
+shader and root-signature hashes.
+
+Verified by: no record in NOTES.md; listed in OVERVIEW.md section 6.
+
+Off switch: VKD3D_PSO_MISMATCH_LOG=0.
+---
+ libs/vkd3d/cache.c | 40 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 40 insertions(+)
+
+diff --git a/libs/vkd3d/cache.c b/libs/vkd3d/cache.c
+index 2e692e1..80f5cf9 100644
+--- a/libs/vkd3d/cache.c
++++ b/libs/vkd3d/cache.c
+@@ -345,6 +345,45 @@ static uint32_t d3d12_cached_pipeline_state_to_flags(const struct d3d12_cached_p
+     return pipeline_library_flags;
+ }
+ 
++/* Diagnostics: one raw line per rejected cached PSO blob in C:\\gfx-pso-mismatch.log (never collapsed), with the
++ * requested and stored state hashes and whether root signature and shaders match, so a game's own cache file can be
++ * cross-checked offline. VKD3D_PSO_MISMATCH_LOG=0 disables. */
++static void vkd3d_pso_mismatch_record(const struct vkd3d_pipeline_cache_compatibility *want,
++        const struct vkd3d_pipeline_cache_compatibility *have)
++{
++#ifdef _WIN32
++    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++    static FILE *f;
++    static int enabled = -1;
++    unsigned int i, same_shaders = 1;
++    char env[16];
++
++    if (enabled < 0)
++        enabled = !(vkd3d_get_env_var("VKD3D_PSO_MISMATCH_LOG", env, sizeof(env)) && env[0] == '0');
++    if (!enabled)
++        return;
++    for (i = 0; i < ARRAY_SIZE(want->dxbc_blob_hashes); i++)
++        if (want->dxbc_blob_hashes[i] != have->dxbc_blob_hashes[i])
++            same_shaders = 0;
++    pthread_mutex_lock(&lock);
++    if (!f)
++        f = fopen("C:\\gfx-pso-mismatch.log", "a");
++    if (f)
++    {
++        fprintf(f, "want %016"PRIx64" have %016"PRIx64" rootsig %s shaders %s |", want->state_desc_compat_hash,
++                have->state_desc_compat_hash, want->root_signature_compat_hash == have->root_signature_compat_hash ? "same" : "DIFF",
++                same_shaders ? "same" : "DIFF");
++        for (i = 0; i < ARRAY_SIZE(want->dxbc_blob_hashes); i++)
++            fprintf(f, " %016"PRIx64, want->dxbc_blob_hashes[i]);
++        fprintf(f, " | rs %016"PRIx64"\n", want->root_signature_compat_hash);
++        fflush(f);
++    }
++    pthread_mutex_unlock(&lock);
++#else
++    (void)want; (void)have;
++#endif
++}
++
+ HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
+         const struct d3d12_cached_pipeline_state *state,
+         const struct vkd3d_pipeline_cache_compatibility *compat)
+@@ -455,6 +494,7 @@ HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
+     /* Verify the expected PSO state that was used. This must match, or we have to fail compilation as per API spec. */
+     if (compat->state_desc_compat_hash != pso_compat->compat.state_desc_compat_hash)
+     {
++        vkd3d_pso_mismatch_record(compat, &pso_compat->compat);
+         if (VKD3D_CONFIG_FLAG_IS_SET(PIPELINE_LIBRARY_LOG))
+             INFO("PSO compatibility hash mismatch.\n");
+         else

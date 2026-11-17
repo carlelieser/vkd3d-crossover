@@ -1,0 +1,37 @@
+From 99bda6285639f1b48cdf8a1c088bc691658faf93 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:12:00 -0500
+Subject: [PATCH 14/28] fix: skip per-command-buffer useResource with residency
+ sets
+
+Problem: GPU "Invalid Resource" device loss under buffer suballocation.
+
+Root cause: Every command buffer called useResource on all GPU-addressable buffers of the device. When the app freed an unrelated buffer whose own work had completed (legal in Vulkan), in-flight command buffers referenced freed memory.
+
+Fix: With a residency set those buffers are already resident; skip the blanket useResource.
+
+Verified by: test_stress_suballocation(+_multithread) 3372/48478 -> 0 failures.
+
+Off switch: none
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index 94df11a..7759433 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -4716,6 +4716,13 @@ MVKBuffer* MVKDevice::removeBuffer(MVKBuffer* mvkBuff) {
+ }
+ 
+ void MVKDevice::encodeGPUAddressableBuffers(MVKUseResourceHelper& resources, MVKResourceUsageStages stage) {
++	// With a residency set, every buffer whose device address can be taken is already resident
++	// (device-memory MTLBuffers and heap-allocated MTLBuffers are added to it). Adding them to each
++	// command buffer with useResource is then redundant, and harmful: the command buffer "requires" every
++	// such buffer in the device, so the app freeing an unrelated buffer whose own work has completed
++	// (legal in Vulkan) leaves an in-flight command buffer referencing freed memory -> GPU "Invalid Resource".
++	if (hasResidencySet()) { return; }
++
+ 	lock_guard<mutex> lock(_rezLock);
+ 	for (auto& buff : _gpuAddressableBuffers) {
+ 		resources.add(buff->getMTLBuffer(), stage, true);

@@ -1,0 +1,52 @@
+From a302360010894d465dd43a521aefc156f281d3ca Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:11:58 -0500
+Subject: [PATCH 11/28] fix: fail buffer views without a Metal texel format
+
+Problem: Process abort when creating a typed buffer view with a format that has no Metal texel-buffer equivalent (e.g. R32G32B32_*).
+
+Root cause: MTLPixelFormatInvalid was passed to minimumLinearTextureAlignmentForPixelFormat:, which aborts.
+
+Fix: Return VK_ERROR_FORMAT_NOT_SUPPORTED from vkCreateBufferView, and skip the Metal alignment query for invalid formats.
+
+Verified by: Startup-path probes (probe2-4); vkd3d-proton sweep of 597 tests, 0 regressions.
+
+Off switch: none
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm | 7 +++++++
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm | 4 +++-
+ 2 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm b/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm
+index a00c09b..d81f5e8 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm
+@@ -297,6 +297,13 @@ MVKBufferView::MVKBufferView(MVKDevice* device, const VkBufferViewCreateInfo* pC
+     _buffer = (MVKBuffer*)pCreateInfo->buffer;
+     _offset = pCreateInfo->offset;
+     _mtlPixelFormat = pixFmts->getMTLPixelFormat(pCreateInfo->format);
++	_mtlTexture = nil;
++	if (_mtlPixelFormat == MTLPixelFormatInvalid) {
++		// No Metal texel-buffer format (e.g. VK_FORMAT_R32G32B32_*). Fail cleanly rather than passing
++		// MTLPixelFormatInvalid to Metal, which aborts the process.
++		setConfigurationResult(reportError(VK_ERROR_FORMAT_NOT_SUPPORTED, "vkCreateBufferView(): VkFormat %s has no Metal texel buffer equivalent.", pixFmts->getName(pCreateInfo->format)));
++		return;
++	}
+     VkExtent2D fmtBlockSize = pixFmts->getBlockTexelSize(pCreateInfo->format);  // Pixel size of format
+     size_t bytesPerBlock = pixFmts->getBytesPerBlock(pCreateInfo->format);
+ 	_mtlTexture = nil;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index 84716f2..e5db8b0 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -4985,7 +4985,9 @@ VkDeviceSize MVKDevice::getVkFormatTexelBufferAlignment(VkFormat format, MVKBase
+ 		// typically have stricter alignment requirements due to it being a 2-component format.
+ 		mtlPixFmt = mvkPixFmts->getChromaSubsamplingPlaneMTLPixelFormat(format, 1);
+ 	}
+-	deviceAlignment = [mtlDev minimumLinearTextureAlignmentForPixelFormat: mtlPixFmt];
++	if (mtlPixFmt != MTLPixelFormatInvalid) {
++		deviceAlignment = [mtlDev minimumLinearTextureAlignmentForPixelFormat: mtlPixFmt];
++	}
+ 
+ 	return deviceAlignment ? deviceAlignment : _physicalDevice->_properties.limits.minTexelBufferOffsetAlignment;
+ }

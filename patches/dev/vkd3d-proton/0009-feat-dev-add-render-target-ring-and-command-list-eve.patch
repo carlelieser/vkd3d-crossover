@@ -1,0 +1,267 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 12:00:00 +0000
+Subject: [PATCH 09/13] feat(dev): add render-target ring and command-list
+ event recorder
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Dev only, not for release builds.
+
+Problem: needed the commands that touched the image sampled by the final
+composite in the same command list (N§29).
+
+Root cause: n/a (diagnostic).
+
+Fix: per command list, a ring of the last render targets bound and a 64-entry
+ring of resource-touching commands (barriers, aliasing and UAV barriers, RTV
+and UAV clears, discards, copies, dispatches with the image views they bind),
+each snapshotted at record time.
+
+Verified by: used with the backbuffer-draw logger (N§29).
+
+Off switch: needs VKD3D_DIAGNOSTICS=1.
+---
+ libs/vkd3d/command.c       | 119 +++++++++++++++++++++++++++++++++++++
+ libs/vkd3d/vkd3d_private.h |  13 ++++
+ 2 files changed, 132 insertions(+)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index bc3521c..18b746f 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -32,6 +32,32 @@ static HRESULT d3d12_fence_signal(struct d3d12_fence *fence, struct vkd3d_fence_
+ static void d3d12_command_queue_add_submission(struct d3d12_command_queue *queue,
+         const struct d3d12_command_queue_submission *sub);
+ static void d3d12_fence_inc_ref(struct d3d12_fence *fence);
++enum vkd3d_diag_event_kind { DIAG_EV_RT = 1, DIAG_EV_BARRIER, DIAG_EV_ALIAS, DIAG_EV_UAVB, DIAG_EV_CLEAR_RTV, DIAG_EV_CLEAR_UAV,
++        DIAG_EV_DISCARD, DIAG_EV_COPY_DST, DIAG_EV_DISPATCH, DIAG_EV_DISPATCH_RES, DIAG_EV_DRAW };
++static void d3d12_command_list_diag_event(struct d3d12_command_list *list, unsigned int kind, unsigned int sub,
++        const void *res, uint32_t a, uint32_t b)
++{
++    unsigned int i;
++    if (!vkd3d_diagnostics_enabled())
++        return;
++    if (list->diag_ev_count && list->diag_ev[(list->diag_ev_count - 1) % 64].kind == DIAG_EV_DRAW && kind == DIAG_EV_DRAW)
++    {
++        list->diag_ev[(list->diag_ev_count - 1) % 64].a++;
++        return;
++    }
++    i = list->diag_ev_count++ % 64;
++    list->diag_ev[i].kind = kind; list->diag_ev[i].sub = sub; list->diag_ev[i].res = res;
++    list->diag_ev[i].a = a; list->diag_ev[i].b = b;
++    list->diag_ev[i].w = list->diag_ev[i].h = list->diag_ev[i].fmt = 0;
++    list->diag_ev[i].heap = NULL; list->diag_ev[i].off = 0;
++    if (res && kind != DIAG_EV_DISPATCH_RES)
++    {
++        const struct d3d12_resource *r = res; /* live: the caller just got it from the application */
++        list->diag_ev[i].w = (uint32_t)r->desc.Width; list->diag_ev[i].h = r->desc.Height;
++        list->diag_ev[i].fmt = r->desc.Format; list->diag_ev[i].heap = r->heap; list->diag_ev[i].off = r->mem.offset;
++    }
++}
++
+ static void d3d12_fence_dec_ref(struct d3d12_fence *fence);
+ static void d3d12_shared_fence_inc_ref(struct d3d12_shared_fence *fence);
+ static void d3d12_shared_fence_dec_ref(struct d3d12_shared_fence *fence);
+@@ -7301,6 +7327,9 @@ static void d3d12_command_list_reset_api_state(struct d3d12_command_list *list,
+     memset(list->so_counter_buffer_offsets, 0, sizeof(list->so_counter_buffer_offsets));
+ 
+     list->cbv_srv_uav_descriptors_view = NULL;
++    list->diag_rt_used = 0;
++    list->diag_rt_head = 0;
++    list->diag_ev_count = 0;
+     list->diag_dispatches = list->diag_copies = 0;
+     list->diag_copy_bytes = 0;
+     list->vrs_image = NULL;
+@@ -9525,6 +9554,47 @@ static void STDMETHODCALLTYPE d3d12_command_list_Dispatch(d3d12_command_list_ifa
+ 
+     TRACE("iface %p, x %u, y %u, z %u.\n", iface, x, y, z);
+     list->diag_dispatches++;
++    d3d12_command_list_diag_event(list, DIAG_EV_DISPATCH, 0, NULL, x, y);
++    if (vkd3d_diagnostics_enabled() && list->compute_bindings.root_signature && list->cbv_srv_uav_descriptors_view && list->diag_cbv_srv_uav_heap)
++    {
++        const struct d3d12_root_signature *crs = list->compute_bindings.root_signature;
++        unsigned int p, b, found = 0;
++        for (p = 0; p < crs->parameter_count && found < 6; p++)
++        {
++            const struct vkd3d_shader_root_parameter *rp = &crs->parameters[p];
++            if (rp->parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
++                continue;
++            for (b = 0; b < rp->descriptor_table.binding_count && found < 6; b++)
++            {
++                const struct vkd3d_shader_resource_binding *rb = &rp->descriptor_table.first_binding[b];
++                uint32_t base = list->compute_bindings.descriptor_tables[p] + rb->descriptor_offset, n, k;
++                if (rb->type != VKD3D_SHADER_DESCRIPTOR_TYPE_UAV && rb->type != VKD3D_SHADER_DESCRIPTOR_TYPE_SRV)
++                    continue;
++                n = rb->register_count > 8 ? 8 : rb->register_count;
++                for (k = 0; k < n && found < 6; k++)
++                {
++                    const struct vkd3d_descriptor_metadata_view *m;
++                    if (base + k >= list->diag_cbv_srv_uav_heap->desc.NumDescriptors)
++                        break;
++                    m = &list->cbv_srv_uav_descriptors_view[base + k];
++                    if ((m->info.flags & VKD3D_DESCRIPTOR_FLAG_NON_NULL) && (m->info.flags & VKD3D_DESCRIPTOR_FLAG_IMAGE_VIEW) &&
++                            m->info.image.view
++#ifdef _WIN32
++                            && !IsBadReadPtr(m->info.image.view, sizeof(*m->info.image.view))
++#endif
++                            && m->info.image.view->diag_resource && m->info.image.view->refcount > 0)
++                    {
++                        struct vkd3d_diag_event *ev;
++                        d3d12_command_list_diag_event(list, DIAG_EV_DISPATCH_RES, rb->type, m->info.image.view->diag_resource, p, rb->register_index + k);
++                        ev = &list->diag_ev[(list->diag_ev_count - 1) % 64];
++                        ev->w = m->info.image.view->diag_width; ev->h = m->info.image.view->diag_height;
++                        ev->fmt = m->info.image.view->diag_dxgi_format;
++                        found++;
++                    }
++                }
++            }
++        }
++    }
+ 
+     d3d12_command_list_check_render_pass_validation(list, "Dispatch called within a render pass.\n", true);
+     d3d12_command_list_flush_dgc_batch(list);
+@@ -11276,6 +11346,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyTextureRegion(d3d12_command
+     TRACE("iface %p, dst %p, dst_x %u, dst_y %u, dst_z %u, src %p, src_box %p.\n",
+             iface, dst, dst_x, dst_y, dst_z, src, src_box);
+     list->diag_copies++;
++    if (dst && dst->pResource)
++        d3d12_command_list_diag_event(list, DIAG_EV_COPY_DST, 1, impl_from_ID3D12Resource(dst->pResource), 0, 0);
+ 
+     d3d12_command_list_check_render_pass_validation(list, "CopyTextureRegion called within a render pass.\n", true);
+     d3d12_command_list_flush_dgc_batch(list);
+@@ -11402,6 +11474,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyResource(d3d12_command_list
+ 
+     TRACE("iface %p, dst_resource %p, src_resource %p.\n", iface, dst, src);
+     list->diag_copies++;
++    if (dst)
++        d3d12_command_list_diag_event(list, DIAG_EV_COPY_DST, 0, impl_from_ID3D12Resource(dst), 0, 0);
+ 
+     d3d12_command_list_check_render_pass_validation(list, "CopyResource called within a render pass.\n", true);
+     d3d12_command_list_flush_dgc_batch(list);
+@@ -14182,6 +14256,21 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
+     unsigned int i, j;
+ 
+     TRACE("iface %p, barrier_count %u, barriers %p.\n", iface, barrier_count, barriers);
++    for (i = 0; vkd3d_diagnostics_enabled() && i < barrier_count; ++i)
++    {
++        const D3D12_RESOURCE_BARRIER *bb = &barriers[i];
++        if (bb->Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && bb->Transition.pResource)
++            d3d12_command_list_diag_event(list, DIAG_EV_BARRIER, bb->Flags, impl_from_ID3D12Resource(bb->Transition.pResource),
++                    bb->Transition.StateBefore, bb->Transition.StateAfter);
++        else if (bb->Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING)
++        {
++            d3d12_command_list_diag_event(list, DIAG_EV_ALIAS, 0, bb->Aliasing.pResourceAfter ? impl_from_ID3D12Resource(bb->Aliasing.pResourceAfter) : NULL,
++                    (uint32_t)(uintptr_t)(bb->Aliasing.pResourceBefore ? impl_from_ID3D12Resource(bb->Aliasing.pResourceBefore) : NULL),
++                    (uint32_t)((uintptr_t)(bb->Aliasing.pResourceBefore ? impl_from_ID3D12Resource(bb->Aliasing.pResourceBefore) : NULL) >> 32));
++        }
++        else if (bb->Type == D3D12_RESOURCE_BARRIER_TYPE_UAV)
++            d3d12_command_list_diag_event(list, DIAG_EV_UAVB, 0, bb->UAV.pResource ? impl_from_ID3D12Resource(bb->UAV.pResource) : NULL, 0, 0);
++    }
+ 
+     /* Ignore enhanced barriers. They are much harder to reason about due to the transient nature of Vulkan-style
+      * barriers. This is more or less just a workaround too for terribly written games,
+@@ -14635,6 +14724,7 @@ static void d3d12_command_list_set_descriptor_heaps_buffers(struct d3d12_command
+                 /* In case we need to hoist buffer descriptors. */
+                 d = d3d12_desc_decode_va(heap->cpu_va.ptr);
+                 list->cbv_srv_uav_descriptors_view = d.view;
++                list->diag_cbv_srv_uav_heap = heap;
+             }
+         }
+         else if (heap->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+@@ -14695,6 +14785,7 @@ static void d3d12_command_list_set_descriptor_heaps_sets(struct d3d12_command_li
+             struct d3d12_desc_split d;
+             d = d3d12_desc_decode_va(heap->cpu_va.ptr);
+             list->cbv_srv_uav_descriptors_view = d.view;
++                list->diag_cbv_srv_uav_heap = heap;
+         }
+     }
+ 
+@@ -15638,6 +15729,25 @@ static void STDMETHODCALLTYPE d3d12_command_list_OMSetRenderTargets(d3d12_comman
+ 
+     d3d12_command_list_invalidate_ds_state(list, prev_dsv_format);
+     d3d12_command_list_recompute_fb_size(list);
++
++    if (list->rtvs[0].resource && vkd3d_diagnostics_enabled())
++    {
++        const struct d3d12_resource *r = list->rtvs[0].resource;
++        unsigned int slot = list->diag_rt_used ? list->diag_rt_head : 0;
++        if (!list->diag_rt_used || list->diag_rt_ring[slot] != r)
++        {
++            if (list->diag_rt_used)
++                slot = list->diag_rt_head = (list->diag_rt_head + 1) % ARRAY_SIZE(list->diag_rt_ring);
++            list->diag_rt_ring[slot] = r;
++            d3d12_command_list_diag_event(list, DIAG_EV_RT, 0, r, 0, 0);
++            list->diag_rt_w[slot] = (uint32_t)r->desc.Width;
++            list->diag_rt_h[slot] = r->desc.Height;
++            list->diag_rt_fmt[slot] = r->desc.Format;
++            list->diag_rt_draws[slot] = 0;
++            if (list->diag_rt_used < ARRAY_SIZE(list->diag_rt_ring))
++                list->diag_rt_used++;
++        }
++    }
+ }
+ 
+ static bool d3d12_rect_fully_covers_region(const D3D12_RECT *a, const D3D12_RECT *b)
+@@ -15997,6 +16107,9 @@ static void STDMETHODCALLTYPE d3d12_command_list_ClearRenderTargetView(d3d12_com
+ 
+     TRACE("iface %p, rtv %zx, color %p, rect_count %u, rects %p.\n",
+             iface, rtv.ptr, color, rect_count, rects);
++    if (rtv_desc && rtv_desc->resource)
++        d3d12_command_list_diag_event(list, DIAG_EV_CLEAR_RTV, 0, rtv_desc->resource,
++                (uint32_t)(color[0] * 1000.0f), (uint32_t)(color[3] * 1000.0f));
+ 
+     d3d12_command_list_check_render_pass_validation(list, "ClearRenderTargetView called within a render pass.\n", true);
+     d3d12_command_list_flush_dgc_batch(list);
+@@ -17192,6 +17305,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_ClearUnorderedAccessViewUint(d3
+ 
+     TRACE("iface %p, gpu_handle %#"PRIx64", cpu_handle %zx, resource %p, values %p, rect_count %u, rects %p.\n",
+             iface, gpu_handle.ptr, cpu_handle.ptr, resource, values, rect_count, rects);
++    if (resource)
++        d3d12_command_list_diag_event(list, DIAG_EV_CLEAR_UAV, 0, impl_from_ID3D12Resource(resource), 0, 0);
+ 
+     d3d12_command_list_check_render_pass_validation(list, "ClearUnorderedAccessViewUint called within a render pass.\n", true);
+     d3d12_command_list_flush_dgc_batch(list);
+@@ -17359,6 +17474,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_ClearUnorderedAccessViewFloat(d
+ 
+     TRACE("iface %p, gpu_handle %#"PRIx64", cpu_handle %zx, resource %p, values %p, rect_count %u, rects %p.\n",
+             iface, gpu_handle.ptr, cpu_handle.ptr, resource, values, rect_count, rects);
++    if (resource)
++        d3d12_command_list_diag_event(list, DIAG_EV_CLEAR_UAV, 0, impl_from_ID3D12Resource(resource), 0, 0);
+ 
+     d3d12_command_list_check_render_pass_validation(list, "ClearUnorderedAccessViewFloat called within a render pass.\n", true);
+     d3d12_command_list_flush_dgc_batch(list);
+@@ -17509,6 +17626,8 @@ static void STDMETHODCALLTYPE d3d12_command_list_DiscardResource(d3d12_command_l
+     bool full_discard;
+ 
+     TRACE("iface %p, resource %p, region %p.\n", iface, resource, region);
++    if (resource)
++        d3d12_command_list_diag_event(list, DIAG_EV_DISCARD, 0, impl_from_ID3D12Resource(resource), 0, 0);
+ 
+     d3d12_command_list_check_render_pass_validation(list, "DiscardResource called within a render pass.\n", true);
+     d3d12_command_list_flush_dgc_batch(list);
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 4fadd89..3c09c91 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3553,6 +3553,19 @@ struct d3d12_command_list
+     size_t pending_queries_count;
+ 
+     const struct vkd3d_descriptor_metadata_view *cbv_srv_uav_descriptors_view;
++    const struct d3d12_descriptor_heap *diag_cbv_srv_uav_heap; /* diagnostics only */
++    /* Diagnostics: last render targets bound with OMSetRenderTargets in this list (ring). */
++    const void *diag_rt_ring[6];
++    uint32_t diag_rt_w[6], diag_rt_h[6], diag_rt_fmt[6], diag_rt_draws[6];
++    uint32_t diag_rt_head, diag_rt_used;
++    /* Diagnostics: ring of resource-touching commands recorded in this list. */
++    struct vkd3d_diag_event
++    {
++        uint8_t kind; uint8_t sub; const void *res; uint32_t a, b;
++        /* Snapshot taken when recorded; never dereference res later (it may be destroyed). */
++        uint32_t w, h, fmt; const void *heap; uint64_t off;
++    } diag_ev[64];
++    uint32_t diag_ev_count;
+     uint32_t diag_dispatches, diag_copies;
+     uint64_t diag_copy_bytes;
+ 

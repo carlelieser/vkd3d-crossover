@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 12:00:00 +0000
+Subject: [PATCH 3/7] fix: emulate reserved resources without sparse binding
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: the PRAGMATA SKETCHBOOK demo crashed with a null-pointer
+dereference on its render thread at the first frame (V1).
+
+Root cause: MoltenVK has no sparse binding, so TiledResourcesTier is 0 and
+the maximum feature level drops to 11_x. RE Engine's FL 11 fallback path
+dereferences a resource it never created. With VKD3D_FEATURE_LEVEL=12_1 the
+game immediately creates a 32 MiB reserved UAV buffer, confirming it uses
+tiled resources on its 12_x path.
+
+Fix: without sparseBinding every reserved resource uses the existing
+committed fallback (d3d12_resource_create_reserved_fallback).
+UpdateTileMappings already ignores fallbacks; CopyTileMappings now does too.
+TiledResourcesTier 2 is reported when VKD3D_RELAX_CAPS is set. Exact unless an
+application aliases heap tiles across resources or relies on unmapped tiles
+reading zero.
+
+Verified by: the demo no longer crashes and gets past loading (N§18).
+test_large_heap and the tiling tests show the expected differences from the
+two limits above.
+
+Off switch: tier 2 is only reported with VKD3D_RELAX_CAPS=1. The committed
+fallback is used only when the device has no sparseBinding.
+---
+ libs/vkd3d/command.c  |  7 +++++++
+ libs/vkd3d/device.c   |  6 ++++++
+ libs/vkd3d/resource.c | 12 ++++++++++++
+ 3 files changed, 25 insertions(+)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index b4d0976..4c83a16 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -23874,6 +23874,13 @@ VKD3D_METHODENTRY(void) d3d12_command_queue_CopyTileMappings(ID3D12CommandQueue
+             iface, dst_resource, dst_region_start_coordinate, src_resource,
+             src_region_start_coordinate, region_size, flags);
+ 
++    /* Fallback (committed) reserved resources have no sparse bindings to copy. */
++    if (!(dst_res->flags & VKD3D_RESOURCE_RESERVED) || !(src_res->flags & VKD3D_RESOURCE_RESERVED))
++    {
++        WARN("Ignoring CopyTileMappings on fallback reserved resource.\n");
++        return;
++    }
++
+     sub.type = VKD3D_SUBMISSION_BIND_SPARSE;
+     sub.bind_sparse.mode = VKD3D_SPARSE_MEMORY_BIND_MODE_COPY;
+     sub.bind_sparse.bind_count = region_size->NumTiles;
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 21081dc..0fc1b06 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -8995,6 +8995,12 @@ static D3D12_TILED_RESOURCES_TIER d3d12_device_determine_tiled_resources_tier(st
+     const VkPhysicalDeviceSparseProperties *sparse_properties = &device->device_info.properties2.properties.sparseProperties;
+     const VkPhysicalDeviceFeatures *features = &device->device_info.features2.features;
+ 
++    /* With no sparse binding, reserved resources are emulated with committed memory (see
++     * d3d12_resource_create_reserved). Applications such as RE Engine titles require tiled
++     * resources for their feature-level 12 path, so expose tier 2 when relaxing caps. */
++    if (!features->sparseBinding && vkd3d_relax_caps())
++        return D3D12_TILED_RESOURCES_TIER_2;
++
+     if (!features->sparseBinding || !features->sparseResidencyAliased ||
+             !features->sparseResidencyBuffer || !features->sparseResidencyImage2D ||
+             !sparse_properties->residencyStandard2DBlockShape ||
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index 39e4b0b..28389d9 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -4896,6 +4896,18 @@ HRESULT d3d12_resource_create_reserved(struct d3d12_device *device,
+     struct d3d12_resource *object;
+     HRESULT hr;
+ 
++    /* No sparse binding at all (e.g. MoltenVK): emulate tiled resources with fully committed memory.
++     * Tile mapping updates become no-ops. Exact as long as the application writes tiles through the
++     * reserved resource itself; aliasing heap tiles between resources is not emulated. */
++    if (!device->device_info.features2.features.sparseBinding)
++    {
++        WARN("Emulating reserved resource with a committed resource (no sparse binding support).\n");
++        if (FAILED(hr = d3d12_resource_create_reserved_fallback(device, desc, initial_state,
++                optimized_clear_value, num_castable_formats, castable_formats, resource)))
++            return hr;
++        return S_OK;
++    }
++
+     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+     {
+         format = vkd3d_get_format(device, desc->Format, !!(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));

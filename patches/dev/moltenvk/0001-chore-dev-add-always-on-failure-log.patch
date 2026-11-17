@@ -1,0 +1,625 @@
+From f74edadd53aaa6c1938b12b9e526b039bbe7f04d Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:12:12 -0500
+Subject: [PATCH 01/10] chore(dev): add always-on failure log
+
+Problem: Games failed silently (black screen, E_FAIL/E_OUTOFMEMORY) with nothing pointing at the cause.
+
+Root cause: Diagnostics only; no defect.
+
+Fix: mvkLogFailure()/mvkFailureLogEnabled() append one deduplicated line per event to $WINEPREFIX/drive_c/gfx-failures.log (shared with vkd3d-proton). MoltenVK errors/warnings are mirrored; draw-skipped/dispatch-skipped (compute pipelines keep their shader code hash), gpu-error, device-lost, draw-mismatch (attachment variants), deferred-pso compile failures, swapchain creation lines, and a black-frame detector on present (4x4 grid every 30 presents; MVK_PRESENT_PROBE_LOG=1 adds present-sample lines).
+
+Verified by: Lines from both layers on the PRAGMATA SKETCHBOOK demo; black logo fades detected and recovered; probe7 presented values bit-exact.
+
+Off switch: MVK_FAILURE_LOG=0 (or a path)
+---
+ MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm      |  10 +-
+ .../Commands/MVKCommandEncoderState.mm        |   4 +-
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm     |   2 +
+ MoltenVK/MoltenVK/GPUObjects/MVKImage.mm      |   1 +
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h    |   4 +
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm   |   7 +
+ MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm      |  17 ++
+ MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.h   |   3 +
+ MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm  | 170 ++++++++++++++++++
+ MoltenVK/MoltenVK/Utility/MVKBaseObject.h     |  12 ++
+ MoltenVK/MoltenVK/Utility/MVKBaseObject.mm    | 146 ++++++++++++++-
+ MoltenVK/MoltenVK/Utility/MVKDeferredPSO.h    |   3 +
+ 12 files changed, 372 insertions(+), 7 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+index b1fb238..57dc7b3 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+@@ -224,7 +224,7 @@ void MVKCmdDraw::encode(MVKCommandEncoder* cmdEncoder) {
+         auto stage = MVKGraphicsStage(s);
+         cmdEncoder->finalizeDrawState(stage);	// Ensure all updated state has been submitted to Metal
+ 
+-		if ( !pipeline->hasValidMTLPipelineStates() ) { return; }	// Abort if this pipeline stage could not be compiled.
++		if ( !pipeline->hasValidMTLPipelineStates() ) { mvkLogFailure("draw-skipped", "draw skipped: its graphics pipeline failed to compile"); return; }	// Abort if this pipeline stage could not be compiled.
+ 
+ 		id<MTLComputeCommandEncoder> mtlTessCtlEncoder = nil;
+ 
+@@ -509,7 +509,7 @@ void MVKCmdDrawIndexed::encode(MVKCommandEncoder* cmdEncoder) {
+         id<MTLComputeCommandEncoder> mtlTessCtlEncoder = nil;
+         cmdEncoder->finalizeDrawState(stage);	// Ensure all updated state has been submitted to Metal
+ 
+-		if ( !pipeline->hasValidMTLPipelineStates() ) { return; }	// Abort if this pipeline stage could not be compiled.
++		if ( !pipeline->hasValidMTLPipelineStates() ) { mvkLogFailure("draw-skipped", "draw skipped: its graphics pipeline failed to compile"); return; }	// Abort if this pipeline stage could not be compiled.
+ 
+         switch (stage) {
+             case kMVKGraphicsStageVertex: {
+@@ -1090,7 +1090,7 @@ void MVKCmdDrawIndirect::encode(MVKCommandEncoder* cmdEncoder) {
+                 cmdEncoder->finalizeDrawState(stage);	// Ensure all updated state has been submitted to Metal
+             }
+ 
+-			if ( !pipeline->hasValidMTLPipelineStates() ) { return; }	// Abort if this pipeline stage could not be compiled.
++			if ( !pipeline->hasValidMTLPipelineStates() ) { mvkLogFailure("draw-skipped", "draw skipped: its graphics pipeline failed to compile"); return; }	// Abort if this pipeline stage could not be compiled.
+ 
+             switch (stage) {
+                 case kMVKGraphicsStageVertex:
+@@ -1484,7 +1484,7 @@ void MVKCmdDrawIndexedIndirect::encode(MVKCommandEncoder* cmdEncoder, const MVKI
+ 			if (drawIdx == 0 || pipeline->isTessellationPipeline() || vtxAdjmts.needsAdjustment()) {
+ 				cmdEncoder->finalizeDrawState(stage);	// Ensure all updated state has been submitted to Metal
+ 			}
+-			if ( !pipeline->hasValidMTLPipelineStates() ) { return; }	// Abort if this pipeline stage could not be compiled.
++			if ( !pipeline->hasValidMTLPipelineStates() ) { mvkLogFailure("draw-skipped", "draw skipped: its graphics pipeline failed to compile"); return; }	// Abort if this pipeline stage could not be compiled.
+ 
+             switch (stage) {
+                 case kMVKGraphicsStageVertex:
+@@ -1610,7 +1610,7 @@ static MVKGraphicsPipeline* prepareMeshDraw(MVKCommandEncoder* cmdEncoder) {
+ 	if ( !pipeline || !pipeline->isMeshPipeline() ) { return nullptr; }
+ 	cmdEncoder->_isIndexedDraw = false;
+ 	cmdEncoder->finalizeDrawState(kMVKGraphicsStageRasterization);	// Ensure all updated state has been submitted to Metal
+-	if ( !pipeline->hasValidMTLPipelineStates() ) { return nullptr; }
++	if ( !pipeline->hasValidMTLPipelineStates() ) { mvkLogFailure("draw-skipped", "mesh draw skipped: its pipeline failed to compile"); return nullptr; }
+ 	return pipeline;
+ }
+ 
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+index 7e5d77a..d1da80d 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+@@ -1653,8 +1653,10 @@ void MVKMetalComputeCommandEncoderState::prepareComputeDispatch(
+   const MVKVulkanSharedCommandEncoderState& vkShared) {
+ 	MVKComputePipeline* pipeline = vk._pipeline;
+ 	id<MTLComputePipelineState> mtlPipeline = pipeline->getPipelineState();
+-	if (!mtlPipeline) // Abort if pipeline could not be created.
++	if (!mtlPipeline) { // Abort if pipeline could not be created.
++		mvkLogFailure("dispatch-skipped", "compute dispatch with no compiled pipeline (shader %016llx)", (unsigned long long)pipeline->getShaderCodeHash());
+ 		return;
++	}
+ 
+ 	_vkPipeline = pipeline;
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index a1dca6a..834c5fe 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -3973,6 +3973,8 @@ VkResult MVKDevice::waitIdle() {
+ VkResult MVKDevice::markLost(bool alsoMarkPhysicalDevice) {
+ 	lock_guard<mutex> lock(_sem4Lock);
+ 
++	mvkLogFailure("device-lost", "VkDevice marked lost%s; all further GPU work fails", alsoMarkPhysicalDevice ? " (physical device too)" : "");
++
+ 	setConfigurationResult(VK_ERROR_DEVICE_LOST);
+ 	if (alsoMarkPhysicalDevice) { _physicalDevice->setConfigurationResult(VK_ERROR_DEVICE_LOST); }
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+index 2702e79..80266ef 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+@@ -1647,6 +1647,7 @@ id<MTLTexture> MVKPresentableSwapchainImage::getMTLTexture(uint8_t planeIndex) {
+ // Pass MVKImagePresentInfo by value because it may not exist when the callback runs.
+ VkResult MVKPresentableSwapchainImage::presentCAMetalDrawable(id<MTLCommandBuffer> mtlCmdBuff,
+ 															  MVKImagePresentInfo presentInfo) {
++	_swapchain->probePresentedImage(getMTLTexture(0), mtlCmdBuff);
+ 	_swapchain->renderWatermark(getMTLTexture(0), mtlCmdBuff);
+ 
+ 	// According to Apple, it is more performant to call MTLDrawable present from within a
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+index 8153d54..8bac329 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+@@ -476,6 +476,9 @@ public:
+ 	/** Returns the MTLRenderPipelineState for the final stage of the pipeline */
+ 	id<MTLComputePipelineState> getPipelineState() const { return _mtlPipelineState; }
+ 
++	/** Code hash of the compute shader module (matches MVK_CONFIG_SHADER_DUMP_DIR file names). */
++	uint64_t getShaderCodeHash() const;
++
+ 	/** Returns a list of implicit buffers used by the given stage. */
+ 	const MVKImplicitBufferBindings& getImplicitBuffers(MVKShaderStage stage = kMVKShaderStageCompute) const { return getStageResources(stage).implicitBuffers; }
+ 
+@@ -507,6 +510,7 @@ protected:
+ 	bool _allowsDispatchBase = false;
+ 
+ 	MVKShaderModule* _module = nullptr;
++	uint64_t _shaderCodeHash = 0;
+ 	bool _ownsModule = false;
+ };
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 3ebf3e3..e67b5d8 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -1096,6 +1096,9 @@ id<MTLRenderPipelineState> MVKGraphicsPipeline::getPipelineStateForAttachments(c
+ 			err = nil;
+ 			variant = [getMTLDevice() newRenderPipelineStateWithDescriptor: desc error: &err];	// retained
+ 		}
++		if ( !variant && err ) {
++			mvkLogFailure("draw-mismatch", "attachment-format pipeline variant failed: %s", err.localizedDescription.UTF8String);
++		}
+ 	}
+ 	_attachmentVariants[key] = variant;
+ 	return variant ? variant : getMainPipelineState();
+@@ -2833,6 +2836,7 @@ MVKMTLFunction MVKComputePipeline::getMTLFunction(const VkComputePipelineCreateI
+     if ( !mvkAreAllFlagsEnabled(pSS->stage, VK_SHADER_STAGE_COMPUTE_BIT) ) { return MVKMTLFunctionNull; }
+ 
+ 	_module = getOrCreateShaderModule(_device, pSS, _ownsModule);
++	_shaderCodeHash = _module ? (uint64_t)_module->getKey().codeHash : 0;	// the module may be destroyed after creation
+ 
+ 	warnIfUnsupportedRobustnessEnabled(this, pSS);
+ 
+@@ -3722,3 +3726,6 @@ void mvkDiskShaderCacheStore(const std::string& preConversionCfgBytes, const std
+ std::string mvkDiskShaderCacheSerializeConfig(const SPIRVToMSLConversionConfiguration& cfg) {
+ 	return mvkDiskShaderCacheEnabled() ? mvkSerializeShaderConfig(cfg) : std::string();
+ }
++
++
++uint64_t MVKComputePipeline::getShaderCodeHash() const { return _shaderCodeHash; }
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
+index 3c046ed..4936615 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
+@@ -257,6 +257,23 @@ void MVKQueue::handleMTLCommandBufferError(id<MTLCommandBuffer> mtlCmdBuff) {
+ 				 (mtlCmdBuff.label ? mtlCmdBuff.label.UTF8String : ""),
+ 				 mtlCmdBuff.error.code, mtlCmdBuff.error.localizedDescription.UTF8String);
+ 
++	{
++		std::string encStates;
++		if (NSArray<id<MTLCommandBufferEncoderInfo>>* encInfo = mtlCmdBuff.error.userInfo[MTLCommandBufferEncoderInfoErrorKey]) {
++			for (id<MTLCommandBufferEncoderInfo> enc in encInfo) {
++				if (enc.errorState == MTLCommandEncoderErrorStateFaulted || enc.errorState == MTLCommandEncoderErrorStateAffected) {
++					encStates += "\n";
++					encStates += mvkStringFromMTLCommandEncoderErrorState(enc.errorState);
++					encStates += ": ";
++					encStates += enc.label ? enc.label.UTF8String : "(unlabeled encoder)";
++				}
++			}
++		}
++		mvkLogFailure("gpu-error", "Metal command buffer failed (code %li: %s); device %s%s",
++					  (long)mtlCmdBuff.error.code, mtlCmdBuff.error.localizedDescription.UTF8String,
++					  markDeviceLoss ? "marked LOST" : "resumed", encStates.c_str());
++	}
++
+ 	if (NSArray<id<MTLCommandBufferEncoderInfo>>* mtlEncInfo = mtlCmdBuff.error.userInfo[MTLCommandBufferEncoderInfoErrorKey]) {
+ 		MVKLogInfo("Encoders for %p \"%s\":", mtlCmdBuff, mtlCmdBuff.label ? mtlCmdBuff.label.UTF8String : "");
+ 		for (id<MTLCommandBufferEncoderInfo> enc in mtlEncInfo) {
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.h b/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.h
+index 1665b51..01adc66 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.h
+@@ -18,6 +18,7 @@
+ 
+ #pragma once
+ 
++#include <memory>
+ #include "MVKDevice.h"
+ #include "MVKImage.h"
+ #include "MVKSmallVector.h"
+@@ -120,6 +121,7 @@ protected:
+ 	bool hasOptimalSurface();
+ 	uint64_t getNextAcquisitionID();
+     void renderWatermark(id<MTLTexture> mtlTexture, id<MTLCommandBuffer> mtlCmdBuff);
++    void probePresentedImage(id<MTLTexture> mtlTexture, id<MTLCommandBuffer> mtlCmdBuff);
+     void markFrameInterval();
+ 	void beginPresentation(const MVKImagePresentInfo& presentInfo);
+ 	void endPresentation(const MVKImagePresentInfo& presentInfo, uint64_t beginPresentTime, uint64_t actualPresentTime = 0);
+@@ -128,6 +130,7 @@ protected:
+ 
+ 	MVKSurface* _surface = nullptr;
+     MVKWatermark* _licenseWatermark = nullptr;
++	std::shared_ptr<struct MVKPresentProbe> _presentProbe;
+ 	MVKSmallVector<MVKPresentableSwapchainImage*, kMVKMaxSwapchainImageCount> _presentableImages;
+ 	MVKSmallVector<VkPresentModeKHR, 2> _compatiblePresentModes;
+ 	static const int kMaxPresentationHistory = 60;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm b/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm
+index 4c90866..77c51b7 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm
+@@ -27,6 +27,7 @@
+ #include "MVKWatermarkShaderSource.h"
+ #include "mvk_datatypes.hpp"
+ #include <libkern/OSByteOrder.h>
++#include <chrono>
+ 
+ #import "CAMetalLayer+MoltenVK.h"
+ #import "MVKBlockObserver.h"
+@@ -140,6 +141,133 @@ bool MVKSwapchain::hasOptimalSurface() {
+ 
+ #pragma mark Rendering
+ 
++// Samples a 4x4 grid of the presented image every 30 presents and reports to the failure log when
++// only black frames are being presented. Diagnoses "game runs but the screen is black".
++struct MVKPresentProbe {
++	std::mutex lock;
++	id<MTLBuffer> buffer = nil;
++	uint32_t presentCount = 0;
++	bool unavailableLogged = false;
++	bool sawVisible = false;
++	bool blackLogged = false;
++	double created = now();
++	double blackSince = 0;
++	double lastBlackReport = 0;
++
++	static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
++
++	void update(bool black, uint32_t w, uint32_t h) {
++		std::lock_guard<std::mutex> guard(lock);
++		double t = now();
++		if ( !black ) {
++			if (blackSince && blackLogged) {
++				mvkLogFailure("present", "visible frames again after %.0f s of black (%ux%u)", t - blackSince, w, h);
++			}
++			if ( !sawVisible ) {
++				sawVisible = true;
++				mvkLogFailure("present", "first visible frame %ux%u, %.1f s after swapchain creation", w, h, t - created);
++			}
++			blackSince = 0;
++			blackLogged = false;
++			return;
++		}
++		if ( !blackSince ) { blackSince = t; }
++		if (t - blackSince >= 5.0 && ( !blackLogged || t - lastBlackReport >= 60.0)) {
++			mvkLogFailure("present", "only black frames presented for %.0f s (%ux%u)%s", t - blackSince, w, h,
++						  sawVisible ? "" : "; no visible frame on this swapchain yet");
++			blackLogged = true;
++			lastBlackReport = t;
++		}
++	}
++
++	~MVKPresentProbe() { [buffer release]; }
++};
++
++void MVKSwapchain::probePresentedImage(id<MTLTexture> mtlTexture, id<MTLCommandBuffer> mtlCmdBuff) {
++	if ( !mtlTexture || !mvkFailureLogEnabled() ) { return; }
++	if ( !_presentProbe ) { _presentProbe = std::make_shared<MVKPresentProbe>(); }
++	auto probe = _presentProbe;
++	if ((probe->presentCount++ % 30) != 0) { return; }
++
++	if (mtlTexture.framebufferOnly) {
++		if ( !probe->unavailableLogged ) {
++			probe->unavailableLogged = true;
++			mvkLogFailure("present", "black-frame check unavailable: swapchain images are framebuffer-only");
++		}
++		return;
++	}
++	// 0: 8-bit RGBA/BGRA, 1: 10:10:10:2, 2: RGBA16Float
++	uint32_t bpp = 4, kind = 0;
++	switch (mtlTexture.pixelFormat) {
++		case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB:
++		case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB:
++			break;
++		case MTLPixelFormatBGR10A2Unorm: case MTLPixelFormatRGB10A2Unorm:
++			kind = 1; break;
++		case MTLPixelFormatRGBA16Float:
++			bpp = 8; kind = 2; break;
++		default:
++			if ( !probe->unavailableLogged ) {
++				probe->unavailableLogged = true;
++				mvkLogFailure("present", "black-frame check unavailable for MTLPixelFormat %lu", (unsigned long)mtlTexture.pixelFormat);
++			}
++			return;
++	}
++	if ( !probe->buffer ) { probe->buffer = [getMTLDevice() newBufferWithLength: 16 * 8 options: MTLResourceStorageModeShared]; }	// retained
++
++	uint32_t w = (uint32_t)mtlTexture.width, h = (uint32_t)mtlTexture.height;
++	id<MTLBlitCommandEncoder> blit = [mtlCmdBuff blitCommandEncoder];
++	blit.label = @"MVK black-frame probe";
++	for (uint32_t j = 0; j < 4; j++) {
++		for (uint32_t i = 0; i < 4; i++) {
++			[blit copyFromTexture: mtlTexture
++					  sourceSlice: 0
++					  sourceLevel: 0
++					 sourceOrigin: MTLOriginMake(w * (2 * i + 1) / 8, h * (2 * j + 1) / 8, 0)
++					   sourceSize: MTLSizeMake(1, 1, 1)
++						 toBuffer: probe->buffer
++				destinationOffset: (j * 4 + i) * bpp
++		   destinationBytesPerRow: bpp
++		 destinationBytesPerImage: bpp];
++		}
++	}
++	[blit endEncoding];
++
++	id<MTLBuffer> buf = probe->buffer;
++	[mtlCmdBuff addCompletedHandler: ^(id<MTLCommandBuffer> mcb) {
++		if (mcb.status != MTLCommandBufferStatusCompleted) { return; }
++		const uint8_t* d = (const uint8_t*)buf.contents;
++		bool black = true;
++		for (uint32_t k = 0; k < 16 && black; k++) {
++			if (kind == 2) {
++				uint16_t c[4]; memcpy(c, d + k * 8, 8);
++				black = !((c[0] | c[1] | c[2]) & 0x7FFF);
++			} else {
++				uint32_t px; memcpy(&px, d + k * 4, 4);
++				black = !(px & (kind == 1 ? 0x3FFFFFFFu : 0x00FFFFFFu));
++			}
++		}
++		probe->update(black, w, h);
++		static const bool verbose = getenv("MVK_PRESENT_PROBE_LOG") && getenv("MVK_PRESENT_PROBE_LOG")[0] == '1';
++		if (verbose) {
++			// Raw value of the sample at (3/8, 3/8) of the drawable, as presented.
++			if (kind == 2) {
++				uint16_t c[4]; memcpy(c, d + 5 * 8, 8);
++				mvkLogFailure("present-sample", "%ux%u RGBA16F %04x %04x %04x %04x", w, h, c[0], c[1], c[2], c[3]);
++			} else {
++				uint32_t px; memcpy(&px, d + 5 * 4, 4);
++				if (kind == 1)
++					mvkLogFailure("present-sample", "%ux%u 10:10:10:2 r=%u g=%u b=%u a=%u (lsb first)", w, h,
++								  px & 0x3FF, (px >> 10) & 0x3FF, (px >> 20) & 0x3FF, px >> 30);
++				else
++					mvkLogFailure("present-sample", "%ux%u 8-bit bytes %u %u %u %u", w, h,
++								  px & 0xFF, (px >> 8) & 0xFF, (px >> 16) & 0xFF, px >> 24);
++			}
++		}
++	}];
++}
++
++
+ // Renders the watermark image to the surface.
+ void MVKSwapchain::renderWatermark(id<MTLTexture> mtlTexture, id<MTLCommandBuffer> mtlCmdBuff) {
+     if (getMVKConfig().displayWatermark) {
+@@ -439,6 +567,48 @@ MVKSwapchain::MVKSwapchain(MVKDevice* device, const VkSwapchainCreateInfoKHR* pC
+ 							   mtlFeats.maxSwapchainImageCount);
+ 	initCAMetalLayer(pCreateInfo, pScalingInfo, imgCnt);
+     initSurfaceImages(pCreateInfo, imgCnt);		// After initCAMetalLayer()
++
++	if (mvkFailureLogEnabled()) {
++		const char* cs = "other";
++		switch (pCreateInfo->imageColorSpace) {
++			case VK_COLOR_SPACE_SRGB_NONLINEAR_KHR:          cs = "sRGB"; break;
++			case VK_COLOR_SPACE_HDR10_ST2084_EXT:            cs = "HDR10-PQ"; break;
++			case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT:    cs = "scRGB-linear"; break;
++			case VK_COLOR_SPACE_EXTENDED_SRGB_NONLINEAR_EXT: cs = "scRGB-nonlinear"; break;
++			case VK_COLOR_SPACE_BT2020_LINEAR_EXT:           cs = "BT2020-linear"; break;
++			case VK_COLOR_SPACE_PASS_THROUGH_EXT:            cs = "pass-through"; break;
++			default: break;
++		}
++		const char* fmt = "other";
++		switch (pCreateInfo->imageFormat) {
++			case VK_FORMAT_B8G8R8A8_UNORM:            fmt = "BGRA8"; break;
++			case VK_FORMAT_B8G8R8A8_SRGB:             fmt = "BGRA8-sRGB"; break;
++			case VK_FORMAT_R8G8B8A8_UNORM:            fmt = "RGBA8"; break;
++			case VK_FORMAT_R8G8B8A8_SRGB:             fmt = "RGBA8-sRGB"; break;
++			case VK_FORMAT_A2B10G10R10_UNORM_PACK32:  fmt = "RGB10A2"; break;
++			case VK_FORMAT_A2R10G10B10_UNORM_PACK32:  fmt = "BGR10A2"; break;
++			case VK_FORMAT_R16G16B16A16_SFLOAT:       fmt = "RGBA16F"; break;
++			default: break;
++		}
++		const char* layerCS = "none";
++		bool edr = false;
++		MTLPixelFormat layerFmt = MTLPixelFormatInvalid;
++		@autoreleasepool {
++			auto* layer = getCAMetalLayer();
++			if (layer) {
++				CGColorSpaceRef lcs = layer.colorspace;
++				CFStringRef name = lcs ? CGColorSpaceGetName(lcs) : nullptr;
++				static char buf[128];
++				if (name && CFStringGetCString(name, buf, sizeof(buf), kCFStringEncodingUTF8)) { layerCS = buf; }
++				edr = layer.wantsExtendedDynamicRangeContent;
++				layerFmt = layer.pixelFormat;
++			}
++		}
++		mvkLogFailure("swapchain", "%s %s swapchain %ux%u, %u images, present mode %d; layer %s, EDR %s, MTLPixelFormat %lu%s", fmt, cs,
++					  pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height, imgCnt, pCreateInfo->presentMode,
++					  layerCS, edr ? "on" : "off", (unsigned long)layerFmt,
++					  getConfigurationResult() == VK_SUCCESS ? "" : " -- CREATION FAILED");
++	}
+ }
+ 
+ // kCAGravityResize is the Metal default
+diff --git a/MoltenVK/MoltenVK/Utility/MVKBaseObject.h b/MoltenVK/MoltenVK/Utility/MVKBaseObject.h
+index d9e04de..e52b3a7 100644
+--- a/MoltenVK/MoltenVK/Utility/MVKBaseObject.h
++++ b/MoltenVK/MoltenVK/Utility/MVKBaseObject.h
+@@ -235,3 +235,15 @@ static inline const char* mvkGetReportingLevelString(MVKConfigLogLevel logLevel)
+ 		default:                            return "mvk-unknown";
+ 	}
+ }
++
++
++#pragma mark -
++#pragma mark Failure log
++
++/**
++ * Always-on, low-volume failure log shared with vkd3d-proton (one line per event, deduplicated).
++ * Path: MVK_FAILURE_LOG (a path, or "0" to disable); default $WINEPREFIX/drive_c/gfx-failures.log,
++ * else ~/Library/Logs/gfx-failures.log.
++ */
++bool mvkFailureLogEnabled();
++void mvkLogFailure(const char* category, const char* format, ...) __attribute__((format(printf, 2, 3)));
+diff --git a/MoltenVK/MoltenVK/Utility/MVKBaseObject.mm b/MoltenVK/MoltenVK/Utility/MVKBaseObject.mm
+index 2533562..eec33d5 100644
+--- a/MoltenVK/MoltenVK/Utility/MVKBaseObject.mm
++++ b/MoltenVK/MoltenVK/Utility/MVKBaseObject.mm
+@@ -58,9 +58,10 @@ void MVKBaseObject::reportMessage(MVKBaseObject* mvkObj, MVKConfigLogLevel logLe
+ 	MVKInstance* mvkInst = mvkAPIObj ? mvkAPIObj->getInstance() : nullptr;
+ 	bool hasDebugCallbacks = mvkInst && mvkInst->hasDebugCallbacks();
+ 	bool shouldLog = logLevel <= mvkGetMVKConfig(mvkInst).logLevel;
++	bool shouldFailLog = logLevel <= MVK_CONFIG_LOG_LEVEL_WARNING && logLevel != MVK_CONFIG_LOG_LEVEL_NONE && mvkFailureLogEnabled();
+ 
+ 	// Fail fast to avoid further unnecessary processing.
+-	if ( !(shouldLog || hasDebugCallbacks) ) { return; }
++	if ( !(shouldLog || hasDebugCallbacks || shouldFailLog) ) { return; }
+ 
+ 	va_list origArgs, redoArgs;
+ 	va_copy(origArgs, args);
+@@ -87,6 +88,11 @@ void MVKBaseObject::reportMessage(MVKBaseObject* mvkObj, MVKConfigLogLevel logLe
+ 	// Log the message to the standard error stream
+ 	if (shouldLog) { fprintf(stderr, "[%s] %s\n", mvkGetReportingLevelString(logLevel), pMessage); }
+ 
++	// Mirror errors and warnings into the always-on failure log
++	// Known-benign, high-volume messages stay out of the failure log.
++	if (shouldFailLog && strstr(pMessage, "does not support disabling primitive restart")) { shouldFailLog = false; }
++	if (shouldFailLog) { mvkLogFailure(logLevel == MVK_CONFIG_LOG_LEVEL_ERROR ? "error" : "warning", "%s", pMessage); }
++
+ 	// Broadcast the message to any Vulkan debug report callbacks
+ 	if (hasDebugCallbacks) { mvkInst->debugReportMessage(mvkAPIObj, logLevel, pMessage); }
+ 
+@@ -157,3 +163,141 @@ VkResult MVKBaseObject::reportWarning(MVKBaseObject* mvkObj, VkResult vkErr, con
+ 	va_end(args);
+ 	return rslt;
+ }
++
++
++#pragma mark -
++#pragma mark Failure log
++
++#include <fcntl.h>
++#include <unistd.h>
++#include <mutex>
++#include <unordered_map>
++#include <chrono>
++#include <ctime>
++#include <sys/time.h>
++
++namespace {
++
++struct MVKFailureLog {
++	std::mutex lock;
++	int fd = -1;
++	struct Entry { uint64_t count = 0; uint64_t reported = 0; };
++	std::unordered_map<std::string, Entry> entries;
++	std::chrono::steady_clock::time_point lastSummary = std::chrono::steady_clock::now();
++
++	MVKFailureLog() {
++		const char* env = getenv("MVK_FAILURE_LOG");
++		if (env && (!strcmp(env, "0") || !strcasecmp(env, "off"))) { return; }
++		std::string path;
++		if (env && *env) {
++			path = env;
++		} else if (const char* pfx = getenv("WINEPREFIX"); pfx && *pfx) {
++			path = std::string(pfx) + "/drive_c/gfx-failures.log";
++		} else if (const char* home = getenv("HOME"); home && *home) {
++			path = std::string(home) + "/Library/Logs/gfx-failures.log";
++		} else {
++			return;
++		}
++		fd = open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
++		if (fd >= 0) { writeLine("process", "MoltenVK loaded (%s)", getprogname()); }
++	}
++
++	// Collapses numbers and hex so the same failure with different handles or sizes dedups to one key.
++	static std::string makeKey(const char* category, const char* msg) {
++		std::string key(category);
++		key += ':';
++		for (const char* p = msg; *p && key.size() < 240; p++) {
++			if (p[0] == '0' && p[1] == 'x') { key += '#'; p += 2; while (isxdigit(*p)) { p++; } p--; continue; }
++			if (isdigit(*p)) { key += '#'; while (isdigit(p[1])) { p++; } continue; }
++			if (*p == '\n') { break; }
++			key += *p;
++		}
++		return key;
++	}
++
++	void writeRaw(const std::string& s) { if (fd >= 0) { (void)!write(fd, s.data(), s.size()); } }
++
++	void writeLine(const char* category, const char* fmt, ...) __attribute__((format(printf, 3, 4))) {
++		char msg[512];
++		va_list args;
++		va_start(args, fmt);
++		vsnprintf(msg, sizeof(msg), fmt, args);
++		va_end(args);
++		writeRaw(prefix(category) + msg + "\n");
++	}
++
++	static std::string prefix(const char* category) {
++		struct timeval tv; gettimeofday(&tv, nullptr);
++		struct tm tmv; localtime_r(&tv.tv_sec, &tmv);
++		char buf[96];
++		snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d mvk[%d] %s: ", tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
++				 (int)(tv.tv_usec / 1000), (int)getpid(), category);
++		return buf;
++	}
++
++	// Writes the message, keeping only the first lines of long multi-line messages (e.g. MSL compiler output).
++	void writeMessage(const char* category, const char* msg, uint64_t occurrence) {
++		std::string out = prefix(category);
++		if (occurrence > 1) { out += "[#" + std::to_string(occurrence) + "] "; }
++		int lines = 0;
++		for (const char* p = msg; *p; p++) {
++			if (*p == '\n') {
++				if (!p[1]) { break; }
++				if (++lines >= 8 || out.size() > 1500) { out += "\n    ..."; break; }
++				out += "\n    ";
++				continue;
++			}
++			out += *p;
++		}
++		out += '\n';
++		writeRaw(out);
++	}
++
++	void flushSummaryLocked(bool force) {
++		auto now = std::chrono::steady_clock::now();
++		if (!force && now - lastSummary < std::chrono::seconds(10)) { return; }
++		lastSummary = now;
++		for (auto& [key, e] : entries) {
++			if (e.count > e.reported) {
++				writeLine("repeat", "+%llu more: %s", (unsigned long long)(e.count - e.reported), key.c_str());
++				e.reported = e.count;
++			}
++		}
++	}
++
++	void log(const char* category, const char* msg) {
++		if (fd < 0) { return; }
++		std::lock_guard<std::mutex> guard(lock);
++		auto& e = entries[makeKey(category, msg)];
++		e.count++;
++		if (e.count <= 3) {
++			writeMessage(category, msg, e.count);
++			e.reported = e.count;
++		}
++		flushSummaryLocked(false);
++	}
++};
++
++MVKFailureLog& mvkFailureLogInstance() {
++	static MVKFailureLog* inst = [] {
++		auto* l = new MVKFailureLog();	// Leaked on purpose: usable from completion handlers during teardown.
++		atexit([] { auto& f = mvkFailureLogInstance(); std::lock_guard<std::mutex> g(f.lock); f.flushSummaryLocked(true); });
++		return l;
++	}();
++	return *inst;
++}
++
++}
++
++bool mvkFailureLogEnabled() { return mvkFailureLogInstance().fd >= 0; }
++
++void mvkLogFailure(const char* category, const char* format, ...) {
++	auto& fl = mvkFailureLogInstance();
++	if (fl.fd < 0) { return; }
++	char buf[4096];
++	va_list args;
++	va_start(args, format);
++	vsnprintf(buf, sizeof(buf), format, args);
++	va_end(args);
++	fl.log(category, buf);
++}
+diff --git a/MoltenVK/MoltenVK/Utility/MVKDeferredPSO.h b/MoltenVK/MoltenVK/Utility/MVKDeferredPSO.h
+index 9037bd8..6c956d8 100644
+--- a/MoltenVK/MoltenVK/Utility/MVKDeferredPSO.h
++++ b/MoltenVK/MoltenVK/Utility/MVKDeferredPSO.h
+@@ -114,6 +114,9 @@ private:
+ 	void submitJob(std::shared_ptr<MVKDeferredRenderPSO> job, bool alreadyMarked = true) {
+ 		[_dev newRenderPipelineStateWithDescriptor: job->desc
+ 								 completionHandler: ^(id<MTLRenderPipelineState> ps, NSError* error) {
++			if ( !ps ) {
++				mvkLogFailure("deferred-pso", "render pipeline compile failed: %s", error ? error.localizedDescription.UTF8String : "?");
++			}
+ 			{
+ 				std::lock_guard<std::mutex> g(job->lock);
+ 				job->state = [ps retain];

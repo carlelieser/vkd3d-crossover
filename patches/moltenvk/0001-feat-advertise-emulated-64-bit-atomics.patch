@@ -1,0 +1,49 @@
+From adb322830089b01d6dd4e8889662dd09e13aa08b Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:11:49 -0500
+Subject: [PATCH 01/28] feat: advertise emulated 64-bit atomics
+
+Problem: vkd3d-proton could not expose Shader Model 6.6 because shaderBufferInt64Atomics and shaderSharedInt64Atomics were hard-coded to false.
+
+Root cause: Apple GPU family 7 (M1) has no 64-bit atomics in hardware, so MoltenVK never reported VK_KHR_shader_atomic_int64.
+
+Fix: Report VK_KHR_shader_atomic_int64 with buffer and shared int64 atomics. SPIRV-Cross emulates them with 32-bit atomics on the two halves (spvAtomic64*): add/sub/and/or/xor/load are exact, min/max/exchange/compare-exchange are best-effort under contention. Requires the SPIRV-Cross patches of this series (patches/spirv-cross).
+
+Verified by: test_shader_sm66_64bit_atomics 79/85; the 6 failures are torn concurrent exchanges (inherent to the emulation).
+
+Off switch: none
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm  | 6 ++++--
+ MoltenVK/MoltenVK/Layers/MVKExtensions.def | 2 +-
+ 2 files changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index 359f8a2..e73bfcd 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -178,8 +178,10 @@ void MVKPhysicalDevice::getFeatures(VkPhysicalDeviceFeatures2* features) {
+ 		.storageBuffer8BitAccess = true,
+ 		.uniformAndStorageBuffer8BitAccess = true,
+ 		.storagePushConstant8 = true,
+-		.shaderBufferInt64Atomics = false,
+-		.shaderSharedInt64Atomics = false,
++		// Emulated in SPIRV-Cross with 32-bit atomics on the two halves (see spvAtomic64*).
++		// add/sub/and/or/xor/load are exact; min/max/exchange/compare-exchange are best-effort under contention.
++		.shaderBufferInt64Atomics = true,
++		.shaderSharedInt64Atomics = true,
+ 		.shaderFloat16 = true,
+ 		.shaderInt8 = true,
+ 		.descriptorIndexing = _vulkan12NoExtFeatures.descriptorIndexing,
+diff --git a/MoltenVK/MoltenVK/Layers/MVKExtensions.def b/MoltenVK/MoltenVK/Layers/MVKExtensions.def
+index bb0935b..a4034a9 100644
+--- a/MoltenVK/MoltenVK/Layers/MVKExtensions.def
++++ b/MoltenVK/MoltenVK/Layers/MVKExtensions.def
+@@ -98,7 +98,7 @@ MVK_EXTENSION(KHR_robustness2,                          KHR_ROBUSTNESS_2,
+ MVK_EXTENSION(KHR_sampler_mirror_clamp_to_edge,         KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE,         DEVICE,   10.11, 14.0,  1.0)
+ MVK_EXTENSION(KHR_sampler_ycbcr_conversion,             KHR_SAMPLER_YCBCR_CONVERSION,             DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(KHR_separate_depth_stencil_layouts,       KHR_SEPARATE_DEPTH_STENCIL_LAYOUTS,       DEVICE,   10.11,  8.0,  1.0)
+-MVK_EXTENSION(KHR_shader_atomic_int64,                  KHR_SHADER_ATOMIC_INT64,                  DEVICE,   MVK_NA, MVK_NA, MVK_NA)
++MVK_EXTENSION(KHR_shader_atomic_int64,                  KHR_SHADER_ATOMIC_INT64,                  DEVICE,   11.0,  14.0,  1.0)
+ MVK_EXTENSION(KHR_shader_draw_parameters,               KHR_SHADER_DRAW_PARAMETERS,               DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(KHR_shader_expect_assume,                 KHR_SHADER_EXPECT_ASSUME,                 DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(KHR_shader_float_controls,                KHR_SHADER_FLOAT_CONTROLS,                DEVICE,   10.11,  8.0,  1.0)

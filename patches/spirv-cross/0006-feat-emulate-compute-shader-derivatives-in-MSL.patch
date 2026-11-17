@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:06:52 -0500
+Subject: [PATCH 06/20] feat: emulate compute shader derivatives in MSL
+
+Problem: SM 6.6 compute (and mesh/task) shaders using ddx/ddy/fwidth
+cannot run; MoltenVK advertises VK_KHR_compute_shader_derivatives.
+
+Root cause: Metal kernels have no derivative functions.
+
+Fix: with linear grouping each 2x2 quad is four consecutive invocations,
+which Metal packs into one quad-group. Emulate fine derivatives with
+quad_shuffle_xor and coarse ones with quad_broadcast, using the SIMD lane
+id (quad lane bit 0 = x, bit 1 = y). The lane id builtin is requested
+for compute-like shaders that use derivatives.
+
+Verified by: vkd3d-proton compute derivative tests 823/823 together with
+the implicit-LOD and LOD-query emulation (see NOTES.md Finding 7).
+
+Off switch: none.
+---
+ spirv_msl.cpp | 104 +++++++++++++++++++++++++++++++++++++++++++++-----
+ spirv_msl.hpp |   2 +
+ 2 files changed, 96 insertions(+), 10 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 3ebfd04..55901f5 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -7247,6 +7247,49 @@ void CompilerMSL::emit_custom_functions()
+ 			break;
+ 		}
+ 
++		case SPVFuncImplComputeDerivatives:
++			// Compute-shader derivatives over a 2x2 quad laid out linearly in a quad-group:
++			// quad lane bit 0 = x, bit 1 = y.
++			statement("template<typename T>");
++			statement("inline T spvComputeDdxFine(T v, uint lane)");
++			begin_scope();
++			statement("T o = quad_shuffle_xor(v, 1u);");
++			statement("return (lane & 1u) != 0u ? (v - o) : (o - v);");
++			end_scope();
++			statement("");
++			statement("template<typename T>");
++			statement("inline T spvComputeDdyFine(T v, uint lane)");
++			begin_scope();
++			statement("T o = quad_shuffle_xor(v, 2u);");
++			statement("return (lane & 2u) != 0u ? (v - o) : (o - v);");
++			end_scope();
++			statement("");
++			statement("template<typename T>");
++			statement("inline T spvComputeDdxCoarse(T v)");
++			begin_scope();
++			statement("return quad_broadcast(v, 1) - quad_broadcast(v, 0);");
++			end_scope();
++			statement("");
++			statement("template<typename T>");
++			statement("inline T spvComputeDdyCoarse(T v)");
++			begin_scope();
++			statement("return quad_broadcast(v, 2) - quad_broadcast(v, 0);");
++			end_scope();
++			statement("");
++			statement("template<typename T>");
++			statement("inline T spvComputeFwidthFine(T v, uint lane)");
++			begin_scope();
++			statement("return abs(spvComputeDdxFine(v, lane)) + abs(spvComputeDdyFine(v, lane));");
++			end_scope();
++			statement("");
++			statement("template<typename T>");
++			statement("inline T spvComputeFwidthCoarse(T v)");
++			begin_scope();
++			statement("return abs(spvComputeDdxCoarse(v)) + abs(spvComputeDdyCoarse(v));");
++			end_scope();
++			statement("");
++			break;
++
+ 		case SPVFuncImplSubgroup64:
+ 		{
+ 			// Metal SIMD-group functions don't accept 64-bit types. Emulate 64-bit integer
+@@ -10224,21 +10267,41 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 	case OpDPdx:
+ 	case OpDPdxFine:
+ 	case OpDPdxCoarse:
+-		MSL_UFOP(dfdx);
+-		register_control_dependent_expression(ops[1]);
+-		break;
+-
+ 	case OpDPdy:
+ 	case OpDPdyFine:
+ 	case OpDPdyCoarse:
+-		MSL_UFOP(dfdy);
+-		register_control_dependent_expression(ops[1]);
+-		break;
+-
+ 	case OpFwidth:
+-	case OpFwidthCoarse:
+ 	case OpFwidthFine:
+-		MSL_UFOP(fwidth);
++	case OpFwidthCoarse:
++		if (is_compute_like_shader())
++		{
++			// VK_KHR_compute_shader_derivatives (linear grouping): each quad is 4 consecutive
++			// invocations, which Metal packs into a quad-group. Emulate with quad-group ops.
++			add_spv_func_and_recompile(SPVFuncImplComputeDerivatives);
++			const char *func = nullptr;
++			bool needs_lane = true;
++			switch (opcode)
++			{
++			case OpDPdx: case OpDPdxFine: func = "spvComputeDdxFine"; break;
++			case OpDPdy: case OpDPdyFine: func = "spvComputeDdyFine"; break;
++			case OpDPdxCoarse: func = "spvComputeDdxCoarse"; needs_lane = false; break;
++			case OpDPdyCoarse: func = "spvComputeDdyCoarse"; needs_lane = false; break;
++			case OpFwidth: case OpFwidthFine: func = "spvComputeFwidthFine"; break;
++			default: func = "spvComputeFwidthCoarse"; needs_lane = false; break;
++			}
++			if (needs_lane)
++				emit_binary_func_op(ops[0], ops[1], ops[2], builtin_subgroup_invocation_id_id, func);
++			else
++				emit_unary_func_op(ops[0], ops[1], ops[2], func);
++			register_control_dependent_expression(ops[1]);
++			break;
++		}
++		if (opcode == OpDPdy || opcode == OpDPdyFine || opcode == OpDPdyCoarse)
++			MSL_UFOP(dfdy);
++		else if (opcode == OpFwidth || opcode == OpFwidthFine || opcode == OpFwidthCoarse)
++			MSL_UFOP(fwidth);
++		else
++			MSL_UFOP(dfdx);
+ 		register_control_dependent_expression(ops[1]);
+ 		break;
+ 
+@@ -15080,6 +15143,13 @@ string CompilerMSL::func_type_decl(SPIRType &type)
+ 	return entry_type + " " + return_type;
+ }
+ 
++bool CompilerMSL::is_compute_like_shader() const
++{
++	auto model = get_execution_model();
++	return model == ExecutionModelGLCompute || model == ExecutionModelKernel ||
++	       model == ExecutionModelTaskEXT || model == ExecutionModelMeshEXT;
++}
++
+ bool CompilerMSL::is_tesc_shader() const
+ {
+ 	return get_execution_model() == ExecutionModelTessellationControl;
+@@ -19861,6 +19931,20 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
+ 		break;
+ 	}
+ 
++	case OpDPdx:
++	case OpDPdxFine:
++	case OpDPdxCoarse:
++	case OpDPdy:
++	case OpDPdyFine:
++	case OpDPdyCoarse:
++	case OpFwidth:
++	case OpFwidthFine:
++	case OpFwidthCoarse:
++		// Metal has no derivatives in kernels; we emulate them with quad-group ops (compute derivatives).
++		if (self.is_compute_like_shader())
++			needs_subgroup_invocation_id = true;
++		break;
++
+ 	case OpGroupNonUniformInverseBallot:
+ 		needs_subgroup_invocation_id = true;
+ 		break;
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index 3ddc13f..583513f 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -855,6 +855,7 @@ protected:
+ 		SPVFuncImplSubgroupAllEqual,
+ 		SPVFuncImplSubgroupScanEmulation,
+ 		SPVFuncImplSubgroup64,
++		SPVFuncImplComputeDerivatives,
+ 		SPVFuncImplAtomic64Emulation,
+ 		SPVFuncImplSubgroupShuffle,
+ 		SPVFuncImplSubgroupShuffleXor,
+@@ -1008,6 +1009,7 @@ protected:
+ 	                                     bool is_packed, bool relaxed) override;
+ 
+ 	bool is_tesc_shader() const;
++	bool is_compute_like_shader() const;
+ 	bool is_tese_shader() const;
+ 	bool is_mesh_shader() const;
+ 
+-- 
+2.51.0
+

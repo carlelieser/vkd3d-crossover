@@ -1,0 +1,48 @@
+From 6ef75a79352a3b4a0e5152487b67988e384442fd Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:12:07 -0500
+Subject: [PATCH 22/28] fix: never assume no NaN/Inf in Metal math mode
+
+Problem: NaN scrubbing in shaders could be folded away, letting one NaN poison temporal history.
+
+Root cause: SPIRV-Cross reports every fast-math flag for shaders that do not ask for IEEE behaviour (nearly all D3D-translated shaders), so MoltenVK used MTLMathModeFast, which assumes NaN/Inf never occur.
+
+Fix: Clear NotNaN/NotInf from the fast-math flags (Relaxed mode), and use fast math functions in Relaxed mode, matching how D3D drivers honour NaN/Inf.
+
+Verified by: nanprobe: isnan/isinf/isfinite, min/max/saturate/clamp with NaN and x/0 correct in every mode (no failure was found; precaution).
+
+Off switch: MVK_ALLOW_NO_NAN_FAST_MATH=1
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index a2066d7..a1dca6a 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -5091,6 +5091,17 @@ MTLCompileOptions* MVKDevice::getMTLCompileOptions(uint32_t fpFastMathFlags,
+ 			break;
+ 	}
+ 
++	// SPIRV-Cross reports "every fast-math flag" for any shader that does not explicitly ask for IEEE NaN/Inf
++	// handling, which is nearly every shader translated from D3D (DXIL/DXBC). With NotNaN/NotInf Metal uses
++	// MTLMathModeFast, which assumes NaN/Inf never occur: x != x is folded to false and NaN * 0 to 0, so the
++	// NaN-scrubbing engines rely on stops working and one NaN can poison temporal history (black frames).
++	// D3D drivers honour NaN/Inf, so keep the other fast-math freedoms (Relaxed mode) but never assume no NaN/Inf,
++	// unless explicitly allowed with MVK_ALLOW_NO_NAN_FAST_MATH=1.
++	{
++		static const bool allowNoNaN = [] { const char* v = getenv("MVK_ALLOW_NO_NAN_FAST_MATH"); return v && v[0] == '1'; }();
++		if ( !allowNoNaN ) { fpFastMathFlags &= ~(spv::FPFastMathModeNotNaNMask | spv::FPFastMathModeNotInfMask); }
++	}
++
+ #if MVK_XCODE_16
+ 	// Match Metal FP options as closely as possible to SPIR-V FPFastMathModeMask flags.
+ 	// TODO: Some MSL functions have different behavour than Vulkan and could probably been overwritten
+@@ -5101,6 +5112,7 @@ MTLCompileOptions* MVKDevice::getMTLCompileOptions(uint32_t fpFastMathFlags,
+ 		if (mvkAreAllFlagsEnabled(fpFastMathFlags, (spv::FPFastMathModeNSZMask | spv::FPFastMathModeAllowRecipMask |
+ 													spv::FPFastMathModeAllowReassocMask | spv::FPFastMathModeAllowContractMask))) {
+ 			mtlMathMode = MTLMathModeRelaxed;
++			mtlFPFuncs = MTLMathFloatingPointFunctionsFast;		// fast:: transcendental precision is within D3D tolerances
+ 			if (mvkAreAllFlagsEnabled(fpFastMathFlags, (spv::FPFastMathModeNotNaNMask | spv::FPFastMathModeNotInfMask))) {
+ 				mtlMathMode = MTLMathModeFast;
+ 				mtlFPFuncs = MTLMathFloatingPointFunctionsFast;

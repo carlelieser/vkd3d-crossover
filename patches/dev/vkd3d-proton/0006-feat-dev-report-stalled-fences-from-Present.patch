@@ -1,0 +1,240 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 12:00:00 +0000
+Subject: [PATCH 06/13] feat(dev): report stalled fences from Present
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Dev only, not for release builds.
+
+Problem: Requiem showed only black frames; needed to tell a GPU or
+synchronisation stall from a game stuck drawing nothing (N§29).
+
+Root cause: n/a (diagnostic).
+
+Fix: every fence is registered; every 10 s, from Present, log CPU waits
+(SetEventOnCompletion) and queue Waits pending for 5 s or more, and fences
+polled (GetCompletedValue) 100+ times with a value that does not move.
+Registration and wait timestamps happen even with diagnostics off; only the
+report and poll counting are gated.
+
+Verified by: Requiem: no CPU/queue waits >= 5 s and no stuck polling, so not
+GPU-bound (N§29).
+
+Off switch: needs VKD3D_DIAGNOSTICS=1; VKD3D_FENCE_STALL_LOG=0 disables.
+---
+ libs/vkd3d/command.c       | 116 +++++++++++++++++++++++++++++++++++++
+ libs/vkd3d/swapchain.c     |   1 +
+ libs/vkd3d/vkd3d_private.h |  10 ++++
+ 3 files changed, 127 insertions(+)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index f331017..d865c91 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -880,12 +880,123 @@ static void d3d12_fence_inc_ref(struct d3d12_fence *fence)
+     InterlockedIncrement(&fence->refcount_internal);
+ }
+ 
++/* Fence stall diagnostics: every live fence is registered; vkd3d_fence_stall_report() (called from Present)
++ * logs CPU waits (SetEventOnCompletion) and queue Waits pending for 5 s or more, and fences polled in a
++ * loop (GetCompletedValue) whose value does not move. Disabled with VKD3D_FENCE_STALL_LOG=0. */
++static pthread_mutex_t vkd3d_fence_diag_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct list vkd3d_fence_diag_list = LIST_INIT(vkd3d_fence_diag_list);
++static uint32_t vkd3d_fence_diag_next_id;
++static uint64_t vkd3d_fence_diag_last_report;
++
++static bool vkd3d_fence_diag_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled < 0)
++    {
++        char env[16];
++        enabled = vkd3d_diagnostics_enabled() && !(vkd3d_get_env_var("VKD3D_FENCE_STALL_LOG", env, sizeof(env)) && env[0] == '0');
++    }
++    return enabled;
++}
++
++static void vkd3d_fence_diag_register(struct d3d12_fence *fence)
++{
++    pthread_mutex_lock(&vkd3d_fence_diag_lock);
++    fence->diag_id = ++vkd3d_fence_diag_next_id;
++    list_add_tail(&vkd3d_fence_diag_list, &fence->diag_entry);
++    pthread_mutex_unlock(&vkd3d_fence_diag_lock);
++}
++
++static void vkd3d_fence_diag_unregister(struct d3d12_fence *fence)
++{
++    pthread_mutex_lock(&vkd3d_fence_diag_lock);
++    list_remove(&fence->diag_entry);
++    pthread_mutex_unlock(&vkd3d_fence_diag_lock);
++}
++
++void vkd3d_fence_stall_report(void)
++{
++    enum { MAX_LINES = 12 };
++    static const uint64_t stall_ns = 5000000000ull;
++    char lines[MAX_LINES][256];
++    unsigned int line_count = 0, i;
++    uint64_t now, interval;
++    struct d3d12_fence *fence;
++    size_t j;
++
++    if (!vkd3d_fence_diag_enabled())
++        return;
++    now = vkd3d_get_current_time_ns();
++    pthread_mutex_lock(&vkd3d_fence_diag_lock);
++    interval = now - vkd3d_fence_diag_last_report;
++    if (!vkd3d_fence_diag_last_report || interval < 10000000000ull)
++    {
++        if (!vkd3d_fence_diag_last_report)
++        {
++            vkd3d_fence_diag_last_report = now;
++            LIST_FOR_EACH_ENTRY(fence, &vkd3d_fence_diag_list, struct d3d12_fence, diag_entry)
++                InterlockedExchange(&fence->diag_polls, 0);
++        }
++        pthread_mutex_unlock(&vkd3d_fence_diag_lock);
++        return;
++    }
++    vkd3d_fence_diag_last_report = now;
++
++    LIST_FOR_EACH_ENTRY(fence, &vkd3d_fence_diag_list, struct d3d12_fence, diag_entry)
++    {
++        uint64_t value, pending_max, cpu_oldest = 0, cpu_value = 0, gpu_oldest = 0, gpu_value = 0;
++        unsigned int cpu_stalled = 0, gpu_stalled = 0;
++        LONG polls = InterlockedExchange(&fence->diag_polls, 0);
++
++        pthread_mutex_lock(&fence->mutex);
++        value = fence->virtual_value;
++        pending_max = fence->max_pending_virtual_timeline_value;
++        for (j = 0; j < fence->event_count; j++)
++        {
++            const struct vkd3d_waiting_event *e = &fence->events[j];
++            if (e->diag_start_ns && now - e->diag_start_ns >= stall_ns && e->value > value)
++            {
++                cpu_stalled++;
++                if (now - e->diag_start_ns > cpu_oldest) { cpu_oldest = now - e->diag_start_ns; cpu_value = e->value; }
++            }
++        }
++        for (j = 0; j < fence->wait_tickets_count; j++)
++        {
++            const struct vkd3d_fence_wait_ticket *t = &fence->wait_tickets[j];
++            if (t->diag_start_ns && now - t->diag_start_ns >= stall_ns && t->virtual_value > value)
++            {
++                gpu_stalled++;
++                if (now - t->diag_start_ns > gpu_oldest) { gpu_oldest = now - t->diag_start_ns; gpu_value = t->virtual_value; }
++            }
++        }
++        pthread_mutex_unlock(&fence->mutex);
++
++        if (cpu_stalled && line_count < MAX_LINES)
++            snprintf(lines[line_count++], sizeof(lines[0]), "fence %u: %u CPU wait(s) pending, oldest %.0f s for value %"PRIu64
++                    "; fence at %"PRIu64", highest signal submitted %"PRIu64"%s", fence->diag_id, cpu_stalled, cpu_oldest / 1e9,
++                    cpu_value, value, pending_max, cpu_value > pending_max ? " (no signal for it was ever submitted)" : "");
++        if (gpu_stalled && line_count < MAX_LINES)
++            snprintf(lines[line_count++], sizeof(lines[0]), "fence %u: %u queue Wait(s) pending, oldest %.0f s for value %"PRIu64
++                    "; fence at %"PRIu64", highest signal submitted %"PRIu64"%s", fence->diag_id, gpu_stalled, gpu_oldest / 1e9,
++                    gpu_value, value, pending_max, gpu_value > pending_max ? " (no signal for it was ever submitted)" : "");
++        if (polls >= 100 && value == fence->diag_last_value && line_count < MAX_LINES)
++            snprintf(lines[line_count++], sizeof(lines[0]), "fence %u: polled %ld times in %.0f s with its value stuck at %"PRIu64
++                    " (highest signal submitted %"PRIu64")", fence->diag_id, (long)polls, interval / 1e9, value, pending_max);
++        fence->diag_last_value = value;
++    }
++    pthread_mutex_unlock(&vkd3d_fence_diag_lock);
++
++    for (i = 0; i < line_count; i++)
++        vkd3d_failure_log("fence-stall", "%s", lines[i]);
++}
++
+ static void d3d12_fence_dec_ref(struct d3d12_fence *fence)
+ {
+     ULONG refcount_internal = InterlockedDecrement(&fence->refcount_internal);
+ 
+     if (!refcount_internal)
+     {
++        vkd3d_fence_diag_unregister(fence);
+         d3d_destruction_notifier_free(&fence->destruction_notifier);
+         vkd3d_private_store_destroy(&fence->private_store);
+         d3d12_fence_destroy_vk_objects(fence);
+@@ -1221,6 +1332,7 @@ uint64_t d3d12_fence_register_pending_gpu_wait(struct d3d12_fence *fence, uint64
+ 
+         wait_ticket = &fence->wait_tickets[fence->wait_tickets_count++];
+         wait_ticket->ticket = ticket;
++        wait_ticket->diag_start_ns = vkd3d_get_current_time_ns();
+         wait_ticket->virtual_value = value;
+     }
+ 
+@@ -1404,6 +1516,8 @@ static UINT64 STDMETHODCALLTYPE d3d12_fence_GetCompletedValue(d3d12_fence_iface
+     }
+     completed_value = fence->virtual_value;
+     pthread_mutex_unlock(&fence->mutex);
++    if (vkd3d_diagnostics_enabled())
++        InterlockedIncrement(&fence->diag_polls);
+ 
+     /* A removed device reports UINT64_MAX, even for fences without a signal in flight. */
+     if (d3d12_device_removed_unblocks_fences(fence->device))
+@@ -1432,6 +1546,7 @@ static HRESULT d3d12_fence_set_native_sync_handle_on_completion_explicit(struct
+     event.handle = handle;
+     event.latch = &latch;
+     event.payload = payload;
++    event.diag_start_ns = vkd3d_get_current_time_ns();
+ 
+     /* A removed device completes every fence to UINT64_MAX, so any value is reached. */
+     if (value <= fence->virtual_value || d3d12_device_removed_unblocks_fences(fence->device))
+@@ -1592,6 +1707,7 @@ static HRESULT d3d12_fence_init(struct d3d12_fence *fence, struct d3d12_device *
+ 
+     d3d_destruction_notifier_init(&fence->destruction_notifier, (IUnknown*)&fence->ID3D12Fence_iface);
+     d3d12_device_add_ref(fence->device = device);
++    vkd3d_fence_diag_register(fence);
+ 
+     return S_OK;
+ }
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 82233ae..e48d892 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -1130,6 +1130,7 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
+     (void)pPresentParameters;
+ 
+     vkd3d_pso_retry_report();
++    vkd3d_fence_stall_report();
+ 
+     /* Like DXGI: once the device is removed, Present fails instead of silently presenting nothing,
+      * so the application notices (and can query GetDeviceRemovedReason / recreate the device). */
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 8760741..a68caa3 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -652,12 +652,14 @@ struct vkd3d_waiting_event
+     bool *latch;
+     uint32_t *payload;
+     struct vkd3d_queue_timeline_trace_cookie timeline_cookie;
++    uint64_t diag_start_ns;
+ };
+ 
+ struct vkd3d_fence_wait_ticket
+ {
+     uint64_t ticket;
+     uint64_t virtual_value;
++    uint64_t diag_start_ns;
+ };
+ 
+ struct d3d12_fence
+@@ -695,8 +697,16 @@ struct d3d12_fence
+ 
+     struct vkd3d_private_store private_store;
+     struct d3d_destruction_notifier destruction_notifier;
++
++    /* Stall diagnostics (vkd3d_fence_stall_report). */
++    struct list diag_entry;
++    uint32_t diag_id;
++    LONG diag_polls;
++    uint64_t diag_last_value;
+ };
+ 
++void vkd3d_fence_stall_report(void);
++
+ static inline struct d3d12_fence *impl_from_ID3D12Fence1(ID3D12Fence1 *iface)
+ {
+     extern CONST_VTBL struct ID3D12Fence1Vtbl d3d12_fence_vtbl;

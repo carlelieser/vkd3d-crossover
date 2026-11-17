@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:07:58 -0500
+Subject: [PATCH 11/20] fix: keep access chain flag on copied pointers
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: Metal compile errors and failed compute PSOs in PRAGMATA; stores
+through a copied pointer emitted "*arr[i] = x".
+
+Root cause: OpCopyObject of a pointer to an access chain produced an
+expression without the access_chain flag, so it was treated as a raw
+pointer and dereferenced. dxil-spirv emits this pattern for groupshared
+stores.
+
+Fix: inherit access_chain and need_transpose from the source expression
+when copying a pointer.
+
+Verified by: 0 Metal compile failures in PRAGMATA after the fix, about
+twice as many shaders reach compilation (see NOTES.md §16).
+
+Off switch: none.
+---
+ spirv_glsl.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/spirv_glsl.cpp b/spirv_glsl.cpp
+index c8284a2..79db239 100644
+--- a/spirv_glsl.cpp
++++ b/spirv_glsl.cpp
+@@ -13988,6 +13988,13 @@ void CompilerGLSL::emit_instruction(const Instruction &instruction)
+ 			{
+ 				e.implied_read_expressions = rhs_expr->implied_read_expressions;
+ 				e.expression_dependencies = rhs_expr->expression_dependencies;
++				// A copied pointer to an access chain is still an access chain (an lvalue), not a raw
++				// pointer; without this, stores through the copy get a bogus dereference ("*arr[i] = x").
++				if (pointer)
++				{
++					e.access_chain = rhs_expr->access_chain;
++					e.need_transpose = rhs_expr->need_transpose;
++				}
+ 			}
+ 		}
+ 		break;
+-- 
+2.51.0
+

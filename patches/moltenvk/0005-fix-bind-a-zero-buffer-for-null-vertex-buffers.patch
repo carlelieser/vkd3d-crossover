@@ -1,0 +1,98 @@
+From 0c56181caab67fa86aad47ff225dc148bb76a6be Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:11:53 -0500
+Subject: [PATCH 05/28] fix: bind a zero buffer for null vertex buffers
+
+Problem: Binding a null vertex buffer (D3D12 null VBV, robustness2 nullDescriptor) crashed.
+
+Root cause: MVKCmdBindVertexBuffers dereferenced the null VkBuffer.
+
+Fix: Bind a 4 MiB zero-filled buffer (256K vertices at vkd3d's 16-byte stride) in place of null vertex buffers.
+
+Verified by: test_null_vbv 1 -> 0 failures.
+
+Off switch: none
+---
+ MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm  |  9 +++++++++
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.h  |  4 ++++
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm | 18 ++++++++++++++++++
+ 3 files changed, 31 insertions(+)
+
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+index d045297..8720236 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+@@ -42,6 +42,15 @@ VkResult MVKCmdBindVertexBuffers<N>::setContent(MVKCommandBuffer* cmdBuff,
+     MVKVertexMTLBufferBinding b;
+     for (uint32_t bindIdx = 0; bindIdx < bindingCount; bindIdx++) {
+         MVKBuffer* mvkBuffer = (MVKBuffer*)pBuffers[bindIdx];
++        if ( !mvkBuffer ) {
++            // nullDescriptor: a null vertex buffer reads zero.
++            b.mtlBuffer = cmdBuff->getDevice()->getZeroVertexMTLBuffer();
++            b.offset = 0;
++            b.size = 0;
++            b.stride = pStrides ? (uint32_t)pStrides[bindIdx] : 0;
++            _bindings.push_back(b);
++            continue;
++        }
+         b.mtlBuffer = mvkBuffer->getMTLBuffer();
+         b.offset = mvkBuffer->getMTLBufferOffset() + pOffsets[bindIdx];
+ 		b.size = pSizes ? uint32_t(pSizes[bindIdx] == VK_WHOLE_SIZE ? mvkBuffer->getByteCount() - pOffsets[bindIdx] : pSizes[bindIdx]) : 0;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+index 534a414..fdd0c08 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+@@ -943,6 +943,9 @@ public:
+ 	 */
+ 	id<MTLBuffer> getDummyBlitMTLBuffer();
+ 
++	/** A zero-filled buffer bound in place of null vertex buffers (robustness2 nullDescriptor). */
++	id<MTLBuffer> getZeroVertexMTLBuffer();
++
+ 	/**
+ 	 * Returns whether MTLCommandBuffers can be prefilled.
+ 	 *
+@@ -1111,6 +1114,7 @@ protected:
+ 	std::string _capturePipeFileName;
+ 	id<MTLSamplerState> _defaultMTLSamplerState = nil;
+ 	id<MTLBuffer> _dummyBlitMTLBuffer = nil;
++	id<MTLBuffer> _zeroVertexMTLBuffer = nil;
+ #if MVK_XCODE_16
+ 	id<MTLResidencySet> _residencySet = nil;
+ #endif
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index 47d0800..167d957 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -4983,6 +4983,23 @@ id<MTLBuffer> MVKDevice::getDummyBlitMTLBuffer() {
+ 	return _dummyBlitMTLBuffer;
+ }
+ 
++id<MTLBuffer> MVKDevice::getZeroVertexMTLBuffer() {
++	if ( !_zeroVertexMTLBuffer ) {
++		lock_guard<mutex> lock(_rezLock);
++		if ( !_zeroVertexMTLBuffer ) {
++			@autoreleasepool {
++				// 4 MiB covers 256K vertices at a 16-byte stride (vkd3d binds null VBVs with stride 16).
++				const NSUInteger len = 4 * 1024 * 1024;
++				id<MTLBuffer> buf = [_physicalDevice->_mtlDevice newBufferWithLength: len options: MTLResourceStorageModeShared];
++				memset(buf.contents, 0, len);
++				[buf setLabel: @"MoltenVK null vertex buffer"];
++				_zeroVertexMTLBuffer = buf;
++			}
++		}
++	}
++	return _zeroVertexMTLBuffer;
++}
++
+ MTLCompileOptions* MVKDevice::getMTLCompileOptions(uint32_t fpFastMathFlags,
+ 												   bool preserveInvariance) {
+ 	MTLCompileOptions* mtlCompOpt = [MTLCompileOptions new];
+@@ -5617,6 +5634,7 @@ MVKDevice::~MVKDevice() {
+ #endif
+ 	[_defaultMTLSamplerState release];
+ 	[_dummyBlitMTLBuffer release];
++	[_zeroVertexMTLBuffer release];
+ 
+ 	stopAutoGPUCapture(MVK_CONFIG_AUTO_GPU_CAPTURE_SCOPE_DEVICE);
+ 

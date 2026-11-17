@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 12:00:00 +0000
+Subject: [PATCH 02/13] feat(dev): add VKD3D_DIAGNOSTICS master switch
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Dev only, not for release builds.
+
+Problem: the black-screen diagnostics added for Requiem (N§29) were compiled
+in and on by default.
+
+Root cause: n/a (diagnostic).
+
+Fix: vkd3d_diagnostics_enabled() reads VKD3D_DIAGNOSTICS=1, off by default.
+It gates the thread sampler, fence-stall and queue-activity reports, the
+backbuffer-draw logger, the event recorder and the GPU readback added in the
+following commits. Defined for _WIN32 builds only.
+
+Verified by: OVERVIEW.md section 4 ("vkd3d diagnostics bundle").
+
+Off switch: off by default; VKD3D_DIAGNOSTICS=1 enables.
+---
+ include/private/vkd3d_debug.h |  1 +
+ libs/vkd3d-common/debug.c     | 15 +++++++++++++++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/include/private/vkd3d_debug.h b/include/private/vkd3d_debug.h
+index 4fdaa0f..f21f9e7 100644
+--- a/include/private/vkd3d_debug.h
++++ b/include/private/vkd3d_debug.h
+@@ -75,6 +75,7 @@ void vkd3d_dbg_flush(void);
+ /* Always-on, deduplicated failure log shared with MoltenVK. VKD3D_FAILURE_LOG = path or "0";
+  * default C:\\gfx-failures.log. */
+ bool vkd3d_failure_log_enabled(void);
++bool vkd3d_diagnostics_enabled(void);
+ void vkd3d_failure_log(const char *category, const char *fmt, ...) VKD3D_PRINTF_FUNC(2, 3);
+ 
+ #define VKD3D_DEBUG_BUFFER_SIZE 512
+diff --git a/libs/vkd3d-common/debug.c b/libs/vkd3d-common/debug.c
+index e4d1087..db69b50 100644
+--- a/libs/vkd3d-common/debug.c
++++ b/libs/vkd3d-common/debug.c
+@@ -711,3 +711,18 @@ union vkd3d_config_flags vkd3d_parse_debug_options(const char *string,
+ 
+     return flags;
+ }
++
++#ifdef _WIN32
++/* Master switch for the black-screen diagnostics (fence/queue reports, backbuffer-draw logger, event recording,
++ * GPU readback, thread sampler). Off by default; VKD3D_DIAGNOSTICS=1 enables. */
++bool vkd3d_diagnostics_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled < 0)
++    {
++        char env[16];
++        enabled = vkd3d_get_env_var("VKD3D_DIAGNOSTICS", env, sizeof(env)) && env[0] == '1';
++    }
++    return enabled;
++}
++#endif

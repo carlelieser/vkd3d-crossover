@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:07:15 -0500
+Subject: [PATCH 08/20] feat: emulate OpImageQueryLod in MSL compute shaders
+
+Problem: CalculateLevelOfDetail in SM 6.6 compute shaders cannot be
+translated.
+
+Root cause: calculate_clamped_lod/calculate_unclamped_lod are only
+available in fragment functions.
+
+Fix: in compute-like shaders compute the unclamped LOD as
+0.5 * log2(max(|dP/dx * size|^2, |dP/dy * size|^2)) from the emulated
+quad derivatives, and clamp it to the image's mip range. The clamped
+value ignores sampler LOD clamps.
+
+Verified by: vkd3d-proton compute derivative tests 823/823 (see NOTES.md
+Finding 7).
+
+Off switch: none.
+---
+ spirv_msl.cpp | 47 +++++++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 39 insertions(+), 8 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index bd551c1..a809b85 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -7283,6 +7283,14 @@ void CompilerMSL::emit_custom_functions()
+ 			end_scope();
+ 			statement("");
+ 			statement("template<typename T>");
++			statement("inline float spvComputeLodUnclamped(T dx, T dy, T size)");
++			begin_scope();
++			statement("T a = dx * size;");
++			statement("T b = dy * size;");
++			statement("return 0.5 * log2(max(dot(a, a), dot(b, b)));");
++			end_scope();
++			statement("");
++			statement("template<typename T>");
+ 			statement("inline T spvComputeFwidthCoarse(T v)");
+ 			begin_scope();
+ 			statement("return abs(spvComputeDdxCoarse(v)) + abs(spvComputeDdyCoarse(v));");
+@@ -10721,14 +10729,36 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 			SPIRV_CROSS_THROW("Bad image type given to OpImageQueryLod");
+ 		}
+ 
+-		// TODO: It is unclear if calculcate_clamped_lod also conditionally rounds
+-		// the reported LOD based on the sampler. NEAREST miplevel should
+-		// round the LOD, but LINEAR miplevel should not round.
+-		// Let's hope this does not become an issue ...
+-		statement(to_expression(id), ".x = ", image_expr, ".calculate_clamped_lod(", sampler_expr, ", ",
+-		          coord_expr, ");");
+-		statement(to_expression(id), ".y = ", image_expr, ".calculate_unclamped_lod(", sampler_expr, ", ",
+-		          coord_expr, ");");
++		if (is_compute_like_shader() && builtin_subgroup_invocation_id_id)
++		{
++			// Kernels have no implicit derivatives. Compute the LOD from emulated quad derivatives:
++			// lod = log2(max(|dP/dx * size|, |dP/dy * size|)). The clamped value ignores sampler LOD clamps.
++			add_spv_func_and_recompile(SPVFuncImplComputeDerivatives);
++			string lane = to_expression(builtin_subgroup_invocation_id_id);
++			string ce = enclose_expression(coord_expr);
++			string size;
++			if (image_type.image.dim == Dim3D)
++				size = join("float3(", image_expr, ".get_width(), ", image_expr, ".get_height(), ", image_expr, ".get_depth())");
++			else if (image_type.image.dim == DimCube)
++				size = join("float3(", image_expr, ".get_width())");
++			else
++				size = join("float2(", image_expr, ".get_width(), ", image_expr, ".get_height())");
++			statement(to_expression(id), ".y = spvComputeLodUnclamped(spvComputeDdxFine(", ce, ", ", lane,
++			          "), spvComputeDdyFine(", ce, ", ", lane, "), ", size, ");");
++			statement(to_expression(id), ".x = clamp(", to_expression(id), ".y, 0.0, float(", image_expr,
++			          ".get_num_mip_levels()) - 1.0);");
++		}
++		else
++		{
++			// TODO: It is unclear if calculcate_clamped_lod also conditionally rounds
++			// the reported LOD based on the sampler. NEAREST miplevel should
++			// round the LOD, but LINEAR miplevel should not round.
++			// Let's hope this does not become an issue ...
++			statement(to_expression(id), ".x = ", image_expr, ".calculate_clamped_lod(", sampler_expr, ", ",
++			          coord_expr, ");");
++			statement(to_expression(id), ".y = ", image_expr, ".calculate_unclamped_lod(", sampler_expr, ", ",
++			          coord_expr, ");");
++		}
+ 		register_control_dependent_expression(id);
+ 		break;
+ 	}
+@@ -19976,6 +20006,7 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
+ 	case OpImageSampleImplicitLod:
+ 	case OpImageSampleProjImplicitLod:
+ 	case OpImageSparseSampleImplicitLod:
++	case OpImageQueryLod:
+ 		// Metal has no derivatives in kernels; we emulate them with quad-group ops (compute derivatives).
+ 		if (self.is_compute_like_shader())
+ 			needs_subgroup_invocation_id = true;
+-- 
+2.51.0
+

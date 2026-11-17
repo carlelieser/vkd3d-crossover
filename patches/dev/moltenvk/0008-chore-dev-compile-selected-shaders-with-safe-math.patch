@@ -1,0 +1,69 @@
+From afac264b720cb044d2018765f220108e193624ab Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:12:16 -0500
+Subject: [PATCH 08/10] chore(dev): compile selected shaders with safe math
+
+Problem: Needed to rule precision in or out per shader.
+
+Root cause: Diagnostics only; no defect.
+
+Fix: MVK_SAFE_MATH_SHADERS=<hash>[,...] (or all) tags those shaders' MSL; newMTLLibrary compiles tagged sources with MTLMathModeSafe and precise functions.
+
+Verified by: Ruled out precision as the hair cause.
+
+Off switch: off by default; MVK_SAFE_MATH_SHADERS enables
+---
+ .../MoltenVK/GPUObjects/MVKShaderModule.mm    | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+index f9a84cc..e832d92 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+@@ -479,6 +479,16 @@ static void mvkProfileDumpComputeMSL(const SPIRVToMSLConversionConfiguration* cf
+ 
+ // Debugging aid: with MVK_MSL_OVERRIDE_DIR set, a file named like the profile dumps (shader-cs|fs-<hash>.metal) in that
+ // directory replaces the converted MSL of that shader (used to instrument a single game shader). Never cached.
++// Debugging aid: MVK_SAFE_MATH_SHADERS=<hash>[,<hash>...] (code hashes as in the profile dumps) compiles those shaders
++// with MTLMathModeSafe and precise math functions. The converted MSL is tagged; newMTLLibrary reads the tag.
++static const char* kMVKSafeMathTag = "// MVK_SAFE_MATH\n";
++static void mvkApplySafeMathTag(size_t codeHash, std::string& msl) {
++	static const char* list = getenv("MVK_SAFE_MATH_SHADERS");
++	if ( !list || !*list || msl.compare(0, strlen(kMVKSafeMathTag), kMVKSafeMathTag) == 0 ) { return; }
++	char hex[24]; snprintf(hex, sizeof(hex), "%016zx", codeHash);
++	if (strcmp(list, "all") == 0 || strstr(list, hex)) { msl.insert(0, kMVKSafeMathTag); }
++}
++
+ static void mvkApplyMSLOverride(const SPIRVToMSLConversionConfiguration* cfg, size_t codeHash, std::string& msl) {
+ 	static const char* dir = getenv("MVK_MSL_OVERRIDE_DIR");
+ 	if ( !dir || !*dir ) { return; }
+@@ -509,6 +519,7 @@ bool MVKShaderModule::convert(SPIRVToMSLConversionConfiguration* pShaderConfig,
+ 		mvkLogAtomic64Use(pShaderConfig, conversionResult.msl);
+ 		mvkProfileDumpComputeMSL(pShaderConfig, _key.codeHash, conversionResult.msl);
+ 		mvkApplyMSLOverride(pShaderConfig, _key.codeHash, conversionResult.msl);
++		mvkApplySafeMathTag(_key.codeHash, conversionResult.msl);
+ 		return true;
+ 	}
+ 	std::string preCfgBytes = useDiskCache ? mvkDiskShaderCacheSerializeConfig(*pShaderConfig) : std::string();
+@@ -518,7 +529,7 @@ bool MVKShaderModule::convert(SPIRVToMSLConversionConfiguration* pShaderConfig,
+ 	if (wasConverted && useDiskCache && !preCfgBytes.empty()) {
+ 		mvkDiskShaderCacheStore(preCfgBytes, _spvConverter.getSPIRV(), *pShaderConfig, conversionResult);
+ 	}
+-	if (wasConverted) { mvkApplyMSLOverride(pShaderConfig, _key.codeHash, conversionResult.msl); }
++	if (wasConverted) { mvkApplyMSLOverride(pShaderConfig, _key.codeHash, conversionResult.msl); mvkApplySafeMathTag(_key.codeHash, conversionResult.msl); }
+ 
+ 	const char* dumpDir = getMVKConfig().shaderDumpDir;
+ 	if (dumpDir && *dumpDir) {
+@@ -662,6 +673,12 @@ id<MTLLibrary> MVKShaderLibraryCompiler::newMTLLibrary(NSString* mslSourceCode,
+ 			@autoreleasepool {
+ 				auto mtlCompileOptions = getDevice()->getMTLCompileOptions(shaderConversionResults.entryPoint.fpFastMathFlags,
+ 																		   shaderConversionResults.isPositionInvariant);
++#if MVK_XCODE_16
++				if ([mslSourceCode hasPrefix: @"// MVK_SAFE_MATH"] && [mtlCompileOptions respondsToSelector: @selector(mathMode)]) {
++					mtlCompileOptions.mathMode = MTLMathModeSafe;
++					mtlCompileOptions.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
++				}
++#endif
+ 				if (!specializationMacroDef.empty()) {
+ 					size_t macro_count = specializationMacroDef.size();
+ 					NSString *macro_names[macro_count];

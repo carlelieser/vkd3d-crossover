@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:07:28 -0500
+Subject: [PATCH 09/20] feat: emulate sparse feedback as always resident in MSL
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: shaders using sparse feedback (OpImageSparse*, OpImageSparseRead,
+OpImageSparseTexelsResident) fail with "Sparse feedback not yet supported
+in MSL". RE Engine uses them once tiled resources are exposed.
+
+Root cause: Metal has no sparse residency feedback.
+
+Fix: run the plain image operation into a texel temporary and return
+{ 0, texel } (resident); OpImageSparseTexelsResident becomes (code == 0).
+This is exact when every tile is backed, as with vkd3d-proton's committed
+fallback for reserved resources on MoltenVK.
+
+Verified by: PRAGMATA SKETCHBOOK demo no longer crashes at the first
+frame together with the vkd3d-proton tiled fallback (see NOTES.md §18).
+
+Off switch: none.
+---
+ spirv_msl.cpp | 65 ++++++++++++++++++++++++++++++++++++++++++++++++++-
+ spirv_msl.hpp |  1 +
+ 2 files changed, 65 insertions(+), 1 deletion(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index a809b85..a3939a6 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -10121,6 +10121,16 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 
+ 	switch (opcode)
+ 	{
++	case OpImageSparseRead:
++		emit_sparse_feedback_as_resident(instruction, OpImageRead);
++		break;
++
++	case OpImageSparseTexelsResident:
++		// Residency codes from the emulation above are always 0 (resident).
++		emit_op(ops[0], ops[1], join("(", to_expression(ops[2]), " == 0)"), should_forward(ops[2]));
++		inherit_expression_dependencies(ops[1], ops[2]);
++		break;
++
+ 	case OpLoad:
+ 	{
+ 		uint32_t id = ops[1];
+@@ -11633,10 +11643,63 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 	previous_instruction_opcode = opcode;
+ }
+ 
++// Metal has no sparse feedback. Emulate it as "always resident": run the plain op into a temporary of
++// the texel type and return { 0 (resident), texel }. This is exact when the runtime backs every tile
++// (e.g. vkd3d-proton emulating reserved resources with committed memory on MoltenVK).
++void CompilerMSL::emit_sparse_feedback_as_resident(const Instruction &i, Op plain_op)
++{
++	auto *ops = stream_mutable(i);
++	uint32_t result_type_id = ops[0];
++	uint32_t id = ops[1];
++	auto &rtype = get<SPIRType>(result_type_id);
++	if (rtype.basetype != SPIRType::Struct || rtype.member_types.size() != 2)
++		SPIRV_CROSS_THROW("Invalid return type for sparse feedback.");
++	uint32_t texel_type_id = rtype.member_types[1];
++
++	auto &temps = extra_sub_expressions[id];
++	if (temps == 0)
++		temps = ir.increase_bound_by(1);
++	uint32_t texel_id = temps;
++
++	// Emit the non-sparse operation into texel_id by temporarily retargeting the instruction.
++	ops[0] = texel_type_id;
++	ops[1] = texel_id;
++	Instruction plain = i;
++	plain.op = uint16_t(plain_op);
++	if (plain_op == OpImageRead)
++		emit_instruction(plain);
++	else
++		emit_texture_op(plain, false);
++	ops[0] = result_type_id;
++	ops[1] = id;
++
++	emit_op(result_type_id, id, join(type_to_glsl(rtype), "{ 0, ", to_expression(texel_id), " }"), false);
++	inherit_expression_dependencies(id, texel_id);
++}
++
+ void CompilerMSL::emit_texture_op(const Instruction &i, bool sparse)
+ {
+ 	if (sparse)
+-		SPIRV_CROSS_THROW("Sparse feedback not yet supported in MSL.");
++	{
++		Op plain_op;
++		switch (static_cast<Op>(i.op))
++		{
++		case OpImageSparseSampleImplicitLod: plain_op = OpImageSampleImplicitLod; break;
++		case OpImageSparseSampleExplicitLod: plain_op = OpImageSampleExplicitLod; break;
++		case OpImageSparseSampleDrefImplicitLod: plain_op = OpImageSampleDrefImplicitLod; break;
++		case OpImageSparseSampleDrefExplicitLod: plain_op = OpImageSampleDrefExplicitLod; break;
++		case OpImageSparseSampleProjImplicitLod: plain_op = OpImageSampleProjImplicitLod; break;
++		case OpImageSparseSampleProjExplicitLod: plain_op = OpImageSampleProjExplicitLod; break;
++		case OpImageSparseSampleProjDrefImplicitLod: plain_op = OpImageSampleProjDrefImplicitLod; break;
++		case OpImageSparseSampleProjDrefExplicitLod: plain_op = OpImageSampleProjDrefExplicitLod; break;
++		case OpImageSparseFetch: plain_op = OpImageFetch; break;
++		case OpImageSparseGather: plain_op = OpImageGather; break;
++		case OpImageSparseDrefGather: plain_op = OpImageDrefGather; break;
++		default: SPIRV_CROSS_THROW("Unsupported sparse texture operation in MSL.");
++		}
++		emit_sparse_feedback_as_resident(i, plain_op);
++		return;
++	}
+ 
+ 	if (msl_options.use_framebuffer_fetch_subpasses)
+ 	{
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index 583513f..39027b6 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -928,6 +928,7 @@ protected:
+ 	// If the underlying resource has been used for comparison then duplicate loads of that resource must be too
+ 	// Use Metal's native frame-buffer fetch API for subpass inputs.
+ 	void emit_texture_op(const Instruction &i, bool sparse) override;
++	void emit_sparse_feedback_as_resident(const Instruction &i, Op plain_op);
+ 	void emit_binary_ptr_op(uint32_t result_type, uint32_t result_id, uint32_t op0, uint32_t op1, const char *op);
+ 	std::string to_ptr_expression(uint32_t id, bool register_expression_read = true);
+ 	void emit_binary_unord_op(uint32_t result_type, uint32_t result_id, uint32_t op0, uint32_t op1, const char *op);
+-- 
+2.51.0
+

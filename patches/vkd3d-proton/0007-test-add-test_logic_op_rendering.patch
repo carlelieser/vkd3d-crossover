@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 12:00:00 +0000
+Subject: [PATCH 7/7] test: add test_logic_op_rendering
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: MoltenVK reported output-merger logic ops but never applied them,
+and no test checked rendered values, only PSO creation.
+
+Root cause: (MoltenVK, M9) logic ops were set only for blendable formats,
+while D3D12 logic ops are for integer formats, which are not blendable.
+
+Fix: new test that draws through XOR/AND/OR/COPY/NOOP onto R8G8B8A8_UINT
+and checks the exact integer result. Skips when OutputMergerLogicOp is not
+supported.
+
+Verified by: 4 of 5 ops failed before the MoltenVK fix; 84/84 after
+(N§25, sweep8).
+
+Off switch: n/a (test only).
+---
+ tests/d3d12_pso.c   | 89 +++++++++++++++++++++++++++++++++++++++++++++
+ tests/d3d12_tests.h |  1 +
+ 2 files changed, 90 insertions(+)
+
+diff --git a/tests/d3d12_pso.c b/tests/d3d12_pso.c
+index 4111a5f..ffee2e2 100644
+--- a/tests/d3d12_pso.c
++++ b/tests/d3d12_pso.c
+@@ -5478,3 +5478,92 @@ void test_unusual_builtin_stage_io_dxil(void)
+     test_unusual_builtin_stage_io(true);
+ }
+ 
++
++/* Renders through an output-merger logic op and checks the exact integer result (not just PSO creation). */
++void test_logic_op_rendering(void)
++{
++    static const struct { D3D12_LOGIC_OP op; unsigned int expected; } tests[] =
++    {
++        { D3D12_LOGIC_OP_XOR,  0x3c3c3c3c },  /* 0x33 ^ 0x0f */
++        { D3D12_LOGIC_OP_AND,  0x03030303 },  /* 0x33 & 0x0f */
++        { D3D12_LOGIC_OP_OR,   0x3f3f3f3f },  /* 0x33 | 0x0f */
++        { D3D12_LOGIC_OP_COPY, 0x0f0f0f0f },
++        { D3D12_LOGIC_OP_NOOP, 0x33333333 },
++    };
++    static const float clear_value[] = { 51.0f, 51.0f, 51.0f, 51.0f };
++    D3D12_FEATURE_DATA_D3D12_OPTIONS options;
++    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc;
++    D3D12_SUBRESOURCE_DATA subresource;
++    struct test_context_desc desc;
++    struct test_context context;
++    ID3D12DescriptorHeap *heap;
++    ID3D12PipelineState *pso;
++    ID3D12Resource *texture;
++    unsigned int data[32 * 32];
++    unsigned int i;
++    HRESULT hr;
++
++#include "shaders/depth_stencil/headers/ps_load_stencil.h"
++
++    memset(&desc, 0, sizeof(desc));
++    desc.rt_format = DXGI_FORMAT_R8G8B8A8_UINT;
++    desc.no_root_signature = true;
++    if (!init_test_context(&context, &desc))
++        return;
++
++    if (FAILED(ID3D12Device_CheckFeatureSupport(context.device, D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
++            !options.OutputMergerLogicOp)
++    {
++        skip("Logic ops not supported.\n");
++        destroy_test_context(&context);
++        return;
++    }
++
++    context.root_signature = create_texture_root_signature(context.device, D3D12_SHADER_VISIBILITY_PIXEL, 0, 0);
++    for (i = 0; i < ARRAY_SIZE(data); i++)
++        data[i] = 0x0f0f0f0f;
++    texture = create_default_texture(context.device, 32, 32, DXGI_FORMAT_R8G8B8A8_UINT, 0, D3D12_RESOURCE_STATE_COPY_DEST);
++    subresource.pData = data;
++    subresource.RowPitch = 32 * sizeof(*data);
++    subresource.SlicePitch = sizeof(data);
++    upload_texture_data(texture, &subresource, 1, context.queue, context.list);
++    reset_command_list(context.list, context.allocator);
++    transition_resource_state(context.list, texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++
++    heap = create_gpu_descriptor_heap(context.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1);
++    ID3D12Device_CreateShaderResourceView(context.device, texture, NULL, get_cpu_descriptor_handle(&context, heap, 0));
++
++    for (i = 0; i < ARRAY_SIZE(tests); i++)
++    {
++        vkd3d_test_set_context("logic op %u", tests[i].op);
++        init_pipeline_state_desc(&pso_desc, context.root_signature, desc.rt_format, NULL, &ps_load_stencil_dxbc, NULL);
++        pso_desc.BlendState.RenderTarget[0].LogicOpEnable = TRUE;
++        pso_desc.BlendState.RenderTarget[0].LogicOp = tests[i].op;
++        hr = ID3D12Device_CreateGraphicsPipelineState(context.device, &pso_desc, &IID_ID3D12PipelineState, (void **)&pso);
++        ok(hr == S_OK, "Failed to create pipeline, hr %#x.\n", (int)hr);
++        if (FAILED(hr))
++            continue;
++
++        ID3D12GraphicsCommandList_ClearRenderTargetView(context.list, context.rtv, clear_value, 0, NULL);
++        ID3D12GraphicsCommandList_OMSetRenderTargets(context.list, 1, &context.rtv, false, NULL);
++        ID3D12GraphicsCommandList_SetDescriptorHeaps(context.list, 1, &heap);
++        ID3D12GraphicsCommandList_SetGraphicsRootSignature(context.list, context.root_signature);
++        ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(context.list, 0,
++                ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(heap));
++        ID3D12GraphicsCommandList_SetPipelineState(context.list, pso);
++        ID3D12GraphicsCommandList_RSSetViewports(context.list, 1, &context.viewport);
++        ID3D12GraphicsCommandList_RSSetScissorRects(context.list, 1, &context.scissor_rect);
++        ID3D12GraphicsCommandList_IASetPrimitiveTopology(context.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++        ID3D12GraphicsCommandList_DrawInstanced(context.list, 3, 1, 0, 0);
++        transition_resource_state(context.list, context.render_target, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
++        check_sub_resource_uint(context.render_target, 0, context.queue, context.list, tests[i].expected, 0);
++        reset_command_list(context.list, context.allocator);
++        transition_resource_state(context.list, context.render_target, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
++        ID3D12PipelineState_Release(pso);
++    }
++    vkd3d_test_set_context(NULL);
++
++    ID3D12Resource_Release(texture);
++    ID3D12DescriptorHeap_Release(heap);
++    destroy_test_context(&context);
++}
+diff --git a/tests/d3d12_tests.h b/tests/d3d12_tests.h
+index f243ced..806bb98 100644
+--- a/tests/d3d12_tests.h
++++ b/tests/d3d12_tests.h
+@@ -51,6 +51,7 @@ decl_test(test_create_root_signature);
+ decl_test(test_root_signature_limits);
+ decl_test(test_create_compute_pipeline_state);
+ decl_test(test_create_graphics_pipeline_state);
++decl_test(test_logic_op_rendering);
+ decl_test(test_create_pipeline_state);
+ decl_test(test_create_fence);
+ decl_test(test_object_interface);

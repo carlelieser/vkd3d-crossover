@@ -1,0 +1,267 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:05:54 -0500
+Subject: [PATCH 01/20] feat: emulate 64-bit buffer and threadgroup atomics in
+ MSL
+
+Problem: shaders using uint64/int64 atomics (SM 6.6) fail to translate
+with "MSL currently does not support 64-bit atomics".
+
+Root cause: Apple GPUs before Apple8 (M1) have no 64-bit atomics, and
+later ones only min/max, so SPIRV-Cross rejects every 64-bit atomic.
+
+Fix: emulate 64-bit atomics on device and threadgroup memory with 32-bit
+atomics on the low and high words (spvAtomic64* helpers). Add/sub/inc/dec
+propagate the carry, and/or/xor work per half, and loads re-read the high
+word until it is stable; these are exact. Min/max decide on the high word,
+then the low word, and repair the low word if a stronger high word landed
+in between. Exchange, compare-exchange and store are best-effort under
+contention (the halves are not updated as one unit). 64-bit image atomics
+remain unsupported.
+
+Verified by: vkd3d-proton test_shader_sm66_64bit_atomics 79/85; all six
+failures are torn concurrent exchanges, inherent to the emulation (see
+NOTES.md Finding 7).
+
+Off switch: none.
+---
+ spirv_msl.cpp | 187 +++++++++++++++++++++++++++++++++++++++++++++++++-
+ spirv_msl.hpp |   3 +
+ 2 files changed, 189 insertions(+), 1 deletion(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 21232ee..b1bf0e1 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -7075,6 +7075,129 @@ void CompilerMSL::emit_custom_functions()
+ 			statement("");
+ 			break;
+ 
++		case SPVFuncImplAtomic64Emulation:
++		{
++			// 64-bit atomics emulated with 32-bit atomics on the low ([0]) and high ([1]) words.
++			// Exact: add/sub (carry propagated), and/or/xor, load (seqlock-style re-read).
++			// min/max: high word decides, then low word; a writer whose high word was overtaken after its low-word
++			// write restores the low word it displaced (fixes mismatched hi/lo pairs from two racing writers).
++			// Best-effort under contention: exchange,
++			// compare-exchange and store (the two halves are not updated as one unit).
++			statement("inline ulong spvAtomic64Pack(uint lo, uint hi) { return (ulong(hi) << 32) | ulong(lo); }");
++			static const char *const spaces[] = { "device", "threadgroup" };
++			for (auto *as : spaces)
++			{
++				string P = join(as, " atomic_uint*");
++				statement("inline ulong spvAtomic64Load(", P, " p)");
++				begin_scope();
++				statement("uint h0, l, h1;");
++				statement("do { h0 = atomic_load_explicit(&p[1], memory_order_relaxed); l = atomic_load_explicit(&p[0], memory_order_relaxed); h1 = atomic_load_explicit(&p[1], memory_order_relaxed); } while (h0 != h1);");
++				statement("return spvAtomic64Pack(l, h1);");
++				end_scope();
++				statement("inline void spvAtomic64Store(", P, " p, ulong v)");
++				begin_scope();
++				statement("atomic_store_explicit(&p[0], uint(v), memory_order_relaxed);");
++				statement("atomic_store_explicit(&p[1], uint(v >> 32), memory_order_relaxed);");
++				end_scope();
++				statement("inline ulong spvAtomic64Exchange(", P, " p, ulong v)");
++				begin_scope();
++				statement("uint l = atomic_exchange_explicit(&p[0], uint(v), memory_order_relaxed);");
++				statement("uint h = atomic_exchange_explicit(&p[1], uint(v >> 32), memory_order_relaxed);");
++				statement("return spvAtomic64Pack(l, h);");
++				end_scope();
++				statement("inline ulong spvAtomic64CompareExchange(", P, " p, ulong cmp, ulong v)");
++				begin_scope();
++				statement("uint ch = uint(cmp >> 32), cl = uint(cmp);");
++				statement("uint h = atomic_load_explicit(&p[1], memory_order_relaxed);");
++				statement("if (h != ch)");
++				statement("    return spvAtomic64Pack(atomic_load_explicit(&p[0], memory_order_relaxed), h);");
++				statement("uint expected = cl;");
++				statement("if (!atomic_compare_exchange_weak_explicit(&p[0], &expected, uint(v), memory_order_relaxed, memory_order_relaxed))");
++				statement("    return spvAtomic64Pack(expected, h);");
++				statement("uint eh = ch;");
++				statement("atomic_compare_exchange_weak_explicit(&p[1], &eh, uint(v >> 32), memory_order_relaxed, memory_order_relaxed);");
++				statement("return cmp;");
++				end_scope();
++				statement("inline ulong spvAtomic64Add(", P, " p, ulong v)");
++				begin_scope();
++				statement("uint lo = uint(v), hi = uint(v >> 32);");
++				statement("uint ol = atomic_fetch_add_explicit(&p[0], lo, memory_order_relaxed);");
++				statement("uint carry = (ol + lo) < ol ? 1u : 0u;");
++				statement("uint oh = atomic_fetch_add_explicit(&p[1], hi + carry, memory_order_relaxed);");
++				statement("return spvAtomic64Pack(ol, oh);");
++				end_scope();
++				static const char *const bitops[][2] = { { "And", "and" }, { "Or", "or" }, { "Xor", "xor" } };
++				for (auto &b : bitops)
++				{
++					statement("inline ulong spvAtomic64", b[0], "(", P, " p, ulong v)");
++					begin_scope();
++					statement("uint ol = atomic_fetch_", b[1], "_explicit(&p[0], uint(v), memory_order_relaxed);");
++					statement("uint oh = atomic_fetch_", b[1], "_explicit(&p[1], uint(v >> 32), memory_order_relaxed);");
++					statement("return spvAtomic64Pack(ol, oh);");
++					end_scope();
++				}
++				// min/max: hi word decides. Ties resolve on the low word.
++				static const char *const mm[][4] = {
++					{ "UMax", "max", "uint", ">" }, { "UMin", "min", "uint", "<" },
++					{ "SMax", "max", "int", ">" }, { "SMin", "min", "int", "<" },
++				};
++				const bool dev = strcmp(as, "device") == 0;
++				const bool has_fence = msl_options.supports_msl_version(3, 2);
++				auto fence = [&]() {
++					if (has_fence)
++						statement("atomic_thread_fence(", dev ? "mem_flags::mem_device" : "mem_flags::mem_threadgroup",
++						          ", memory_order_seq_cst, ", dev ? "thread_scope_device" : "thread_scope_threadgroup", ");");
++				};
++				for (auto &m : mm)
++				{
++					bool sgn = strcmp(m[2], "int") == 0;
++					statement("inline ulong spvAtomic64", m[0], "(", P, " p, ulong v)");
++					begin_scope();
++					statement("uint hi = uint(v >> 32), lo = uint(v);");
++					if (sgn)
++					{
++						statement("int ohs = atomic_fetch_", m[1], "_explicit((", as, " atomic_int*)&p[1], int(hi), memory_order_relaxed);");
++						statement("uint oh = uint(ohs);");
++						statement("bool wins = int(hi) ", m[3], " ohs;");
++					}
++					else
++					{
++						statement("uint oh = atomic_fetch_", m[1], "_explicit(&p[1], hi, memory_order_relaxed);");
++						statement("bool wins = hi ", m[3], " oh;");
++					}
++					// Write-and-repair. The fence orders our high-word update before our
++					// low-word write, so a writer that later displaces our low word is guaranteed to see our high word.
++					fence();
++					statement("uint ol;");
++					statement("if (wins)");
++					statement("    ol = atomic_exchange_explicit(&p[0], lo, memory_order_relaxed);");
++					statement("else if (hi == oh)");
++					statement("    ol = atomic_fetch_", m[1], "_explicit(&p[0], lo, memory_order_relaxed);");
++					statement("else");
++					statement("    ol = atomic_load_explicit(&p[0], memory_order_relaxed);");
++					// Repair the two-writer race: if a stronger high word landed after our low-word write,
++					// our low word may be paired with someone else's high word. Put back exactly what we
++					// displaced, but only if our value is still there (otherwise the winner already wrote).
++					statement("if ((wins || hi == oh) && ol != lo)");
++					begin_scope();
++					if (msl_options.supports_msl_version(3, 2))
++						statement("atomic_thread_fence(", strcmp(as, "device") == 0 ? "mem_flags::mem_device" : "mem_flags::mem_threadgroup",
++						          ", memory_order_seq_cst, ",
++						          strcmp(as, "device") == 0 ? "thread_scope_device" : "thread_scope_threadgroup", ");");
++					statement("if (atomic_load_explicit(&p[1], memory_order_relaxed) != hi)");
++					begin_scope();
++					statement("uint e = lo;");
++					statement("while (!atomic_compare_exchange_weak_explicit(&p[0], &e, ol, memory_order_relaxed, memory_order_relaxed) && e == lo) {}");
++					end_scope();
++					end_scope();
++					statement("return spvAtomic64Pack(ol, oh);");
++					end_scope();
++				}
++				statement("");
++			}
++			break;
++		}
++
+ 		case SPVFuncImplSubgroupAllEqual:
+ 			// Metal doesn't provide a function to evaluate this directly. But, we can
+ 			// implement this by comparing every thread's value to one thread's value
+@@ -11653,7 +11776,14 @@ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id,
+ 		use_native_image_atomic = false;
+ 
+ 	if (type.width == 64)
+-		SPIRV_CROSS_THROW("MSL currently does not support 64-bit atomics.");
++	{
++		// Apple GPUs before Apple8 (M1) have no 64-bit atomics, and later ones only min/max.
++		// Emulate on buffer / threadgroup memory with 32-bit atomics on the two halves.
++		if (use_native_image_atomic || ptr_type.storage == StorageClassImage)
++			SPIRV_CROSS_THROW("MSL currently does not support 64-bit image atomics.");
++		emit_atomic64_emulated(result_type, result_id, opcode, obj, op1, op1_is_literal, op2);
++		return;
++	}
+ 
+ 	auto remapped_type = type;
+ 	remapped_type.basetype = expected_type;
+@@ -11912,6 +12042,61 @@ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id,
+ 	flush_all_atomic_capable_variables();
+ }
+ 
++void CompilerMSL::emit_atomic64_emulated(uint32_t result_type, uint32_t result_id, Op opcode, uint32_t obj,
++                                         uint32_t op1, bool op1_is_literal, uint32_t op2)
++{
++	add_spv_func_and_recompile(SPVFuncImplAtomic64Emulation);
++
++	auto storage = get_expression_effective_storage_class(obj);
++	const char *addr_space = storage == StorageClassWorkgroup ? "threadgroup" : "device";
++	string ptr = join("((", addr_space, " atomic_uint*)", to_enclosed_pointer_expression(obj), ")");
++
++	auto value_expr = [&](uint32_t id) -> string {
++		if (op1_is_literal && id == op1)
++			return join(to_string(id), "ul");
++		return join("as_type<ulong>(", to_unpacked_expression(id), ")");
++	};
++
++	const char *func = nullptr;
++	string args = ptr;
++	switch (opcode)
++	{
++	case OpAtomicLoad: func = "spvAtomic64Load"; break;
++	case OpAtomicStore: func = "spvAtomic64Store"; args += ", " + value_expr(op1); break;
++	case OpAtomicExchange: func = "spvAtomic64Exchange"; args += ", " + value_expr(op1); break;
++	case OpAtomicCompareExchange:
++		// op1 = comparator, op2 = new value.
++		func = "spvAtomic64CompareExchange";
++		args += join(", ", value_expr(op1), ", as_type<ulong>(", to_unpacked_expression(op2), ")");
++		break;
++	case OpAtomicIIncrement: func = "spvAtomic64Add"; args += ", 1ul"; break;
++	case OpAtomicIDecrement: func = "spvAtomic64Add"; args += ", ulong(-1l)"; break;
++	case OpAtomicIAdd: func = "spvAtomic64Add"; args += ", " + value_expr(op1); break;
++	case OpAtomicISub: func = "spvAtomic64Add"; args += join(", (0ul - ", value_expr(op1), ")"); break;
++	case OpAtomicAnd: func = "spvAtomic64And"; args += ", " + value_expr(op1); break;
++	case OpAtomicOr: func = "spvAtomic64Or"; args += ", " + value_expr(op1); break;
++	case OpAtomicXor: func = "spvAtomic64Xor"; args += ", " + value_expr(op1); break;
++	case OpAtomicUMax: func = "spvAtomic64UMax"; args += ", " + value_expr(op1); break;
++	case OpAtomicUMin: func = "spvAtomic64UMin"; args += ", " + value_expr(op1); break;
++	case OpAtomicSMax: func = "spvAtomic64SMax"; args += ", " + value_expr(op1); break;
++	case OpAtomicSMin: func = "spvAtomic64SMin"; args += ", " + value_expr(op1); break;
++	default:
++		SPIRV_CROSS_THROW("Unsupported 64-bit atomic opcode.");
++	}
++
++	string call = join(func, "(", args, ")");
++	if (opcode == OpAtomicStore)
++		statement(call, ";");
++	else
++	{
++		auto &res_type = get<SPIRType>(result_type);
++		string value = join("as_type<", type_to_glsl(res_type), ">(", call, ")");
++		emit_op(result_type, result_id, value, false);
++	}
++
++	flush_all_atomic_capable_variables();
++}
++
+ // Metal only supports relaxed memory order for now
+ const char *CompilerMSL::get_memory_order(uint32_t)
+ {
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index 913cb74..a438f2f 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -853,6 +853,7 @@ protected:
+ 		SPVFuncImplSubgroupBallotFindMSB,
+ 		SPVFuncImplSubgroupBallotBitCount,
+ 		SPVFuncImplSubgroupAllEqual,
++		SPVFuncImplAtomic64Emulation,
+ 		SPVFuncImplSubgroupShuffle,
+ 		SPVFuncImplSubgroupShuffleXor,
+ 		SPVFuncImplSubgroupShuffleUp,
+@@ -1167,6 +1168,8 @@ protected:
+ 	std::string get_tess_factor_struct_name();
+ 	SPIRType &get_uint_type();
+ 	uint32_t get_uint_type_id();
++	void emit_atomic64_emulated(uint32_t result_type, uint32_t result_id, Op opcode, uint32_t obj,
++	                            uint32_t op1, bool op1_is_literal, uint32_t op2);
+ 	void emit_atomic_func_op(uint32_t result_type, uint32_t result_id, const char *op, Op opcode,
+ 	                         uint32_t mem_order_1, uint32_t mem_order_2, bool has_mem_order_2, uint32_t op0, uint32_t op1 = 0,
+ 	                         bool op1_is_pointer = false, bool op1_is_literal = false, uint32_t op2 = 0);
+-- 
+2.51.0
+

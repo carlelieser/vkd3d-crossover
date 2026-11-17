@@ -1,0 +1,323 @@
+From 82c2c0e6699e14d2aa536fc1412c4ecdc286b8c8 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:12:14 -0500
+Subject: [PATCH 04/10] chore(dev): add per-encoder GPU profiler
+
+Problem: Needed GPU time per render pass / compute encoder to find GPU-bound work.
+
+Root cause: Diagnostics only; no defect.
+
+Fix: MVK_CONFIG_GPU_PROFILE=1 times every Metal encoder with stage-boundary GPU timestamps and logs every 5 s a ranking ([mvk-gpuprof] on stderr), render passes keyed by attachments, size and first fragment shader hash, compute encoders by the first shader hash.
+
+Verified by: Found the indirect-count pass splitting.
+
+Off switch: off by default; MVK_CONFIG_GPU_PROFILE=1 enables
+---
+ MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h |  13 ++
+ .../MoltenVK/Commands/MVKCommandBuffer.mm     | 184 +++++++++++++++++-
+ .../Commands/MVKCommandEncoderState.mm        |   2 +
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h    |   4 +
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm   |   1 +
+ 5 files changed, 202 insertions(+), 2 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
+index ce221d0..f1f0498 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
+@@ -366,6 +366,10 @@ public:
+ 	 */
+ 	id<MTLComputeCommandEncoder> getMTLComputeEncoder(MVKCommandUse cmdUse);
+ 
++	/** GPU profiling (MVK_CONFIG_GPU_PROFILE=1): notes the shader of the compute pipeline bound to the current compute encoder. */
++	void profNoteComputeShader(uint64_t shaderHash);
++	void profNoteRenderDraw(uint64_t fragmentHash);
++
+ 	/**
+ 	 * Returns the current Metal BLIT encoder for the specified use,
+      * which determines the label assigned to the returned encoder.
+@@ -490,6 +494,15 @@ public:
+ 	/** The current Metal command buffer. */
+ 	id<MTLCommandBuffer> _mtlCmdBuffer;
+ 
++	/** GPU profiling state (MVK_CONFIG_GPU_PROFILE=1). */
++	std::shared_ptr<struct MVKGPUProfileBatch> _profBatch;
++	id<MTLCommandBuffer> _profCmdBuffer = nil;
++	int32_t _profComputeSlot = -1;
++	int32_t _profRenderSlot = -1;
++	uint32_t _profRenderDraws = 0;
++	struct MVKGPUProfileBatch* profBatch();
++	int32_t profAllocSlot(const std::string& key);
++
+ 	/** The current Metal render encoder. */
+ 	id<MTLRenderCommandEncoder> _mtlRenderEncoder;
+ 
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+index f7b18a7..9fbe6d0 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+@@ -424,6 +424,153 @@ void MVKCommandEncoder::encode(id<MTLCommandBuffer> mtlCmdBuff,
+ 	addPerformanceInterval(getPerformanceStats().queue.commandBufferEncoding, startTime);
+ }
+ 
++
++#pragma mark -
++#pragma mark GPU profiler (MVK_CONFIG_GPU_PROFILE=1)
++
++// Times every Metal encoder with stage-boundary GPU timestamps (Apple GPUs) and logs, every 5 s, the GPU time per
++// render pass (keyed by attachments and size) and per compute encoder (keyed by the first compute shader's code hash,
++// matching MVK_CONFIG_SHADER_DUMP_DIR file names). Diagnostic only; adds a little overhead.
++
++#include <map>
++#include <chrono>
++
++struct MVKGPUProfileBatch {
++	id<MTLCounterSampleBuffer> sampleBuffer = nil;
++	uint32_t next = 0;
++	std::vector<std::string> keys;
++	~MVKGPUProfileBatch() { [sampleBuffer release]; }
++};
++
++static constexpr uint32_t kMVKGPUProfileSlots = 2048;
++
++static bool mvkGPUProfileEnabled() {
++	static int enabled = -1;
++	if (enabled < 0) { const char* e = getenv("MVK_CONFIG_GPU_PROFILE"); enabled = (e && e[0] == '1'); }
++	return enabled;
++}
++
++static std::mutex& mvkGPUProfileLock() { static std::mutex m; return m; }
++static std::map<std::string, std::pair<double, uint64_t>>& mvkGPUProfileTotals() { static std::map<std::string, std::pair<double, uint64_t>> t; return t; }
++
++static void mvkGPUProfileAccumulate(MVKGPUProfileBatch* batch) {
++	if ( !batch->next ) { return; }
++	NSData* data = [batch->sampleBuffer resolveCounterRange: NSMakeRange(0, batch->next)];
++	if ( !data ) { return; }
++	const MTLCounterResultTimestamp* ts = (const MTLCounterResultTimestamp*)data.bytes;
++	size_t count = data.length / sizeof(MTLCounterResultTimestamp);
++
++	static auto lastReport = std::chrono::steady_clock::now();
++	static auto windowStart = lastReport;
++	std::lock_guard<std::mutex> lock(mvkGPUProfileLock());
++	auto& totals = mvkGPUProfileTotals();
++	for (size_t i = 0; i + 1 < count && i / 2 < batch->keys.size(); i += 2) {
++		uint64_t a = ts[i].timestamp, b = ts[i + 1].timestamp;
++		if (a == MTLCounterErrorValue || b == MTLCounterErrorValue || b < a) { continue; }
++		auto& e = totals[batch->keys[i / 2]];
++		e.first += double(b - a);	// Apple GPU timestamps are nanoseconds (timestampPeriod 1.0)
++		e.second++;
++	}
++	auto now = std::chrono::steady_clock::now();
++	double secs = std::chrono::duration<double>(now - windowStart).count();
++	if (std::chrono::duration<double>(now - lastReport).count() >= 5.0 && secs > 0) {
++		std::vector<std::pair<std::string, std::pair<double, uint64_t>>> v(totals.begin(), totals.end());
++		std::sort(v.begin(), v.end(), [](auto& x, auto& y) { return x.second.first > y.second.first; });
++		double all = 0; for (auto& x : v) { all += x.second.first; }
++		fprintf(stderr, "[mvk-gpuprof] window %.1fs: total encoder GPU time %.1f ms/s across %zu keys\n", secs, all / 1e6 / secs, v.size());
++		for (size_t i = 0; i < v.size() && i < 25; i++) {
++			fprintf(stderr, "[mvk-gpuprof] %7.2f ms/s %5.1f%%  n=%-6llu avg %7.3f ms  %s\n", v[i].second.first / 1e6 / secs,
++					all > 0 ? 100.0 * v[i].second.first / all : 0.0, (unsigned long long)v[i].second.second,
++					v[i].second.first / 1e6 / double(v[i].second.second), v[i].first.c_str());
++		}
++		fflush(stderr);
++		totals.clear();
++		lastReport = windowStart = now;
++	}
++}
++
++MVKGPUProfileBatch* MVKCommandEncoder::profBatch() {
++	if ( !mvkGPUProfileEnabled() || !_mtlCmdBuffer ) { return nullptr; }
++	if (_profCmdBuffer == _mtlCmdBuffer && _profBatch) { return _profBatch.get(); }
++
++	static id<MTLCounterSet> tsSet = nil;
++	static bool supported = false;
++	static std::once_flag once;
++	id<MTLDevice> mtlDev = getMTLDevice();
++	std::call_once(once, [&]() {
++		if ( ![mtlDev supportsCounterSampling: MTLCounterSamplingPointAtStageBoundary] ) { return; }
++		for (id<MTLCounterSet> cs in mtlDev.counterSets) {
++			if ([cs.name isEqualToString: MTLCommonCounterSetTimestamp]) { tsSet = [cs retain]; supported = true; }
++		}
++	});
++	if ( !supported ) { return nullptr; }
++
++	auto batch = std::make_shared<MVKGPUProfileBatch>();
++	@autoreleasepool {
++		MTLCounterSampleBufferDescriptor* d = [[MTLCounterSampleBufferDescriptor new] autorelease];
++		d.counterSet = tsSet;
++		d.storageMode = MTLStorageModeShared;
++		d.sampleCount = kMVKGPUProfileSlots;
++		NSError* err = nil;
++		batch->sampleBuffer = [mtlDev newCounterSampleBufferWithDescriptor: d error: &err];
++	}
++	if ( !batch->sampleBuffer ) { return nullptr; }
++	std::shared_ptr<MVKGPUProfileBatch> keep = batch;
++	[_mtlCmdBuffer addCompletedHandler: ^(id<MTLCommandBuffer>) { mvkGPUProfileAccumulate(keep.get()); }];
++	_profBatch = batch;
++	_profCmdBuffer = _mtlCmdBuffer;
++	_profComputeSlot = -1;
++	return _profBatch.get();
++}
++
++int32_t MVKCommandEncoder::profAllocSlot(const std::string& key) {
++	auto* batch = profBatch();
++	if ( !batch || batch->next + 2 > kMVKGPUProfileSlots ) { return -1; }
++	int32_t slot = (int32_t)batch->next;
++	batch->next += 2;
++	batch->keys.push_back(key);
++	return slot;
++}
++
++void MVKCommandEncoder::profNoteComputeShader(uint64_t shaderHash) {
++	if (_profComputeSlot < 0 || !_profBatch || _profCmdBuffer != _mtlCmdBuffer) { return; }
++	auto& key = _profBatch->keys[_profComputeSlot / 2];
++	if (key.size() <= 3) {		// still the bare "CS " placeholder: name it after the first shader dispatched
++		char buf[48];
++		snprintf(buf, sizeof(buf), "CS %016llx", (unsigned long long)shaderHash);
++		key = buf;
++	}
++}
++
++// Names the render pass after its first fragment shader (and how many distinct draws were made before the key froze),
++// so heavy passes can be matched to MVK_PROFILE_SHADER_DIR dumps.
++void MVKCommandEncoder::profNoteRenderDraw(uint64_t fragmentHash) {
++	if (_profRenderSlot < 0 || !_profBatch || _profCmdBuffer != _mtlCmdBuffer) { return; }
++	auto& key = _profBatch->keys[_profRenderSlot / 2];
++	if (key.find(" fs ") == std::string::npos && fragmentHash) {
++		char buf[40];
++		snprintf(buf, sizeof(buf), " fs %016llx", (unsigned long long)fragmentHash);
++		key += buf;
++	}
++}
++
++static std::string mvkProfRenderPassKey(MTLRenderPassDescriptor* rpd) {
++	std::string k = "RP";
++	NSUInteger w = 0, h = 0;
++	for (uint32_t i = 0; i < 8; i++) {
++		id<MTLTexture> t = rpd.colorAttachments[i].texture;
++		if ( !t ) { continue; }
++		w = t.width; h = t.height;
++		k += " c" + std::to_string((unsigned)t.pixelFormat);
++		if (t.sampleCount > 1) { k += "x" + std::to_string((unsigned)t.sampleCount); }
++	}
++	id<MTLTexture> dt = rpd.depthAttachment.texture;
++	if (dt) { if ( !w ) { w = dt.width; h = dt.height; } k += " d" + std::to_string((unsigned)dt.pixelFormat); }
++	if ( !w ) { w = rpd.renderTargetWidth; h = rpd.renderTargetHeight; k += " noatt"; }
++	k += " " + std::to_string((unsigned)w) + "x" + std::to_string((unsigned)h);
++	return k;
++}
++
+ void MVKCommandEncoder::beginEncoding(id<MTLCommandBuffer> mtlCmdBuff, MVKCommandEncodingContext* pEncodingContext) {
+ 	_pEncodingContext = pEncodingContext;
+ 
+@@ -878,6 +1025,19 @@ void MVKCommandEncoder::beginMetalRenderPass(MVKCommandUse cmdUse) {
+ 		[mtlRPDesc setSamplePositions: sampPosns.data() count: sampPosns.size()];
+ 	}
+ 
++	if (mvkGPUProfileEnabled()) {
++		int32_t slot = profAllocSlot(mvkProfRenderPassKey(mtlRPDesc));
++		_profRenderSlot = slot;
++		_profRenderDraws = 0;
++		if (slot >= 0) {
++			auto* sba = mtlRPDesc.sampleBufferAttachments[0];
++			sba.sampleBuffer = _profBatch->sampleBuffer;
++			sba.startOfVertexSampleIndex = slot;
++			sba.endOfVertexSampleIndex = MTLCounterDontSample;
++			sba.startOfFragmentSampleIndex = MTLCounterDontSample;
++			sba.endOfFragmentSampleIndex = slot + 1;
++		}
++	}
+     _mtlRenderEncoder = [_mtlCmdBuffer renderCommandEncoderWithDescriptor: mtlRPDesc];
+ 	retainIfImmediatelyEncoding(_mtlRenderEncoder);
+ 	_cmdBuffer->setMetalObjectLabel(_mtlRenderEncoder, getMTLRenderCommandEncoderName(cmdUse));
+@@ -1147,7 +1307,18 @@ id<MTLComputeCommandEncoder> MVKCommandEncoder::getMTLComputeEncoder(MVKCommandU
+ 	if (!_mtlComputeEncoder || shouldStartNewEncoder(_mtlComputeEncoderUse, cmdUse)) {
+ 		needWaits = true;
+ 		endCurrentMetalEncoding();
+-		_mtlComputeEncoder = [_mtlCmdBuffer computeCommandEncoderWithDispatchType:getDispatchType(cmdUse)];
++		int32_t profSlot = mvkGPUProfileEnabled() ? profAllocSlot("CS ") : -1;
++		if (profSlot >= 0) {
++			MTLComputePassDescriptor* cpd = [MTLComputePassDescriptor computePassDescriptor];
++			cpd.dispatchType = getDispatchType(cmdUse);
++			cpd.sampleBufferAttachments[0].sampleBuffer = _profBatch->sampleBuffer;
++			cpd.sampleBufferAttachments[0].startOfEncoderSampleIndex = profSlot;
++			cpd.sampleBufferAttachments[0].endOfEncoderSampleIndex = profSlot + 1;
++			_mtlComputeEncoder = [_mtlCmdBuffer computeCommandEncoderWithDescriptor: cpd];
++		} else {
++			_mtlComputeEncoder = [_mtlCmdBuffer computeCommandEncoderWithDispatchType:getDispatchType(cmdUse)];
++		}
++		_profComputeSlot = profSlot;
+ 		retainIfImmediatelyEncoding(_mtlComputeEncoder);
+ 		beginMetalComputeEncoding(cmdUse);
+ 	}
+@@ -1171,7 +1342,16 @@ id<MTLBlitCommandEncoder> MVKCommandEncoder::getMTLBlitEncoder(MVKCommandUse cmd
+ 	if ( !_mtlBlitEncoder ) {
+ 		needWaits = true;
+ 		endCurrentMetalEncoding();
+-		_mtlBlitEncoder = [_mtlCmdBuffer blitCommandEncoder];
++		int32_t profSlot = mvkGPUProfileEnabled() ? profAllocSlot("BLIT") : -1;
++		if (profSlot >= 0) {
++			MTLBlitPassDescriptor* bpd = [MTLBlitPassDescriptor blitPassDescriptor];
++			bpd.sampleBufferAttachments[0].sampleBuffer = _profBatch->sampleBuffer;
++			bpd.sampleBufferAttachments[0].startOfEncoderSampleIndex = profSlot;
++			bpd.sampleBufferAttachments[0].endOfEncoderSampleIndex = profSlot + 1;
++			_mtlBlitEncoder = [_mtlCmdBuffer blitCommandEncoderWithDescriptor: bpd];
++		} else {
++			_mtlBlitEncoder = [_mtlCmdBuffer blitCommandEncoder];
++		}
+ 		retainIfImmediatelyEncoding(_mtlBlitEncoder);
+ 	}
+     if (_mtlBlitEncoderUse != cmdUse) {
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+index d1da80d..597a59f 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+@@ -1474,6 +1474,7 @@ void MVKMetalGraphicsCommandEncoderState::prepareDraw(
+ 	MVKGraphicsPipeline* pipeline = vk._pipeline;
+ 	if (!pipeline->getMainPipelineState()) // Abort if pipeline could not be created.
+ 		return;
++	mvkEncoder.profNoteRenderDraw(pipeline->getFragmentCodeHash());
+ 
+ 	// Pipeline
+ 	if (!_flags.has(MVKMetalRenderEncoderStateFlag::PipelineReady)) {
+@@ -1658,6 +1659,7 @@ void MVKMetalComputeCommandEncoderState::prepareComputeDispatch(
+ 		return;
+ 	}
+ 
++	mvkEncoder.profNoteComputeShader(pipeline->getShaderCodeHash());
+ 	_vkPipeline = pipeline;
+ 
+ 	if (_pipeline != mtlPipeline) {
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+index 8bac329..d030743 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+@@ -347,6 +347,9 @@ public:
+ 	const MTLPrimitiveTopologyClass getPrimitiveTopologyClass() const { return static_cast<MTLPrimitiveTopologyClass>(_primitiveTopologyClass); }
+ 
+ 	/** Constructs an instance for the device and parent (which may be NULL). */
++	/** Code hash of the fragment shader module (profiling). */
++	uint64_t getFragmentCodeHash() const { return _fragmentCodeHash; }
++
+ 	MVKGraphicsPipeline(MVKDevice* device,
+ 						MVKPipelineCache* pipelineCache,
+ 						MVKPipeline* parent,
+@@ -444,6 +447,7 @@ protected:
+ 	MVKShaderModule* _tessCtlModule = nullptr;
+ 	MVKShaderModule* _tessEvalModule = nullptr;
+ 	MVKShaderModule* _fragmentModule = nullptr;
++	uint64_t _fragmentCodeHash = 0;	// profiling: matches MVK_PROFILE_SHADER_DIR names
+ 	bool _ownsVertexModule = false;
+ 	bool _ownsTessCtlModule = false;
+ 	bool _ownsTessEvalModule = false;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 572ad85..d04440a 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -813,6 +813,7 @@ MVKGraphicsPipeline::MVKGraphicsPipeline(MVKDevice* device,
+ 	_tessCtlModule = getOrCreateShaderModule(device, pTessCtlSS, _ownsTessCtlModule);
+ 	_tessEvalModule = getOrCreateShaderModule(device, pTessEvalSS, _ownsTessEvalModule);
+ 	_fragmentModule = getOrCreateShaderModule(device, pFragmentSS, _ownsFragmentModule);
++	_fragmentCodeHash = _fragmentModule ? (uint64_t)_fragmentModule->getKey().codeHash : 0;
+ 
+ 	// Mesh pipelines: task/mesh shaders occupy the tessellation control/evaluation slots
+ 	// (modules, stage resources, implicit buffers). A pipeline is never both.

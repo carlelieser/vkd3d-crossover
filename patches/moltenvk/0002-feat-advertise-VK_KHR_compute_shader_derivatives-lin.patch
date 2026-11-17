@@ -1,0 +1,64 @@
+From ea69a309f9601b928cd948968ce9945ebf461ab0 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:11:50 -0500
+Subject: [PATCH 02/28] feat: advertise VK_KHR_compute_shader_derivatives
+ (linear)
+
+Problem: Shader Model 6.6 requires compute-shader derivatives; vkd3d-proton found computeDerivativeGroupLinear missing.
+
+Root cause: MoltenVK did not implement VK_KHR_compute_shader_derivatives.
+
+Fix: Report the extension with computeDerivativeGroupLinear when the device supports quad permutes (Metal quad-groups are 4 consecutive threads); quads grouping stays unsupported. SPIRV-Cross emulates ddx/ddy/fwidth and implicit-LOD sampling in compute. Requires the SPIRV-Cross patches of this series (patches/spirv-cross).
+
+Verified by: vkd3d-proton compute-derivative tests 823/823 pass.
+
+Off switch: none
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm                | 8 ++++++++
+ MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def | 1 +
+ MoltenVK/MoltenVK/Layers/MVKExtensions.def               | 1 +
+ 3 files changed, 10 insertions(+)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index e73bfcd..c309f5f 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -574,6 +574,14 @@ void MVKPhysicalDevice::getFeatures(VkPhysicalDeviceFeatures2* features) {
+ 				zeroInitWorkgroupMemFeatures->shaderZeroInitializeWorkgroupMemory = supportedFeats13.shaderZeroInitializeWorkgroupMemory;
+ 				break;
+ 			}
++			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR: {
++				// Emulated in SPIRV-Cross with quad-group ops; linear grouping maps directly onto
++				// Metal quad-groups (4 consecutive threads). Quads (2x2 by ID) is not supported.
++				auto* compDerivFeatures = (VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR*)next;
++				compDerivFeatures->computeDerivativeGroupQuads = false;
++				compDerivFeatures->computeDerivativeGroupLinear = _metalFeatures.quadPermute;
++				break;
++			}
+ 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR: {
+ 				auto* barycentricFeatures = (VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR*)next;
+ 				barycentricFeatures->fragmentShaderBarycentric = true;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def
+index 9342deb..ae05d92 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def
+@@ -80,6 +80,7 @@ MVK_DEVICE_FEATURE(VariablePointer,                       VARIABLE_POINTER,
+ MVK_DEVICE_FEATURE(VertexAttributeDivisor,                VERTEX_ATTRIBUTE_DIVISOR,                    2)
+ MVK_DEVICE_FEATURE(VulkanMemoryModel,                     VULKAN_MEMORY_MODEL,                         3)
+ MVK_DEVICE_FEATURE(ZeroInitializeWorkgroupMemory,         ZERO_INITIALIZE_WORKGROUP_MEMORY,            1)
++MVK_DEVICE_FEATURE_EXTN(ComputeShaderDerivatives,         COMPUTE_SHADER_DERIVATIVES,           KHR,   2)
+ MVK_DEVICE_FEATURE_EXTN(FragmentShaderBarycentric,        FRAGMENT_SHADER_BARYCENTRIC,          KHR,   1)
+ MVK_DEVICE_FEATURE_EXTN(Maintenance7,                     MAINTENANCE_7,                        KHR,   1)
+ MVK_DEVICE_FEATURE_EXTN(Maintenance8,                     MAINTENANCE_8,                        KHR,   1)
+diff --git a/MoltenVK/MoltenVK/Layers/MVKExtensions.def b/MoltenVK/MoltenVK/Layers/MVKExtensions.def
+index a4034a9..6bb79d5 100644
+--- a/MoltenVK/MoltenVK/Layers/MVKExtensions.def
++++ b/MoltenVK/MoltenVK/Layers/MVKExtensions.def
+@@ -46,6 +46,7 @@ MVK_EXTENSION(KHR_8bit_storage,                         KHR_8BIT_STORAGE,
+ MVK_EXTENSION(KHR_bind_memory2,                         KHR_BIND_MEMORY_2,                        DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(KHR_buffer_device_address,                KHR_BUFFER_DEVICE_ADDRESS,                DEVICE,   13.0,  16.0,  1.0)
+ MVK_EXTENSION(KHR_calibrated_timestamps,                KHR_CALIBRATED_TIMESTAMPS,                DEVICE,   10.15, 14.0,  1.0)
++MVK_EXTENSION(KHR_compute_shader_derivatives,          KHR_COMPUTE_SHADER_DERIVATIVES,           DEVICE,   11.0,  14.0,  1.0)
+ MVK_EXTENSION(KHR_copy_commands2,                       KHR_COPY_COMMANDS_2,                      DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(KHR_create_renderpass2,                   KHR_CREATE_RENDERPASS_2,                  DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(KHR_dedicated_allocation,                 KHR_DEDICATED_ALLOCATION,                 DEVICE,   10.11,  8.0,  1.0)

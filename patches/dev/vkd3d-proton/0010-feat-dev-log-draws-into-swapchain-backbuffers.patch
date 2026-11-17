@@ -1,0 +1,446 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 12:00:00 +0000
+Subject: [PATCH 10/13] feat(dev): log draws into swapchain backbuffers
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Dev only, not for release builds.
+
+Problem: needed to trace a frame that reaches the swapchain black to an empty
+viewport/scissor, a disabled write mask, a depth/stencil test or null input
+descriptors (N§29).
+
+Root cause: n/a (diagnostic).
+
+Fix: backbuffers are flagged VKD3D_RESOURCE_SWAPCHAIN_BACKBUFFER; draws into
+them are described (viewport, scissor, PSO RT0 state, depth/stencil, root
+signature tables, earlier render targets, recorded events since the sampled
+image was last a render target), at most every 15 s and 8 times per process,
+and the tables are re-read at ExecuteCommandLists. One-time dump of the
+pixel shader and root-signature layout to C:\gfx-bbdraw-*.
+
+Verified by: Requiem's final StretchBlt state was correct (N§29).
+
+Off switch: needs VKD3D_DIAGNOSTICS=1; VKD3D_BACKBUFFER_DRAW_LOG=0 disables.
+---
+ libs/vkd3d/command.c       | 284 +++++++++++++++++++++++++++++++++++++
+ libs/vkd3d/state.c         |  23 +++
+ libs/vkd3d/swapchain.c     |   1 +
+ libs/vkd3d/vkd3d_private.h |  12 ++
+ 4 files changed, 320 insertions(+)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 18b746f..f0b821d 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -7327,6 +7327,7 @@ static void d3d12_command_list_reset_api_state(struct d3d12_command_list *list,
+     memset(list->so_counter_buffer_offsets, 0, sizeof(list->so_counter_buffer_offsets));
+ 
+     list->cbv_srv_uav_descriptors_view = NULL;
++    list->diag_bb_pending = false;
+     list->diag_rt_used = 0;
+     list->diag_rt_head = 0;
+     list->diag_ev_count = 0;
+@@ -9300,6 +9301,271 @@ static bool d3d12_command_list_emit_predicated_command(struct d3d12_command_list
+     return true;
+ }
+ 
++static size_t vkd3d_diag_format_table(char *out, size_t size, const struct vkd3d_descriptor_metadata_view *views,
++        uint32_t heap_size, uint32_t offset, unsigned int count)
++{
++    size_t pos = 0;
++    unsigned int j;
++    for (j = 0; j < count && pos + 32 < size; j++)
++    {
++        const struct vkd3d_descriptor_metadata_view *m;
++        if (!views || !heap_size)
++            return pos + snprintf(out + pos, size - pos, " (no descriptor metadata)");
++        if (offset + j >= heap_size)
++            return pos + snprintf(out + pos, size - pos, " out-of-heap(%u)", heap_size);
++        m = &views[offset + j];
++        if (!(m->info.flags & VKD3D_DESCRIPTOR_FLAG_NON_NULL))
++            pos += snprintf(out + pos, size - pos, " null");
++        else if ((m->info.flags & VKD3D_DESCRIPTOR_FLAG_IMAGE_VIEW) && m->info.image.view
++#ifdef _WIN32
++                && !IsBadReadPtr(m->info.image.view, sizeof(*m->info.image.view))
++#endif
++                && m->info.image.view->diag_resource)
++            pos += snprintf(out + pos, size - pos, " img(%ux%u fmt %u res %p%s%s)", m->info.image.view->diag_width,
++                    m->info.image.view->diag_height, m->info.image.view->diag_dxgi_format, m->info.image.view->diag_resource,
++                    (m->info.image.view->diag_resource_flags & VKD3D_RESOURCE_SWAPCHAIN_BACKBUFFER) ? " backbuffer" : "",
++                    m->info.image.view->refcount <= 0 ? " STALE view" : "");
++        else if (m->info.flags & VKD3D_DESCRIPTOR_FLAG_IMAGE_VIEW)
++            pos += snprintf(out + pos, size - pos, " img(fmt %u)", m->info.image.dxgi_format);
++        else
++            pos += snprintf(out + pos, size - pos, " buf(fmt %u, %u B)", m->info.buffer.dxgi_format, m->info.buffer.range);
++    }
++    return pos;
++}
++
++/* Diagnostics: describe draws into a swapchain backbuffer (the application's final composite), so a frame that
++ * reaches the swapchain black can be traced to an empty viewport/scissor, a disabled write mask, a depth/stencil
++ * test, or null input descriptors. Logged at most every 15 s, 8 times per process. VKD3D_BACKBUFFER_DRAW_LOG=0 disables. */
++static void d3d12_command_list_diag_backbuffer_draw(struct d3d12_command_list *list, const char *kind,
++        uint32_t count, uint32_t instances)
++{
++    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++    static uint64_t last_ns;
++    static unsigned int logged;
++    static int enabled = -1;
++    const struct vkd3d_pipeline_bindings *bindings = &list->graphics_bindings;
++    const struct d3d12_root_signature *rs = bindings->root_signature;
++    const struct d3d12_graphics_pipeline_state *g;
++    const struct vkd3d_dynamic_state *dyn = &list->dynamic_state;
++    char tables[1024];
++    size_t pos = 0;
++    uint64_t now, mask;
++    unsigned int i;
++
++    if (!vkd3d_diagnostics_enabled())
++        return;
++    if (list->diag_rt_used && list->diag_rt_ring[list->diag_rt_head] == list->rtvs[0].resource)
++        list->diag_rt_draws[list->diag_rt_head]++;
++    d3d12_command_list_diag_event(list, DIAG_EV_DRAW, 0, list->rtvs[0].resource, 1, 0);
++    if (!list->rtvs[0].resource || !(list->rtvs[0].resource->flags & VKD3D_RESOURCE_SWAPCHAIN_BACKBUFFER))
++        return;
++    if (enabled < 0)
++    {
++        char env[16];
++        enabled = vkd3d_diagnostics_enabled() && !(vkd3d_get_env_var("VKD3D_BACKBUFFER_DRAW_LOG", env, sizeof(env)) && env[0] == '0');
++    }
++    if (!enabled || logged >= 8)
++        return;
++    now = vkd3d_get_current_time_ns();
++    pthread_mutex_lock(&lock);
++    if ((last_ns && now - last_ns < 15000000000ull) || logged >= 8)
++    {
++        pthread_mutex_unlock(&lock);
++        return;
++    }
++    last_ns = now;
++    logged++;
++    pthread_mutex_unlock(&lock);
++
++    if (!list->state || list->state->pipeline_type != VKD3D_PIPELINE_TYPE_GRAPHICS)
++    {
++        vkd3d_failure_log("backbuffer-draw", "%s %u x%u into the backbuffer with no graphics PSO bound", kind, count, instances);
++        return;
++    }
++    g = &list->state->graphics;
++
++    /* Once per process, for the first draw after the swapchain has been recreated at least once (the steady state),
++     * dump the pixel shader and the root signature's table layout so the shader's inputs can be mapped. */
++    if (logged == 2)
++    {
++        FILE *f;
++        if (list->state->diag_ps_code && (f = fopen("C:\\gfx-bbdraw-ps.dxbc", "wb")))
++        {
++            fwrite(list->state->diag_ps_code, 1, list->state->diag_ps_size, f);
++            fclose(f);
++        }
++        if (rs && (f = fopen("C:\\gfx-bbdraw-rootsig.txt", "w")))
++        {
++            static const char *types[] = { "?", "CBV", "SRV", "UAV", "SAMPLER" };
++            unsigned int p, b;
++            for (p = 0; p < rs->parameter_count; p++)
++            {
++                const struct vkd3d_shader_root_parameter *rp = &rs->parameters[p];
++                fprintf(f, "param %u: type %u", p, rp->parameter_type);
++                if (rp->parameter_type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
++                {
++                    fprintf(f, ", table index %u, %u bindings\n", rp->descriptor_table.table_index, rp->descriptor_table.binding_count);
++                    for (b = 0; b < rp->descriptor_table.binding_count; b++)
++                    {
++                        const struct vkd3d_shader_resource_binding *rb = &rp->descriptor_table.first_binding[b];
++                        fprintf(f, "  %s space %u reg %u count %u -> table offset %u, visibility %u, flags %#x\n",
++                                rb->type < 5 ? types[rb->type] : "?", rb->register_space, rb->register_index,
++                                rb->register_count, rb->descriptor_offset, rb->shader_visibility, rb->flags);
++                    }
++                }
++                else if (rp->parameter_type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
++                    fprintf(f, ", constants index %u count %u\n", rp->constant.constant_index, rp->constant.constant_count);
++                else
++                    fprintf(f, ", root descriptor\n");
++            }
++            fclose(f);
++        }
++        vkd3d_failure_log("backbuffer-draw", "  dumped this draw's pixel shader (%s) and root signature layout to C:\\gfx-bbdraw-*",
++                list->state->diag_ps_code ? "ok" : "not retained");
++    }
++
++    vkd3d_failure_log("backbuffer-draw", "%s %u x%u into backbuffer %ux%u (fb %ux%u); viewport %.0f,%.0f %.0fx%.0f depth %.2f-%.2f (%u vp); "
++            "scissor %d,%d %ux%u; PSO RT0 vk format %d, write mask %#x, blend %u; rt_count %u; cull %#x; "
++            "depth test %u op %d, stencil %u, DSV %s; sample mask %#x",
++            kind, count, instances, list->rtvs[0].width, list->rtvs[0].height, list->fb_width, list->fb_height,
++            dyn->viewports[0].x, dyn->viewports[0].y, dyn->viewports[0].width, dyn->viewports[0].height,
++            dyn->viewports[0].minDepth, dyn->viewports[0].maxDepth, dyn->viewport_count,
++            dyn->scissors[0].offset.x, dyn->scissors[0].offset.y, dyn->scissors[0].extent.width, dyn->scissors[0].extent.height,
++            g->rtv_formats[0], g->blend_attachments[0].colorWriteMask, g->blend_attachments[0].blendEnable, g->rt_count,
++            g->rs_desc.cullMode, g->ds_desc.depthTestEnable, g->ds_desc.depthCompareOp, g->ds_desc.stencilTestEnable,
++            list->dsv.resource ? "bound" : "none", g->sample_mask);
++
++    tables[0] = '\0';
++    list->diag_bb_count = 0;
++    list->diag_bb_view = list->cbv_srv_uav_descriptors_view;
++    list->diag_bb_heap_size = list->diag_cbv_srv_uav_heap ? list->diag_cbv_srv_uav_heap->desc.NumDescriptors : 0;
++    list->diag_bb_pending = true;
++    if (rs)
++    {
++        mask = rs->descriptor_table_mask;
++        while (mask && pos + 96 < sizeof(tables))
++        {
++            const struct d3d12_descriptor_heap *heap = list->diag_cbv_srv_uav_heap;
++            uint32_t offset;
++
++            i = vkd3d_bitmask_iter64(&mask);
++            offset = bindings->descriptor_tables[i];
++            pos += snprintf(tables + pos, sizeof(tables) - pos, " [param %u @%u:", i, offset);
++            pos += vkd3d_diag_format_table(tables + pos, sizeof(tables) - pos, list->cbv_srv_uav_descriptors_view,
++                    heap ? heap->desc.NumDescriptors : 0, offset, i == 0 ? 10 : 4);
++            if (list->diag_bb_count < ARRAY_SIZE(list->diag_bb_offsets))
++            {
++                list->diag_bb_params[list->diag_bb_count] = i;
++                list->diag_bb_offsets[list->diag_bb_count++] = offset;
++            }
++            pos += snprintf(tables + pos, sizeof(tables) - pos, "]");
++        }
++        if (rs->root_constant_count && pos + 80 < sizeof(tables))
++        {
++            pos += snprintf(tables + pos, sizeof(tables) - pos, " root constants:");
++            for (i = 0; i < 8 && pos + 16 < sizeof(tables); i++)
++                pos += snprintf(tables + pos, sizeof(tables) - pos, " %#x", bindings->root_constants[i]);
++        }
++    }
++    vkd3d_failure_log("backbuffer-draw", "  root signature %s, %u params; tables:%s", rs ? "bound" : "NONE",
++            rs ? rs->parameter_count : 0, tables[0] ? tables : " none");
++    {
++        char ring[600];
++        size_t rp = 0;
++        unsigned int k, n = list->diag_rt_used;
++        for (k = 0; k < n && rp + 80 < sizeof(ring); k++)
++        {
++            unsigned int slot = (list->diag_rt_head + ARRAY_SIZE(list->diag_rt_ring) - (n - 1 - k)) % ARRAY_SIZE(list->diag_rt_ring);
++            rp += snprintf(ring + rp, sizeof(ring) - rp, " [%ux%u fmt %u res %p, %u draws]", list->diag_rt_w[slot],
++                    list->diag_rt_h[slot], list->diag_rt_fmt[slot], list->diag_rt_ring[slot], list->diag_rt_draws[slot]);
++        }
++        vkd3d_failure_log("backbuffer-draw", "  render targets bound earlier in this command list (oldest first):%s", n ? ring : " none");
++    }
++
++    /* Find the draw's first pixel-visible SRV (the image it samples) and list every recorded command since that
++     * image was last bound as a render target, marking ones that touch it or memory that may overlap it. */
++    if (rs && list->cbv_srv_uav_descriptors_view && list->diag_cbv_srv_uav_heap)
++    {
++        static const char *names[] = { "?", "bind RT", "barrier", "aliasing barrier", "UAV barrier", "clear RTV", "clear UAV",
++                "discard", "copy into", "dispatch", "  dispatch binds", "draws into" };
++        const struct d3d12_resource *t0 = NULL;
++        unsigned int p, b, k, start, total, shown = 0;
++        uint64_t t0_off = 0, t0_size = 0;
++
++        for (p = 0; p < rs->parameter_count && !t0; p++)
++        {
++            const struct vkd3d_shader_root_parameter *rp = &rs->parameters[p];
++            if (rp->parameter_type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
++                continue;
++            for (b = 0; b < rp->descriptor_table.binding_count && !t0; b++)
++            {
++                const struct vkd3d_shader_resource_binding *rb = &rp->descriptor_table.first_binding[b];
++                uint32_t idx = bindings->descriptor_tables[p] + rb->descriptor_offset;
++                const struct vkd3d_descriptor_metadata_view *m;
++                if (rb->type != VKD3D_SHADER_DESCRIPTOR_TYPE_SRV ||
++                        (rb->shader_visibility != VKD3D_SHADER_VISIBILITY_ALL && rb->shader_visibility != VKD3D_SHADER_VISIBILITY_PIXEL) ||
++                        idx >= list->diag_cbv_srv_uav_heap->desc.NumDescriptors)
++                    continue;
++                m = &list->cbv_srv_uav_descriptors_view[idx];
++                if ((m->info.flags & VKD3D_DESCRIPTOR_FLAG_IMAGE_VIEW) && m->info.image.view
++#ifdef _WIN32
++                        && !IsBadReadPtr(m->info.image.view, sizeof(*m->info.image.view))
++#endif
++                        && m->info.image.view->refcount > 0 && m->info.image.view->diag_resource)
++                    t0 = m->info.image.view->diag_resource;
++            }
++        }
++        if (!t0)
++            return;
++        t0_off = t0->mem.offset;
++        t0_size = (uint64_t)t0->desc.Width * t0->desc.Height * 4 * 5 / 4;
++        vkd3d_failure_log("backbuffer-draw", "  sampled image %p: %"PRIu64"x%u fmt %u, %s, heap %p offset %#"PRIx64", flags %#x",
++                (const void *)t0, t0->desc.Width, t0->desc.Height, t0->desc.Format,
++                (t0->flags & VKD3D_RESOURCE_PLACED) ? "placed" : (t0->flags & VKD3D_RESOURCE_COMMITTED) ? "committed" : "other",
++                (const void *)t0->heap, t0_off, t0->flags);
++
++        total = list->diag_ev_count;
++        start = total > 64 ? total - 64 : 0;
++        for (k = total; k > start; k--)
++            if (list->diag_ev[(k - 1) % 64].kind == DIAG_EV_RT && list->diag_ev[(k - 1) % 64].res == t0)
++            {
++                start = k - 1;
++                break;
++            }
++        for (k = start; k < total && shown < 40; k++)
++        {
++            const struct vkd3d_diag_event *e = &list->diag_ev[k % 64];
++            const void *r = e->res;
++            const char *mark = "";
++            char extra[96] = "";
++            if (r == t0)
++                mark = "  <== SAMPLED IMAGE";
++            else if (r && t0->heap && e->heap == t0->heap && e->off < t0_off + t0_size &&
++                    e->off + (uint64_t)e->w * (e->h ? e->h : 1) * 4 > t0_off)
++                mark = "  <== SAME HEAP, MAY OVERLAP";
++            if (e->kind == DIAG_EV_BARRIER)
++                snprintf(extra, sizeof(extra), " %#x -> %#x%s", e->a, e->b, e->sub ? " (split)" : "");
++            else if (e->kind == DIAG_EV_CLEAR_RTV)
++                snprintf(extra, sizeof(extra), " colour r=%.3f a=%.3f", e->a / 1000.0, e->b / 1000.0);
++            else if (e->kind == DIAG_EV_DISPATCH)
++                snprintf(extra, sizeof(extra), " %ux%u groups", e->a, e->b);
++            else if (e->kind == DIAG_EV_DISPATCH_RES)
++                snprintf(extra, sizeof(extra), " as %s param %u reg %u", e->sub == VKD3D_SHADER_DESCRIPTOR_TYPE_UAV ? "UAV" : "SRV", e->a, e->b);
++            else if (e->kind == DIAG_EV_DRAW)
++                snprintf(extra, sizeof(extra), " x%u", e->a);
++            else if (e->kind == DIAG_EV_ALIAS)
++                snprintf(extra, sizeof(extra), " (before %p)", (const void *)(uintptr_t)((uint64_t)e->b << 32 | e->a));
++            if (r)
++                vkd3d_failure_log("backbuffer-draw", "    %s %p %"PRIu64"x%u fmt %u heap %p off %#"PRIx64"%s%s",
++                        e->kind < ARRAY_SIZE(names) ? names[e->kind] : "?", r, (uint64_t)e->w, e->h,
++                        e->fmt, e->heap, e->off, extra, mark);
++            else
++                vkd3d_failure_log("backbuffer-draw", "    %s%s", e->kind < ARRAY_SIZE(names) ? names[e->kind] : "?", extra);
++            shown++;
++        }
++    }
++}
++
+ static void STDMETHODCALLTYPE d3d12_command_list_DrawInstanced(d3d12_command_list_iface *iface,
+         UINT vertex_count_per_instance, UINT instance_count, UINT start_vertex_location,
+         UINT start_instance_location)
+@@ -9332,6 +9598,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_DrawInstanced(d3d12_command_lis
+         WARN("Failed to begin render pass, ignoring draw call.\n");
+         return;
+     }
++    d3d12_command_list_diag_backbuffer_draw(list, "draw", vertex_count_per_instance, instance_count);
+ 
+     list->cmd.estimated_cost += VKD3D_COMMAND_COST_HIGH;
+ 
+@@ -9405,6 +9672,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_DrawIndexedInstanced(d3d12_comm
+         WARN("Failed to begin render pass, ignoring draw call.\n");
+         return;
+     }
++    d3d12_command_list_diag_backbuffer_draw(list, "indexed draw", index_count_per_instance, instance_count);
+ 
+     list->cmd.estimated_cost += VKD3D_COMMAND_COST_HIGH;
+ 
+@@ -24372,6 +24640,22 @@ VKD3D_METHODENTRY(void) d3d12_command_queue_ExecuteCommandLists(ID3D12CommandQue
+             InterlockedAdd64(&command_queue->diag_copy_bytes, (LONG64)cmd_list->diag_copy_bytes);
+         }
+ 
++        if (cmd_list && cmd_list->diag_bb_pending)
++        {
++            char tables[768];
++            size_t pos = 0;
++            unsigned int t;
++            cmd_list->diag_bb_pending = false;
++            for (t = 0; t < cmd_list->diag_bb_count && pos + 96 < sizeof(tables); t++)
++            {
++                pos += snprintf(tables + pos, sizeof(tables) - pos, " [param %u @%u:", cmd_list->diag_bb_params[t], cmd_list->diag_bb_offsets[t]);
++                pos += vkd3d_diag_format_table(tables + pos, sizeof(tables) - pos, cmd_list->diag_bb_view,
++                        cmd_list->diag_bb_heap_size, cmd_list->diag_bb_offsets[t], t == 0 ? 10 : 4);
++                pos += snprintf(tables + pos, sizeof(tables) - pos, "]");
++            }
++            vkd3d_failure_log("backbuffer-draw", "  same tables at ExecuteCommandLists:%s", tables[0] ? tables : " none");
++        }
++
+         if (!cmd_list)
+         {
+             WARN("Unsupported command list type %p.\n", cmd_list);
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index f9cbeef..222a551 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -2908,6 +2908,7 @@ void d3d12_pipeline_state_dec_ref(struct d3d12_pipeline_state *state)
+         if (state->pipeline_type == VKD3D_PIPELINE_TYPE_GRAPHICS || state->pipeline_type == VKD3D_PIPELINE_TYPE_MESH_GRAPHICS)
+             d3d12_pipeline_state_free_cached_desc(&state->graphics.cached_desc);
+         rwlock_destroy(&state->lock);
++        vkd3d_free(state->diag_ps_code);
+         vkd3d_free(state);
+     }
+ }
+@@ -6575,6 +6576,28 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
+     TRACE("Created pipeline state %p.\n", object);
+     vkd3d_pso_retry_note_created(object->pipeline_cache_compat.state_desc_compat_hash);
+ 
++    if (vkd3d_diagnostics_enabled() && bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS && desc->rtv_formats.NumRenderTargets == 1 &&
++            desc->ps.BytecodeLength && desc->ps.BytecodeLength <= 1024 * 1024)
++    {
++        switch (desc->rtv_formats.RTFormats[0])
++        {
++            case DXGI_FORMAT_R10G10B10A2_UNORM:
++            case DXGI_FORMAT_R8G8B8A8_UNORM:
++            case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
++            case DXGI_FORMAT_B8G8R8A8_UNORM:
++            case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
++            case DXGI_FORMAT_R16G16B16A16_FLOAT:
++                if ((object->diag_ps_code = vkd3d_malloc(desc->ps.BytecodeLength)))
++                {
++                    memcpy(object->diag_ps_code, desc->ps.pShaderBytecode, desc->ps.BytecodeLength);
++                    object->diag_ps_size = desc->ps.BytecodeLength;
++                }
++                break;
++            default:
++                break;
++        }
++    }
++
+ #ifdef VKD3D_ENABLE_PROFILING
+     vkd3d_timestamp_profiler_register_pipeline_state(device->timestamp_profiler, object);
+ #endif
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 05e11dc..ff80f97 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -818,6 +818,7 @@ static HRESULT dxgi_vk_swap_chain_reallocate_user_buffers(struct dxgi_vk_swap_ch
+             goto err;
+ 
+         /* We need to hold a private reference to the resource, not a public one. */
++        chain->user.backbuffers[i]->flags |= VKD3D_RESOURCE_SWAPCHAIN_BACKBUFFER;
+         vkd3d_resource_incref((ID3D12Resource *)&chain->user.backbuffers[i]->ID3D12Resource_iface);
+         ID3D12Resource2_Release(&chain->user.backbuffers[i]->ID3D12Resource_iface);
+ 
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 3c09c91..3299f14 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -1111,6 +1111,8 @@ enum vkd3d_resource_flag
+     VKD3D_RESOURCE_INPUT_ATTACHMENT       = (1u << 11),
+     /* Reserved resource emulated with committed memory (no sparse binding); behaves as RESERVED at the API. */
+     VKD3D_RESOURCE_EMULATED_RESERVED      = (1u << 12),
++    /* Diagnostics: a DXGI swapchain backbuffer handed to the application. */
++    VKD3D_RESOURCE_SWAPCHAIN_BACKBUFFER   = (1u << 13)
+ };
+ 
+ #define VKD3D_INVALID_TILE_INDEX (~0u)
+@@ -2446,6 +2448,9 @@ struct d3d12_pipeline_state
+     struct d3d12_root_signature *root_signature;
+     struct d3d12_device *device;
+     bool root_signature_compat_hash_is_dxbc_derived;
++    /* Diagnostics: copy of the pixel shader bytecode for PSOs that could draw into a swapchain backbuffer. */
++    void *diag_ps_code;
++    size_t diag_ps_size;
+     bool pso_is_loaded_from_cached_blob;
+     bool pso_is_fully_dynamic;
+ 
+@@ -3554,6 +3559,13 @@ struct d3d12_command_list
+ 
+     const struct vkd3d_descriptor_metadata_view *cbv_srv_uav_descriptors_view;
+     const struct d3d12_descriptor_heap *diag_cbv_srv_uav_heap; /* diagnostics only */
++    /* Diagnostics: tables of the last backbuffer draw, re-read at ExecuteCommandLists. */
++    bool diag_bb_pending;
++    const struct vkd3d_descriptor_metadata_view *diag_bb_view;
++    uint32_t diag_bb_heap_size;
++    uint32_t diag_bb_count;
++    uint32_t diag_bb_params[4];
++    uint32_t diag_bb_offsets[4];
+     /* Diagnostics: last render targets bound with OMSetRenderTargets in this list (ring). */
+     const void *diag_rt_ring[6];
+     uint32_t diag_rt_w[6], diag_rt_h[6], diag_rt_fmt[6], diag_rt_draws[6];

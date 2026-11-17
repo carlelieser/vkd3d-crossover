@@ -1,0 +1,35 @@
+From cc8650dfee1b5da5c89ee0c30b50170945d365af Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:11:51 -0500
+Subject: [PATCH 03/28] feat: report fixed subgroup size 32 on Apple7+
+
+Problem: D3D12 WaveSize / required subgroup size (Shader Model 6.6) could not be honoured by vkd3d-proton.
+
+Root cause: MoltenVK reported minSubgroupSize 4 on Apple GPUs although Apple silicon (Apple7+) always runs SIMD-groups 32 wide.
+
+Fix: On Apple7+ report minSubgroupSize = maxSubgroupSize = 32.
+
+Verified by: vkd3d-proton device caps (Shader Model 6.6 exposed natively).
+
+Off switch: none
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index c309f5f..47d0800 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -2724,6 +2724,12 @@ void MVKPhysicalDevice::initMetalFeatures() {
+                 _metalFeatures.maxSubgroupSize = 32;
+                 // XXX Minimum thread execution width for Apple GPUs is unknown, but assumed to be 4. May be greater.
+                 _metalFeatures.minSubgroupSize = 4;
++                // Apple silicon (Apple7+, M1 and later) always executes SIMD-groups 32 wide
++                // (threadExecutionWidth == 32), so report a fixed subgroup size. This lets layers
++                // like vkd3d-proton honor D3D12 WaveSize / required subgroup size trivially.
++                if (supportsGPUFam(Apple7, _mtlDevice)) {
++                    _metalFeatures.minSubgroupSize = 32;
++                }
+                 break;
+             default:
+                 // Apply a sane default.

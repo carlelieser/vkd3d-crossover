@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:07:04 -0500
+Subject: [PATCH 07/20] feat: emulate implicit-LOD sampling in MSL compute
+ shaders
+
+Problem: SM 6.6 compute shaders that call Sample() (implicit LOD) need
+derivatives that Metal kernels do not have.
+
+Root cause: Metal cannot compute an implicit LOD in a kernel.
+
+Fix: for 2D, 3D and cube sampling without explicit LOD or gradients,
+pass gradient2d/3d/cube built from the emulated quad derivatives of the
+coordinate (projected when needed). A bias is folded into the gradients
+as exp2(bias), since Metal cannot combine bias() with gradient options.
+
+Verified by: vkd3d-proton compute derivative tests 823/823 (see NOTES.md
+Finding 7).
+
+Off switch: none.
+---
+ spirv_msl.cpp | 36 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 55901f5..bd551c1 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -13520,6 +13520,39 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool
+ 		}
+ 	}
+ 
++	// Compute shader derivatives: kernels cannot compute an implicit LOD, so synthesize explicit
++	// gradients from the emulated quad derivatives. A bias is folded into the gradients
++	// (Metal cannot combine bias() with gradient options).
++	if (is_compute_like_shader() && !args.base.is_fetch && !args.base.is_gather && !args.dref && !lod &&
++	    !grad_x && !grad_y && imgtype.image.sampled != 2 && imgtype.image.dim != DimBuffer && !imgtype.image.ms &&
++	    (imgtype.image.dim == Dim2D || imgtype.image.dim == Dim3D || imgtype.image.dim == DimCube) &&
++	    !(imgtype.image.dim == DimCube && imgtype.image.arrayed && msl_options.emulate_cube_array) &&
++	    builtin_subgroup_invocation_id_id)
++	{
++		add_spv_func_and_recompile(SPVFuncImplComputeDerivatives);
++		string swz = imgtype.image.dim == Dim2D ? ".xy" : ".xyz";
++		string gc = enclose_expression(to_unpacked_expression(args.coord)) + swz;
++		if (args.base.is_proj)
++		{
++			uint32_t w = imgtype.image.dim == Dim2D ? 2 : 3;
++			gc = join("(", gc, " / ", to_extract_component_expression(args.coord, w), ")");
++		}
++		string lane = to_expression(builtin_subgroup_invocation_id_id);
++		string dx = join("spvComputeDdxFine(", gc, ", ", lane, ")");
++		string dy = join("spvComputeDdyFine(", gc, ", ", lane, ")");
++		if (bias)
++		{
++			string scale = join("exp2(", to_unpacked_expression(bias), ")");
++			dx = join("(", dx, " * ", scale, ")");
++			dy = join("(", dy, " * ", scale, ")");
++			forward = forward && should_forward(bias);
++			bias = 0;
++		}
++		const char *grad_opt = imgtype.image.dim == Dim2D ? "gradient2d" :
++		                       imgtype.image.dim == Dim3D ? "gradient3d" : "gradientcube";
++		farg_str += join(", ", grad_opt, "(", dx, ", ", dy, ")");
++	}
++
+ 	// LOD Options
+ 	// Metal does not support LOD for 1D textures.
+ 	if (bias && (imgtype.image.dim != Dim1D || msl_options.texture_1D_as_2D))
+@@ -19940,6 +19973,9 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
+ 	case OpFwidth:
+ 	case OpFwidthFine:
+ 	case OpFwidthCoarse:
++	case OpImageSampleImplicitLod:
++	case OpImageSampleProjImplicitLod:
++	case OpImageSparseSampleImplicitLod:
+ 		// Metal has no derivatives in kernels; we emulate them with quad-group ops (compute derivatives).
+ 		if (self.is_compute_like_shader())
+ 			needs_subgroup_invocation_id = true;
+-- 
+2.51.0
+

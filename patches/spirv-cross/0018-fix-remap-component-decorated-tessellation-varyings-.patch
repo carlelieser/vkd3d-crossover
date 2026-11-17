@@ -1,0 +1,128 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:10:24 -0500
+Subject: [PATCH 18/20] fix: remap component-decorated tessellation varyings in
+ MSL
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: tessellation pipelines with Component-decorated varyings fail.
+
+Root cause: tessellation stages that MoltenVK links through device
+buffers (vertex-for-tessellation outputs, tess control inputs/outputs,
+tess evaluation inputs) cannot share one location between
+component-packed variables.
+
+Fix: give every (location, component) its own slot,
+location' = location + 256 * component, in the shader's decorations and
+in the adjacent-stage interface tables, identically in every such stage
+so producers and consumers agree. Component-0 varyings keep their
+numbers, so dynamically indexed IO ranges stay contiguous. Tess
+evaluation outputs link through user() names and are untouched.
+
+Verified by: vkd3d-proton tessellation tests, 4 improved, 0 regressions
+(see NOTES.md §17).
+
+Off switch: none.
+---
+ spirv_msl.cpp | 58 ++++++++++++++++++++++++++++++++++++++++++++++++++-
+ spirv_msl.hpp |  2 ++
+ 2 files changed, 59 insertions(+), 1 deletion(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 3657d12..28c0c2f 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -1671,10 +1671,64 @@ void CompilerMSL::emit_entry_point_declarations()
+ 		statement("threadgroup uint2 spvMeshSizes;");
+ }
+ 
++// Tessellation stages that MoltenVK links through device buffers (vertex-for-tessellation outputs, tess control
++// inputs/outputs, tess evaluation inputs) cannot share one location between component-packed variables.
++// Give every (location, component) its own slot, location' = location + 256 * component, in the shader's own
++// decorations and in the adjacent-stage interface tables. Component-0 varyings (and IO arrays spanning
++// consecutive locations) keep their numbers, so dynamically indexed ranges stay contiguous. Applied
++// identically in every such stage, so
++// producers and consumers still agree. Tess evaluation outputs (to fragment) use user() names and are untouched.
++void CompilerMSL::remap_tessellation_buffer_io_locations()
++{
++	bool remap_in = is_tesc_shader() || is_tese_shader();
++	bool remap_out = is_tesc_shader() || (get_execution_model() == ExecutionModelVertex && msl_options.vertex_for_tessellation);
++	if (!remap_in && !remap_out)
++		return;
++
++	ir.for_each_typed_id<SPIRVariable>([&](uint32_t, SPIRVariable &var) {
++		bool in = var.storage == StorageClassInput && remap_in;
++		bool out = var.storage == StorageClassOutput && remap_out;
++		if ((!in && !out) || is_builtin_variable(var) || !has_decoration(var.self, DecorationLocation))
++			return;
++		uint32_t locn = get_decoration(var.self, DecorationLocation);
++		uint32_t comp = get_decoration(var.self, DecorationComponent);
++		set_decoration(var.self, DecorationLocation, locn + 256 * comp);
++		unset_decoration(var.self, DecorationComponent);
++	});
++
++	auto remap_maps = [](std::map<LocationComponentPair, MSLShaderInterfaceVariable> &by_loc,
++	                     std::unordered_map<uint32_t, MSLShaderInterfaceVariable> &by_builtin) {
++		std::map<LocationComponentPair, MSLShaderInterfaceVariable> remapped;
++		for (auto &kv : by_loc)
++		{
++			auto v = kv.second;
++			v.location = kv.first.location + 256 * kv.first.component;
++			v.component = 0;
++			remapped[{ v.location, 0 }] = v;
++		}
++		by_loc.swap(remapped);
++		for (auto &kv : by_builtin)
++		{
++			kv.second.location = kv.second.location + 256 * kv.second.component;
++			kv.second.component = 0;
++		}
++	};
++	if (remap_in)
++		remap_maps(inputs_by_location, inputs_by_builtin);
++	if (remap_out)
++		remap_maps(outputs_by_location, outputs_by_builtin);
++}
++
+ string CompilerMSL::compile()
+ {
+ 	replace_illegal_entry_point_names();
+ 	ir.fixup_reserved_names();
++	if (!tess_buffer_io_remapped)
++	{
++		// compile() may run several passes; remap once.
++		tess_buffer_io_remapped = true;
++		remap_tessellation_buffer_io_locations();
++	}
+ 
+ 	// Do not deal with GLES-isms like precision, older extensions and such.
+ 	options.vulkan_semantics = true;
+@@ -4487,7 +4541,9 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
+ 				uint32_t component = get_decoration(var_id, DecorationComponent);
+ 				if (component != 0)
+ 				{
+-					if (is_tessellation_shader())
++					// Buffer-linked tessellation interfaces were remapped to component 0 (see
++					// remap_tessellation_buffer_io_locations); tess evaluation outputs link through user() names.
++					if (is_tessellation_shader() && !(is_tese_shader() && storage == StorageClassOutput))
+ 						SPIRV_CROSS_THROW("Component decoration is not supported in tessellation shaders.");
+ 					else if (pack_components)
+ 					{
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index 37a2c4b..72da783 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -1280,6 +1280,8 @@ protected:
+ 	Options msl_options;
+ 	std::set<SPVFuncImpl> spv_function_implementations;
+ 	// Must be ordered to ensure declarations are in a specific order.
++	void remap_tessellation_buffer_io_locations();
++	bool tess_buffer_io_remapped = false;
+ 	std::map<LocationComponentPair, MSLShaderInterfaceVariable> inputs_by_location;
+ 	std::unordered_map<uint32_t, MSLShaderInterfaceVariable> inputs_by_builtin;
+ 	std::map<LocationComponentPair, MSLShaderInterfaceVariable> outputs_by_location;
+-- 
+2.51.0
+

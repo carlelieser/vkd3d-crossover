@@ -1,0 +1,183 @@
+From 36e2ce2b29bc7f50d63158914171482ce0aa1d6e Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:01:49 -0500
+Subject: [PATCH 1/2] fix: expose a Windows-like display mode list
+
+Problem: Resident Evil Requiem rendered at 882x550 in borderless mode.
+
+Root cause: Wine's macOS display driver reports 1248 modes (312 distinct,
+mostly odd scaled sizes about 17px apart) and no 1920x1080. RE Engine
+stores an index into the mode list, and its default index lands on
+882x550.
+
+Fix: when GetDisplayModeList1 sees more than 64 distinct sizes, replace
+the list with what a Windows driver reports: the standard sizes that fit
+the panel, plus the native and desktop sizes, at the panel's refresh
+rates. Lists that already look like a real driver's are left untouched.
+
+Verified by: Requiem renders at desktop size (user confirmed). Games
+that saved a mode index under the old list keep it; clear
+FullScreenDisplayMode and the DisplayMode* entries from the game's
+config.ini once.
+
+Off switch: DXVK_DXGI_MODE_FILTER=0
+---
+ src/dxgi/dxgi_output.cpp | 112 ++++++++++++++++++++++++++++++++++-----
+ src/dxgi/dxgi_output.h   |   1 +
+ 2 files changed, 99 insertions(+), 14 deletions(-)
+
+diff --git a/src/dxgi/dxgi_output.cpp b/src/dxgi/dxgi_output.cpp
+index 8814f5c..6c79aec 100644
+--- a/src/dxgi/dxgi_output.cpp
++++ b/src/dxgi/dxgi_output.cpp
+@@ -261,6 +261,92 @@ namespace dxvk {
+   }
+ 
+ 
++  /**
++   * Wine's macOS driver exposes hundreds of synthetic scaled sizes
++   * (~17px apart, mostly odd aspect ratios) and lacks common ones like
++   * 1920x1080. Games that pick a default from the mode list (RE Engine
++   * stores an index into it) end up at absurd sizes such as 882x550.
++   * When the list looks like that, replace it with what a Windows
++   * driver reports: standard sizes that fit the panel, plus the native
++   * and desktop sizes, at the panel's refresh rates.
++   * DXVK_DXGI_MODE_FILTER=0 disables this.
++   */
++  void DxgiOutput::NormalizeModeList(std::vector<DXGI_MODE_DESC1>& modeList) const {
++    static const bool disabled = [] {
++      const char* e = std::getenv("DXVK_DXGI_MODE_FILTER");
++      return e && e[0] == '0';
++    }();
++
++    if (disabled || modeList.empty())
++      return;
++
++    std::vector<std::pair<UINT, UINT>> sizes;
++    for (const auto& m : modeList) {
++      std::pair<UINT, UINT> s = { m.Width, m.Height };
++      if (std::find(sizes.begin(), sizes.end(), s) == sizes.end())
++        sizes.push_back(s);
++    }
++
++    // A real Windows driver reports a few dozen sizes at most.
++    if (sizes.size() <= 64)
++      return;
++
++    auto native = *std::max_element(sizes.begin(), sizes.end(),
++      [] (const auto& a, const auto& b) { return uint64_t(a.first) * a.second < uint64_t(b.first) * b.second; });
++
++    std::vector<DXGI_MODE_DESC1> templates;
++    for (const auto& m : modeList) {
++      if (m.Width == native.first && m.Height == native.second)
++        templates.push_back(m);
++    }
++
++    static const std::pair<UINT, UINT> standard[] = {
++      {  640,  480 }, {  800,  600 }, { 1024,  768 }, { 1152,  864 },
++      { 1280,  720 }, { 1280,  768 }, { 1280,  800 }, { 1280,  960 },
++      { 1280, 1024 }, { 1360,  768 }, { 1366,  768 }, { 1440,  900 },
++      { 1600,  900 }, { 1600, 1200 }, { 1680, 1050 }, { 1920, 1080 },
++      { 1920, 1200 }, { 2048, 1152 }, { 2560, 1440 }, { 2560, 1600 },
++      { 2880, 1800 }, { 3200, 1800 }, { 3840, 2160 }, { 3840, 2400 },
++      { 5120, 2880 }, { 5120, 3200 }, { 6016, 3384 },
++    };
++
++    std::vector<std::pair<UINT, UINT>> keep;
++    for (const auto& s : standard) {
++      if (s.first <= native.first && s.second <= native.second)
++        keep.push_back(s);
++    }
++
++    keep.push_back(native);
++
++    wsi::WsiMode desktop = { };
++    if (wsi::getDesktopDisplayMode(m_monitor, &desktop)
++     && desktop.width <= native.first && desktop.height <= native.second)
++      keep.push_back({ desktop.width, desktop.height });
++
++    std::vector<DXGI_MODE_DESC1> result;
++    for (const auto& s : keep) {
++      for (const auto& t : templates) {
++        DXGI_MODE_DESC1 mode = t;
++        mode.Width  = s.first;
++        mode.Height = s.second;
++
++        bool dup = std::any_of(result.begin(), result.end(), [&] (const DXGI_MODE_DESC1& r) {
++          return r.Width == mode.Width && r.Height == mode.Height
++              && r.RefreshRate.Numerator   == mode.RefreshRate.Numerator
++              && r.RefreshRate.Denominator == mode.RefreshRate.Denominator
++              && r.ScanlineOrdering == mode.ScanlineOrdering
++              && r.Scaling == mode.Scaling;
++        });
++
++        if (!dup)
++          result.push_back(mode);
++      }
++    }
++
++    modeList = std::move(result);
++  }
++
++
+   HRESULT STDMETHODCALLTYPE DxgiOutput::GetDisplayModeList(
+           DXGI_FORMAT    EnumFormat,
+           UINT           Flags,
+@@ -310,30 +396,28 @@ namespace dxvk {
+     wsi::WsiMode devMode = { };
+     
+     uint32_t srcModeId = 0;
+-    uint32_t dstModeId = 0;
+-    
++
+     std::vector<DXGI_MODE_DESC1> modeList;
+-    
++
+     while (wsi::getDisplayMode(m_monitor, srcModeId++, &devMode)) {
+       // Only enumerate interlaced modes if requested.
+       if (devMode.interlaced && !(Flags & DXGI_ENUM_MODES_INTERLACED))
+         continue;
+-      
++
+       // Skip modes with incompatible formats
+       if (devMode.bitsPerPixel != GetMonitorFormatBpp(EnumFormat))
+         continue;
+-      
+-      if (pDesc != nullptr) {
+-        DXGI_MODE_DESC1 mode = ConvertDisplayMode(devMode);
+-        // Fix up the DXGI_FORMAT to match what we were enumerating.
+-        mode.Format = EnumFormat;
+ 
+-        modeList.push_back(mode);
+-      }
+-      
+-      dstModeId += 1;
++      DXGI_MODE_DESC1 mode = ConvertDisplayMode(devMode);
++      // Fix up the DXGI_FORMAT to match what we were enumerating.
++      mode.Format = EnumFormat;
++      modeList.push_back(mode);
+     }
+-    
++
++    NormalizeModeList(modeList);
++
++    uint32_t dstModeId = uint32_t(modeList.size());
++
+     // Sort display modes by width, height and refresh rate,
+     // in that order. Some games rely on correct ordering.
+     std::sort(modeList.begin(), modeList.end(),
+diff --git a/src/dxgi/dxgi_output.h b/src/dxgi/dxgi_output.h
+index dca52ea..f5787c0 100644
+--- a/src/dxgi/dxgi_output.h
++++ b/src/dxgi/dxgi_output.h
+@@ -70,6 +70,7 @@ namespace dxvk {
+             UINT                  Flags,
+             UINT*                 pNumModes,
+             DXGI_MODE_DESC1*      pDesc) final;
++    void NormalizeModeList(std::vector<DXGI_MODE_DESC1>& modeList) const;
+     
+     HRESULT STDMETHODCALLTYPE GetDisplaySurfaceData(
+             IDXGISurface*         pDestination) final;
+-- 
+2.51.0
+

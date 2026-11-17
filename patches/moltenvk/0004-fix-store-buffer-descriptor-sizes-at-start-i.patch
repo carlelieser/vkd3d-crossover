@@ -1,0 +1,35 @@
+From 12b482af5e8a1683deb3932ecab8ce4b7de773c0 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:11:52 -0500
+Subject: [PATCH 04/28] fix: store buffer descriptor sizes at start + i
+
+Problem: Buffer descriptors written past array element 0 had the wrong size (also broke OpArrayLength on descriptor arrays).
+
+Root cause: writeDescriptorSetGPUBuffer stored the per-descriptor size at index i instead of start + i (upstream bug).
+
+Fix: Write the size at start + i.
+
+Verified by: vkd3d-proton out-of-bounds buffer tests (with robust buffer access).
+
+Off switch: none
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.mm | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.mm
+index 3cdc623..2411937 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDescriptorSet.mm
+@@ -1055,10 +1055,10 @@ static void writeDescriptorSetGPUBuffer(
+ 				if (buf) {
+ 					enc.setBuffer(buf->getMTLBuffer(), buf->getMTLBufferOffset() + info->offset);
+ 					VkDeviceSize size = info->range == VK_WHOLE_SIZE ? buf->getByteCount() - info->offset : info->range;
+-					reinterpret_cast<uint32_t*>(base + auxOffsets[binding.auxIndex])[i] = static_cast<uint32_t>(size);
++					reinterpret_cast<uint32_t*>(base + auxOffsets[binding.auxIndex])[start + i] = static_cast<uint32_t>(size);
+ 				} else {
+ 					enc.setNullBuffer();
+-					reinterpret_cast<uint32_t*>(base + auxOffsets[binding.auxIndex])[i] = 0;
++					reinterpret_cast<uint32_t*>(base + auxOffsets[binding.auxIndex])[start + i] = 0;
+ 				}
+ 				break;
+ 			}

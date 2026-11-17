@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 12:00:00 +0000
+Subject: [PATCH 1/7] feat: add temporary VKD3D_RELAX_CAPS flag
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+TEMPORARY. Shipping only until the behaviour it gates is made unconditional
+and the remaining caps are reported honestly (OVERVIEW.md section 6, N§21).
+
+Problem: vkd3d-proton refuses to create a device on MoltenVK. Transform
+feedback, single-texel texel-buffer alignment, robustness2
+(robustBufferAccess2/robustImageAccess2) and nullDescriptor are hard
+requirements, and SM 6.2+ is not exposed without FP32 denorm controls.
+
+Root cause: Metal has no stream-out, no per-shader FP32 denorm mode and a
+linear-texture alignment above one texel. MoltenVK lacked robustness2 and
+null descriptors at the time (now implemented for real, N§23).
+
+Fix: VKD3D_RELAX_CAPS=1 turns these device-creation failures into warnings
+and exposes SM 6.2 without FP32 denorm controls (denorm hints in shaders are
+ignored). A later commit also gates TiledResourcesTier 2 on it.
+
+Verified by: offscreen D3D12 runs on MoltenVK with the flag (N Findings 2, 4);
+test_shader_sm62_denorm 35/36, the one failure being a denorm mode Metal
+cannot honour (N Finding 7).
+
+Off switch: unset VKD3D_RELAX_CAPS (off by default).
+---
+ libs/vkd3d/device.c | 28 ++++++++++++++++++++++++----
+ 1 file changed, 24 insertions(+), 4 deletions(-)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index b580de5..19223df 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -2447,6 +2447,14 @@ static bool vkd3d_supports_minimum_coopmat_caps(struct d3d12_device *device)
+     return true;
+ }
+ 
++/* Dev hack: VKD3D_RELAX_CAPS=1 turns selected hard device requirements into warnings,
++ * so we can map how far vkd3d-proton gets on incomplete drivers (e.g. MoltenVK). */
++static bool vkd3d_relax_caps(void)
++{
++    const char *v = getenv("VKD3D_RELAX_CAPS");
++    return v && *v && *v != '0';
++}
++
+ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+         const struct vkd3d_device_create_info *create_info,
+         struct vkd3d_physical_device_info *physical_device_info)
+@@ -2502,7 +2510,8 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+     if (!physical_device_info->xfb_properties.transformFeedbackQueries)
+     {
+         ERR("Lacking support for transform feedback.\n");
+-        return E_INVALIDARG;
++        if (!vkd3d_relax_caps()) return E_INVALIDARG;
++        WARN("VKD3D_RELAX_CAPS: continuing anyway.\n");
+     }
+ 
+     single_storage_texel =
+@@ -2517,7 +2526,8 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+     if (!single_storage_texel || !single_uniform_texel)
+     {
+         ERR("Lacking support for single texel alignment.\n");
+-        return E_INVALIDARG;
++        if (!vkd3d_relax_caps()) return E_INVALIDARG;
++        WARN("VKD3D_RELAX_CAPS: continuing anyway.\n");
+     }
+ 
+     /* Disable unused Vulkan features. The following features need to remain enabled
+@@ -2626,13 +2636,15 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+             !physical_device_info->robustness2_features.robustImageAccess2)
+     {
+         ERR("Robustness2 features not supported. This is required.\n");
+-        return E_INVALIDARG;
++        if (!vkd3d_relax_caps()) return E_INVALIDARG;
++        WARN("VKD3D_RELAX_CAPS: continuing anyway.\n");
+     }
+ 
+     if (!physical_device_info->robustness2_features.nullDescriptor)
+     {
+         ERR("Null descriptor in VK_EXT_robustness2 is not supported by this implementation. This is required for correct operation.\n");
+-        return E_INVALIDARG;
++        if (!vkd3d_relax_caps()) return E_INVALIDARG;
++        WARN("VKD3D_RELAX_CAPS: continuing anyway.\n");
+     }
+ 
+     if (vulkan_info->KHR_fragment_shading_rate)
+@@ -9836,6 +9848,14 @@ static void d3d12_device_caps_init_shader_model(struct d3d12_device *device)
+             }
+         }
+ 
++        /* VKD3D_RELAX_CAPS: Metal has no per-shader FP32 denorm control. Expose SM 6.2+ anyway and let
++         * denorm-mode hints in shaders be ignored (hardware default behavior applies). */
++        if (!denorm_behavior && vkd3d_relax_caps())
++        {
++            WARN("VKD3D_RELAX_CAPS: exposing SM 6.2 without FP32 denorm controls.\n");
++            denorm_behavior = true;
++        }
++
+         if (denorm_behavior)
+         {
+             device->d3d12_caps.max_shader_model = D3D_SHADER_MODEL_6_2;

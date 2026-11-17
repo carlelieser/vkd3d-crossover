@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 12:00:00 +0000
+Subject: [PATCH 4/7] fix: validate emulated reserved resources like tier 2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: test_create_reserved_resource crashed on an assert in the emulated
+tiling path for a non-2D texture (V4).
+
+Root cause: emulated reserved resources skipped the CreateReservedResource
+rules that the sparse path enforces, and looked like committed resources at
+the API.
+
+Fix: validate them like tier 2 (buffers ROW_MAJOR with no clear value;
+textures 64KB_UNDEFINED_SWIZZLE, 2D, single plane, no packed mips in arrays
+below tier 4) and flag them VKD3D_RESOURCE_EMULATED_RESERVED so
+GetHeapProperties fails as it does for real reserved resources.
+
+Verified by: test_create_reserved_resource 26/26 (N§23); sweep8 vs sweep6:
+0 regressions, this test the one improvement (N§25).
+
+Off switch: none.
+---
+ libs/vkd3d/resource.c      | 64 +++++++++++++++++++++++++++++++++++++-
+ libs/vkd3d/vkd3d_private.h |  4 ++-
+ 2 files changed, 66 insertions(+), 2 deletions(-)
+
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index 28389d9..046f673 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -2883,7 +2883,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_resource_GetHeapProperties(d3d12_resource
+         return S_OK;
+     }
+ 
+-    if (resource->flags & VKD3D_RESOURCE_RESERVED)
++    if (resource->flags & (VKD3D_RESOURCE_RESERVED | VKD3D_RESOURCE_EMULATED_RESERVED))
+     {
+         WARN("Cannot get heap properties for reserved resources.\n");
+         return E_INVALIDARG;
+@@ -4886,6 +4886,65 @@ fail:
+     return hr;
+ }
+ 
++/* CreateReservedResource rules for the reported tier (emulation path, where nothing Vulkan-side enforces them):
++ * buffers need ROW_MAJOR and no clear value; textures need 64KB_UNDEFINED_SWIZZLE, are 2D, single-plane, and
++ * below tier 4 an array may not have packed mips (mips smaller than a tile). */
++static HRESULT d3d12_resource_validate_emulated_reserved(struct d3d12_device *device,
++        const D3D12_RESOURCE_DESC1 *desc, const D3D12_CLEAR_VALUE *optimized_clear_value)
++{
++    static const struct { unsigned int byte_count, width, height; } tile_shapes[] =
++    {
++        { 1, 256, 256 }, { 2, 256, 128 }, { 4, 128, 128 }, { 8, 128, 64 }, { 16, 64, 64 },
++    };
++    const struct vkd3d_format *format;
++    unsigned int tile_w = 0, tile_h = 0, i;
++    unsigned int last_mip_w, last_mip_h;
++
++    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
++    {
++        if (desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR || optimized_clear_value)
++            return E_INVALIDARG;
++        return S_OK;
++    }
++
++    if (desc->Layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE)
++        return E_INVALIDARG;
++
++    /* Tier 3 is needed for 3D; 1D textures are never tiled. */
++    if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
++            !(desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
++              device->d3d12_caps.options.TiledResourcesTier >= D3D12_TILED_RESOURCES_TIER_3))
++        return E_INVALIDARG;
++
++    if (!(format = vkd3d_get_format(device, desc->Format, !!(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))))
++        return E_INVALIDARG;
++    if (vkd3d_popcount(format->vk_aspect_mask) != 1)
++        return E_INVALIDARG;
++
++    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc->DepthOrArraySize > 1 &&
++            device->d3d12_caps.options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_4)
++    {
++        for (i = 0; i < ARRAY_SIZE(tile_shapes); i++)
++        {
++            if (tile_shapes[i].byte_count == format->byte_count)
++            {
++                tile_w = tile_shapes[i].width * format->block_width;
++                tile_h = tile_shapes[i].height * format->block_height;
++            }
++        }
++        if (tile_w)
++        {
++            unsigned int levels = desc->MipLevels ? desc->MipLevels : max_miplevel_count(desc);
++            last_mip_w = max(1u, (unsigned int)(desc->Width >> (levels - 1)));
++            last_mip_h = max(1u, desc->Height >> (levels - 1));
++            if (last_mip_w < tile_w || last_mip_h < tile_h)
++                return E_INVALIDARG;
++        }
++    }
++
++    return S_OK;
++}
++
+ HRESULT d3d12_resource_create_reserved(struct d3d12_device *device,
+         const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES initial_state,
+         const D3D12_CLEAR_VALUE *optimized_clear_value,
+@@ -4901,10 +4960,13 @@ HRESULT d3d12_resource_create_reserved(struct d3d12_device *device,
+      * reserved resource itself; aliasing heap tiles between resources is not emulated. */
+     if (!device->device_info.features2.features.sparseBinding)
+     {
++        if (FAILED(hr = d3d12_resource_validate_emulated_reserved(device, desc, optimized_clear_value)))
++            return hr;
+         WARN("Emulating reserved resource with a committed resource (no sparse binding support).\n");
+         if (FAILED(hr = d3d12_resource_create_reserved_fallback(device, desc, initial_state,
+                 optimized_clear_value, num_castable_formats, castable_formats, resource)))
+             return hr;
++        (*resource)->flags |= VKD3D_RESOURCE_EMULATED_RESERVED;
+         return S_OK;
+     }
+ 
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index b0ebd55..a943373 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -1096,7 +1096,9 @@ enum vkd3d_resource_flag
+     VKD3D_RESOURCE_ZERO_INITIALIZED       = (1u << 8),
+     VKD3D_RESOURCE_RETAINED_GPU_REFERENCE = (1u << 9),
+     VKD3D_RESOURCE_COPY_QUEUE_COMPATIBLE  = (1u << 10),
+-    VKD3D_RESOURCE_INPUT_ATTACHMENT       = (1u << 11)
++    VKD3D_RESOURCE_INPUT_ATTACHMENT       = (1u << 11),
++    /* Reserved resource emulated with committed memory (no sparse binding); behaves as RESERVED at the API. */
++    VKD3D_RESOURCE_EMULATED_RESERVED      = (1u << 12),
+ };
+ 
+ #define VKD3D_INVALID_TILE_INDEX (~0u)

@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 12:00:00 +0000
+Subject: [PATCH 11/13] feat(dev): read back the final composite's images once
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Dev only, not for release builds.
+
+Problem: needed the actual contents of the image sampled by the final
+composite and of images written by the composite dispatch (N§29).
+
+Root cause: n/a (diagnostic).
+
+Fix: armed by the backbuffer-draw logger; right after the command list with
+that draw is submitted, the middle row of up to 4 images is copied to a
+readback buffer and summarised in the failure log ("gpu-readback"). Windows
+builds only, once per process.
+
+Verified by: Requiem: same texture, the scene itself was black (HDR max
+~0.001) under an opaque black UI fade, so the game was stuck in a transition
+(N§29).
+
+Off switch: needs VKD3D_DIAGNOSTICS=1 (through the backbuffer-draw logger).
+---
+ libs/vkd3d/command.c | 147 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 147 insertions(+)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index f0b821d..ac28d31 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -9301,6 +9301,107 @@ static bool d3d12_command_list_emit_predicated_command(struct d3d12_command_list
+     return true;
+ }
+ 
++/* Diagnostics: one-time GPU readback of the images involved in the final composite. Armed by the backbuffer-draw
++ * logger; performed right after the command list containing the draw is submitted. Windows builds only. */
++static struct d3d12_command_list *vkd3d_diag_rb_list;
++static const struct d3d12_resource *vkd3d_diag_rb_res[4];
++static uint32_t vkd3d_diag_rb_state[4];
++static const char *vkd3d_diag_rb_role[4];
++static unsigned int vkd3d_diag_rb_count;
++static bool vkd3d_diag_rb_busy;
++
++#ifdef _WIN32
++static void vkd3d_diag_readback(struct d3d12_command_queue *queue)
++{
++    ID3D12Device *dev = (ID3D12Device *)&queue->device->ID3D12Device_iface;
++    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_READBACK };
++    D3D12_RESOURCE_DESC bd = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 0, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, 0 };
++    ID3D12CommandAllocator *alloc = NULL; ID3D12GraphicsCommandList *cl = NULL; ID3D12Resource *buf = NULL; ID3D12Fence *fence = NULL;
++    uint32_t pitch[4], offs[4], total = 0, i;
++    HANDLE ev;
++    uint8_t *map;
++
++    for (i = 0; i < vkd3d_diag_rb_count; i++)
++    {
++        pitch[i] = ((uint32_t)vkd3d_diag_rb_res[i]->desc.Width * 8 + 255) & ~255u;
++        offs[i] = total;
++        total += pitch[i];
++    }
++    bd.Width = total;
++    if (FAILED(ID3D12Device_CreateCommittedResource(dev, &hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
++                &IID_ID3D12Resource, (void **)&buf)) ||
++            FAILED(ID3D12Device_CreateCommandAllocator(dev, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void **)&alloc)) ||
++            FAILED(ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL, &IID_ID3D12GraphicsCommandList, (void **)&cl)) ||
++            FAILED(ID3D12Device_CreateFence(dev, 0, 0, &IID_ID3D12Fence, (void **)&fence)))
++    {
++        vkd3d_failure_log("gpu-readback", "could not create readback objects");
++        goto done;
++    }
++    for (i = 0; i < vkd3d_diag_rb_count; i++)
++    {
++        ID3D12Resource *src = (ID3D12Resource *)&vkd3d_diag_rb_res[i]->ID3D12Resource_iface;
++        D3D12_TEXTURE_COPY_LOCATION d = {0}, sl = {0};
++        D3D12_RESOURCE_BARRIER b = {0};
++        uint32_t y = vkd3d_diag_rb_res[i]->desc.Height / 2;
++        D3D12_BOX box = { 0, y, 0, (UINT)vkd3d_diag_rb_res[i]->desc.Width, y + 1, 1 };
++
++        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b.Transition.pResource = src; b.Transition.Subresource = 0;
++        b.Transition.StateBefore = vkd3d_diag_rb_state[i]; b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
++        if (b.Transition.StateBefore != b.Transition.StateAfter)
++            ID3D12GraphicsCommandList_ResourceBarrier(cl, 1, &b);
++        d.pResource = buf; d.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++        d.PlacedFootprint.Offset = offs[i];
++        d.PlacedFootprint.Footprint.Format = vkd3d_diag_rb_res[i]->desc.Format;
++        d.PlacedFootprint.Footprint.Width = (UINT)vkd3d_diag_rb_res[i]->desc.Width;
++        d.PlacedFootprint.Footprint.Height = 1; d.PlacedFootprint.Footprint.Depth = 1;
++        d.PlacedFootprint.Footprint.RowPitch = pitch[i];
++        sl.pResource = src; sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; sl.SubresourceIndex = 0;
++        ID3D12GraphicsCommandList_CopyTextureRegion(cl, &d, 0, 0, 0, &sl, &box);
++        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE; b.Transition.StateAfter = vkd3d_diag_rb_state[i];
++        if (b.Transition.StateBefore != b.Transition.StateAfter)
++            ID3D12GraphicsCommandList_ResourceBarrier(cl, 1, &b);
++    }
++    ID3D12GraphicsCommandList_Close(cl);
++    vkd3d_diag_rb_busy = true;
++    ID3D12CommandQueue_ExecuteCommandLists((ID3D12CommandQueue *)&queue->ID3D12CommandQueue_iface, 1, (ID3D12CommandList **)&cl);
++    ID3D12CommandQueue_Signal((ID3D12CommandQueue *)&queue->ID3D12CommandQueue_iface, fence, 1);
++    vkd3d_diag_rb_busy = false;
++    ev = CreateEventA(NULL, FALSE, FALSE, NULL);
++    ID3D12Fence_SetEventOnCompletion(fence, 1, ev);
++    if (WaitForSingleObject(ev, 3000) != WAIT_OBJECT_0)
++    {
++        vkd3d_failure_log("gpu-readback", "timed out waiting for the copy");
++        CloseHandle(ev);
++        goto done;
++    }
++    CloseHandle(ev);
++    if (SUCCEEDED(ID3D12Resource_Map(buf, 0, NULL, (void **)&map)))
++    {
++        for (i = 0; i < vkd3d_diag_rb_count; i++)
++        {
++            const struct d3d12_resource *r = vkd3d_diag_rb_res[i];
++            uint32_t w = (uint32_t)r->desc.Width, bpp = r->desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4, x, nonzero = 0;
++            const uint8_t *row = map + offs[i];
++            for (x = 0; x < w; x++)
++            {
++                uint32_t v; memcpy(&v, row + x * bpp, 4);
++                if (v || (bpp == 8 && *(const uint32_t *)(row + x * bpp + 4))) nonzero++;
++            }
++            vkd3d_failure_log("gpu-readback", "%s %p %ux%u fmt %u (state %#x), middle row after the frame's commands: %u/%u texels nonzero; "
++                    "x=%u: %08x  x=%u: %08x  x=%u: %08x", vkd3d_diag_rb_role[i], (const void *)r, w, r->desc.Height, r->desc.Format,
++                    vkd3d_diag_rb_state[i], nonzero, w, w / 8, *(const uint32_t *)(row + (w / 8) * bpp), w / 2,
++                    *(const uint32_t *)(row + (w / 2) * bpp), 7 * w / 8, *(const uint32_t *)(row + (7 * w / 8) * bpp));
++        }
++        ID3D12Resource_Unmap(buf, 0, NULL);
++    }
++done:
++    if (fence) ID3D12Fence_Release(fence);
++    if (cl) ID3D12GraphicsCommandList_Release(cl);
++    if (alloc) ID3D12CommandAllocator_Release(alloc);
++    if (buf) ID3D12Resource_Release(buf);
++}
++#endif
++
+ static size_t vkd3d_diag_format_table(char *out, size_t size, const struct vkd3d_descriptor_metadata_view *views,
+         uint32_t heap_size, uint32_t offset, unsigned int count)
+ {
+@@ -9524,6 +9625,37 @@ static void d3d12_command_list_diag_backbuffer_draw(struct d3d12_command_list *l
+                 (t0->flags & VKD3D_RESOURCE_PLACED) ? "placed" : (t0->flags & VKD3D_RESOURCE_COMMITTED) ? "committed" : "other",
+                 (const void *)t0->heap, t0_off, t0->flags);
+ 
++        if (logged == 3 && !vkd3d_diag_rb_list)
++        {
++            unsigned int q2, n2 = list->diag_ev_count > 64 ? 64 : list->diag_ev_count;
++            vkd3d_diag_rb_count = 0;
++            vkd3d_diag_rb_res[vkd3d_diag_rb_count] = t0;
++            vkd3d_diag_rb_role[vkd3d_diag_rb_count] = "sampled by final draw";
++            vkd3d_diag_rb_state[vkd3d_diag_rb_count++] = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++            for (q2 = list->diag_ev_count - n2; q2 < list->diag_ev_count && vkd3d_diag_rb_count < 4; q2++)
++            {
++                const struct vkd3d_diag_event *e2 = &list->diag_ev[q2 % 64];
++                if (e2->kind == DIAG_EV_DISPATCH_RES && e2->sub == VKD3D_SHADER_DESCRIPTOR_TYPE_UAV && e2->res != t0)
++                {
++                    vkd3d_diag_rb_res[vkd3d_diag_rb_count] = e2->res;
++                    vkd3d_diag_rb_role[vkd3d_diag_rb_count] = "written by composite dispatch";
++                    vkd3d_diag_rb_state[vkd3d_diag_rb_count++] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++                }
++            }
++            /* Use the last state the application transitioned each image to in this list, if any. */
++            for (q2 = list->diag_ev_count - n2; q2 < list->diag_ev_count; q2++)
++            {
++                const struct vkd3d_diag_event *e2 = &list->diag_ev[q2 % 64];
++                unsigned int z;
++                if (e2->kind != DIAG_EV_BARRIER)
++                    continue;
++                for (z = 0; z < vkd3d_diag_rb_count; z++)
++                    if (e2->res == vkd3d_diag_rb_res[z])
++                        vkd3d_diag_rb_state[z] = e2->b;
++            }
++            vkd3d_diag_rb_list = list;
++        }
++
+         total = list->diag_ev_count;
+         start = total > 64 ? total - 64 : 0;
+         for (k = total; k > start; k--)
+@@ -24993,6 +25125,21 @@ VKD3D_METHODENTRY(void) d3d12_command_queue_ExecuteCommandLists(ID3D12CommandQue
+ #endif
+     sub.execute.timeline_cookie = timeline_cookie;
+     d3d12_command_queue_add_submission(command_queue, &sub);
++
++#ifdef _WIN32
++    if (vkd3d_diag_rb_list && vkd3d_diag_rb_list != (void *)1 && !vkd3d_diag_rb_busy)
++    {
++        for (i = 0; i < command_list_count; i++)
++        {
++            if (d3d12_command_list_from_iface(command_lists[i]) == vkd3d_diag_rb_list)
++            {
++                vkd3d_diag_rb_list = (void *)1; /* done, never again */
++                vkd3d_diag_readback(command_queue);
++                break;
++            }
++        }
++    }
++#endif
+ }
+ 
+ VKD3D_METHODENTRY(void) d3d12_command_queue_SetMarker(ID3D12CommandQueue *iface,

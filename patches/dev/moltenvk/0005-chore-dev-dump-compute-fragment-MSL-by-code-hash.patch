@@ -1,0 +1,66 @@
+From 01e08cb5a1349af08fbf971c9d55b3ee5384876a Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:12:14 -0500
+Subject: [PATCH 05/10] chore(dev): dump compute/fragment MSL by code hash
+
+Problem: Needed the MSL behind profiler and probe hashes.
+
+Root cause: Diagnostics only; no defect.
+
+Fix: MVK_PROFILE_SHADER_DIR=dir writes shader-{cs,fs}-<hash>.metal once per shader; unlike MVK_CONFIG_SHADER_DUMP_DIR the disk cache stays on.
+
+Verified by: Used in every shader investigation.
+
+Off switch: off by default; MVK_PROFILE_SHADER_DIR enables
+---
+ .../MoltenVK/GPUObjects/MVKShaderModule.mm     | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+index ceddb2c..31775b7 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+@@ -22,6 +22,7 @@
+ #include "MVKPipeline.h"
+ #include "MVKFoundation.h"
+ #include <sys/stat.h>
++#include <unistd.h>
+ 
+ using namespace std;
+ using namespace mvk;
+@@ -462,6 +463,20 @@ static void mvkLogAtomic64Use(SPIRVToMSLConversionConfiguration* pShaderConfig,
+ 	              stage, used.c_str(), dev ? "yes" : "no", tg ? "yes" : "no");
+ }
+ 
++// Profiling aid: with MVK_PROFILE_SHADER_DIR set, write each compute and fragment shader's MSL once, named by the same code hash
++// that the GPU profiler ([mvk-gpuprof] "CS <hash>") prints. Unlike MVK_CONFIG_SHADER_DUMP_DIR it keeps the disk cache on.
++static void mvkProfileDumpComputeMSL(const SPIRVToMSLConversionConfiguration* cfg, size_t codeHash, const std::string& msl) {
++	static const char* dir = getenv("MVK_PROFILE_SHADER_DIR");
++	bool cs = cfg->options.entryPointStage == spv::ExecutionModelGLCompute, fs = cfg->options.entryPointStage == spv::ExecutionModelFragment;
++	if ( !dir || !*dir || !(cs || fs) || msl.empty() ) { return; }
++	char path[PATH_MAX];
++	mkdir(dir, 0755);
++	snprintf(path, sizeof(path), "%s/shader-%s-%016zx.metal", dir, cs ? "cs" : "fs", codeHash);
++	if (access(path, F_OK) == 0) { return; }
++	FILE* f = fopen(path, "wb");
++	if (f) { fwrite(msl.data(), 1, msl.size(), f); fclose(f); }
++}
++
+ bool MVKShaderModule::convert(SPIRVToMSLConversionConfiguration* pShaderConfig,
+ 							  SPIRVToMSLConversionResult& conversionResult) {
+ 	MVKFrameStatTimer frameStatTimer(kMVKStatSPIRVToMSL);
+@@ -475,12 +490,13 @@ bool MVKShaderModule::convert(SPIRVToMSLConversionConfiguration* pShaderConfig,
+ 	if (useDiskCache && mvkDiskShaderCacheLoad(pShaderConfig, _spvConverter.getSPIRV(), conversionResult)) {
+ 		addPerformanceInterval(getPerformanceStats().shaderCompilation.shaderLibraryFromCache, startTime);
+ 		mvkLogAtomic64Use(pShaderConfig, conversionResult.msl);
++		mvkProfileDumpComputeMSL(pShaderConfig, _key.codeHash, conversionResult.msl);
+ 		return true;
+ 	}
+ 	std::string preCfgBytes = useDiskCache ? mvkDiskShaderCacheSerializeConfig(*pShaderConfig) : std::string();
+ 	bool wasConverted = _spvConverter.convert(*pShaderConfig, conversionResult, shouldLogCode, shouldLogCode, shouldLogEstimatedGLSL);
+ 	addPerformanceInterval(getPerformanceStats().shaderCompilation.spirvToMSL, startTime);
+-	if (wasConverted) { mvkLogAtomic64Use(pShaderConfig, conversionResult.msl); }
++	if (wasConverted) { mvkLogAtomic64Use(pShaderConfig, conversionResult.msl); mvkProfileDumpComputeMSL(pShaderConfig, _key.codeHash, conversionResult.msl); }
+ 	if (wasConverted && useDiskCache && !preCfgBytes.empty()) {
+ 		mvkDiskShaderCacheStore(preCfgBytes, _spvConverter.getSPIRV(), *pShaderConfig, conversionResult);
+ 	}

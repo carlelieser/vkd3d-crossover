@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:09:56 -0500
+Subject: [PATCH 17/20] feat: add MSL options to unpack 10:10:10:2 integer
+ vertex inputs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: pipelines with VK_FORMAT_A2B10G10R10_UINT_PACK32 or
+A2B10G10R10_SINT_PACK32 vertex attributes fail to create.
+
+Root cause: Metal has no 10:10:10:2 integer vertex format.
+
+Fix: new options vertex_input_1010102_uint_mask and
+vertex_input_1010102_sint_mask (bit per location). MoltenVK fetches such
+attributes as one MTLVertexFormatUInt; the shader declares the member as
+a scalar uint and unpacks it (sign-extending for SINT).
+
+Verified by: see NOTES.md §17.
+
+Off switch: none (masks default to 0).
+---
+ spirv_msl.cpp | 42 +++++++++++++++++++++++++++++++++++++++++-
+ spirv_msl.hpp |  5 +++++
+ 2 files changed, 46 insertions(+), 1 deletion(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 207a3d4..3657d12 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -2955,6 +2955,34 @@ void CompilerMSL::add_plain_variable_to_interface_block(StorageClass storage, co
+ 		}
+ 	}
+ 
++	// Packed 10:10:10:2 integer vertex attributes: declare the member as a scalar uint and unpack it.
++	int unpack_1010102 = 0;
++	if (storage == StorageClassInput && get_entry_point().model == ExecutionModelVertex &&
++	    has_decoration(var.self, DecorationLocation) && !is_builtin_variable(var) &&
++	    !has_decoration(var.self, DecorationComponent))
++	{
++		uint32_t locn = get_decoration(var.self, DecorationLocation);
++		if (locn < 32 && ((msl_options.vertex_input_1010102_uint_mask | msl_options.vertex_input_1010102_sint_mask) & (1u << locn)))
++		{
++			const SPIRType &cur = get<SPIRType>(type_id);
++			if (!is_array(cur) && !is_matrix(cur) && cur.width == 32)
++			{
++				unpack_1010102 = (msl_options.vertex_input_1010102_sint_mask & (1u << locn)) ? 2 : 1;
++				uint32_t new_id = ir.increase_bound_by(1);
++				auto &nt = set<SPIRType>(new_id, cur);
++				nt.basetype = SPIRType::UInt;
++				nt.op = OpTypeInt;
++				nt.vecsize = 1;
++				nt.columns = 1;
++				nt.self = new_id;
++				nt.parent_type = 0;
++				type_id = new_id;
++				retyped_input_type_id = new_id;
++				padded_input = true;
++			}
++		}
++	}
++
+ 	if (storage == StorageClassInput && pull_model_inputs.count(var.self))
+ 		ib_type.member_types.push_back(build_msl_interpolant_type(type_id, is_noperspective));
+ 	else
+@@ -2998,7 +3026,19 @@ void CompilerMSL::add_plain_variable_to_interface_block(StorageClass storage, co
+ 			uint32_t retype_ib_type_id = ib_type.self;
+ 			uint32_t retype_ib_mbr_idx = ib_mbr_idx;
+ 			entry_func.fixup_hooks_in.push_back([=, &var]() {
+-				if (!retype_cast.empty())
++				if (unpack_1010102)
++				{
++					const SPIRType &local_t = get_variable_data_type(var);
++					const char *bn = local_t.basetype == SPIRType::Float ? "float" : local_t.basetype == SPIRType::Int ? "int" : "uint";
++					string v = qual_var_name;
++					string unpacked = unpack_1010102 == 2 ?
++					    join("int4(int(", v, " << 22u) >> 22, int(", v, " << 12u) >> 22, int(", v, " << 2u) >> 22, int(", v, ") >> 30)") :
++					    join("uint4(", v, " & 0x3FFu, (", v, " >> 10u) & 0x3FFu, (", v, " >> 20u) & 0x3FFu, ", v, " >> 30u)");
++					uint32_t n = local_t.vecsize;
++					static const char *const swz[] = { "", ".x", ".xy", ".xyz", "" };
++					statement(to_name(var.self), " = ", n > 1 ? join(bn, n) : string(bn), "((", unpacked, ")", swz[n < 5 ? n : 4], ");");
++				}
++				else if (!retype_cast.empty())
+ 				{
+ 					// Widths are resolved at emit time: component padding may have widened the local variable.
+ 					const SPIRType &local_t = get_variable_data_type(var);
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index 7cdf8c3..37a2c4b 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -385,6 +385,11 @@ public:
+ 		// Metal), the [[stage_in]] member takes the previous stage's type and is bit-cast to the shader's type.
+ 		uint8_t fragment_input_basetypes[32] = {};
+ 
++		// Vertex inputs (by location bit) fetched as one packed 32-bit word because Metal has no
++		// 10:10:10:2 integer vertex format (VK_FORMAT_A2B10G10R10_UINT/SINT_PACK32). The shader unpacks them.
++		uint32_t vertex_input_1010102_uint_mask = 0;
++		uint32_t vertex_input_1010102_sint_mask = 0;
++
+ 		// Specifies whether the iOS target version supports the [[base_vertex]] and [[base_instance]] attributes.
+ 		bool ios_support_base_vertex_instance = false;
+ 
+-- 
+2.51.0
+

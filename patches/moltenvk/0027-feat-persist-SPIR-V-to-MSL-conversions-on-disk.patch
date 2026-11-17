@@ -1,0 +1,198 @@
+From e9716da4986460fa95b8b81f13bd1377473df6a8 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:12:10 -0500
+Subject: [PATCH 27/28] feat: persist SPIR-V to MSL conversions on disk
+
+Problem: ~9 minutes of CPU per PRAGMATA SKETCHBOOK launch converting shaders.
+
+Root cause: MoltenVK re-ran SPIRV-Cross for every shader on every launch.
+
+Fix: Cache conversion results in ~/Library/Caches/MoltenVK/msl, keyed by the SPIR-V, the full pre-conversion configuration (verified byte for byte on load) and the identity of the MoltenVK binary. Bypassed when shader logging or MVK_CONFIG_SHADER_DUMP_DIR is active.
+
+Verified by: Warm launch: 1,476 conversions instead of ~29,000.
+
+Off switch: MVK_CONFIG_DISK_SHADER_CACHE=0
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm   | 133 ++++++++++++++++++
+ .../MoltenVK/GPUObjects/MVKShaderModule.mm    |  18 +++
+ 2 files changed, 151 insertions(+)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index ece3392..fd6fd0d 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -3573,3 +3573,136 @@ void mvkValidateCeralArchiveDefinitions() {
+ 	missingBytes += mvkValidateCerealArchiveSize<MVKCompressor<std::string>>(20);				// Contains collection
+ 	assert(missingBytes == 0 && "Cereal Archive definitions incomplete. See previous logged errors.");
+ }
++
++
++#pragma mark -
++#pragma mark Persistent SPIR-V -> MSL disk cache
++
++// MoltenVK otherwise re-runs SPIRV-Cross for every shader on every launch, which for large D3D12 titles
++// translated through vkd3d-proton costs minutes of CPU time and causes hitches. Results are cached on disk,
++// keyed by the SPIR-V, the full pre-conversion configuration (verified byte for byte on load) and the identity
++// of this MoltenVK binary, so any rebuild of MoltenVK/SPIRV-Cross invalidates the cache.
++// Disable with MVK_CONFIG_DISK_SHADER_CACHE=0. Location: ~/Library/Caches/MoltenVK/msl/.
++
++#include <dlfcn.h>
++#include <fstream>
++
++static uint64_t mvkFNV1a(const void* data, size_t size, uint64_t h = 1469598103934665603ull) {
++	const uint8_t* p = (const uint8_t*)data;
++	for (size_t i = 0; i < size; i++) { h ^= p[i]; h *= 1099511628211ull; }
++	return h;
++}
++
++static bool mvkDiskShaderCacheEnabled() {
++	static int enabled = -1;
++	if (enabled < 0) {
++		const char* e = getenv("MVK_CONFIG_DISK_SHADER_CACHE");
++		enabled = !(e && e[0] == '0');
++	}
++	return enabled;
++}
++
++static const std::string& mvkDiskShaderCacheDir() {
++	static std::string dir;
++	static std::once_flag once;
++	std::call_once(once, []() {
++		const char* home = getenv("HOME");
++		if (!home || !*home) { return; }
++		std::string base = std::string(home) + "/Library/Caches/MoltenVK";
++		mkdir(base.c_str(), 0755);
++		dir = base + "/msl";
++		mkdir(dir.c_str(), 0755);
++	});
++	return dir;
++}
++
++// Identity of this MoltenVK binary (size + mtime of the dylib containing this code).
++static uint64_t mvkDiskShaderCacheBuildId() {
++	static uint64_t buildId = 0;
++	static std::once_flag once;
++	std::call_once(once, []() {
++		Dl_info info;
++		struct stat st;
++		if (dladdr((const void*)&mvkDiskShaderCacheBuildId, &info) && info.dli_fname && stat(info.dli_fname, &st) == 0) {
++			uint64_t v[3] = { (uint64_t)st.st_size, (uint64_t)st.st_mtimespec.tv_sec, (uint64_t)st.st_mtimespec.tv_nsec };
++			buildId = mvkFNV1a(v, sizeof(v));
++		}
++	});
++	return buildId;
++}
++
++static std::string mvkSerializeShaderConfig(const SPIRVToMSLConversionConfiguration& cfg) {
++	std::ostringstream os;
++	{
++		cereal::BinaryOutputArchive ar(os);
++		ar(const_cast<SPIRVToMSLConversionConfiguration&>(cfg));
++	}
++	return os.str();
++}
++
++static std::string mvkDiskShaderCachePath(const std::string& cfgBytes, const std::vector<uint32_t>& spirv) {
++	const std::string& dir = mvkDiskShaderCacheDir();
++	if (dir.empty()) { return std::string(); }
++	uint64_t h = mvkFNV1a(spirv.data(), spirv.size() * sizeof(uint32_t));
++	h = mvkFNV1a(cfgBytes.data(), cfgBytes.size(), h);
++	uint64_t b = mvkDiskShaderCacheBuildId();
++	h = mvkFNV1a(&b, sizeof(b), h);
++	char name[40];
++	snprintf(name, sizeof(name), "/%016llx.mslc", (unsigned long long)h);
++	return dir + name;
++}
++
++bool mvkDiskShaderCacheLoad(SPIRVToMSLConversionConfiguration* pShaderConfig, const std::vector<uint32_t>& spirv,
++							SPIRVToMSLConversionResult& conversionResult) {
++	if ( !mvkDiskShaderCacheEnabled() || !mvkDiskShaderCacheBuildId() ) { return false; }
++	std::string cfgBytes = mvkSerializeShaderConfig(*pShaderConfig);
++	std::string path = mvkDiskShaderCachePath(cfgBytes, spirv);
++	if (path.empty()) { return false; }
++	std::ifstream in(path, std::ios::binary);
++	if ( !in ) { return false; }
++	try {
++		cereal::BinaryInputArchive ar(in);
++		std::string storedCfgBytes;
++		SPIRVToMSLConversionConfiguration convertedCfg;
++		SPIRVToMSLConversionResult result;
++		ar(storedCfgBytes);
++		if (storedCfgBytes != cfgBytes) { return false; }		// hash collision or stale entry
++		ar(convertedCfg, result.resultInfo, result.msl);
++		pShaderConfig->alignWith(convertedCfg);			// restore the "used by shader" outputs of the conversion
++		conversionResult = std::move(result);
++		return true;
++	} catch (...) {
++		return false;
++	}
++}
++
++void mvkDiskShaderCacheStore(const std::string& preConversionCfgBytes, const std::vector<uint32_t>& spirv,
++							 const SPIRVToMSLConversionConfiguration& convertedCfg,
++							 const SPIRVToMSLConversionResult& conversionResult) {
++	if ( !mvkDiskShaderCacheEnabled() || !mvkDiskShaderCacheBuildId() ) { return; }
++	std::string path = mvkDiskShaderCachePath(preConversionCfgBytes, spirv);
++	if (path.empty()) { return; }
++	char tmp[64];
++	snprintf(tmp, sizeof(tmp), ".tmp.%d.%p", getpid(), (void*)&conversionResult);
++	std::string tmpPath = path + tmp;
++	{
++		std::ofstream out(tmpPath, std::ios::binary | std::ios::trunc);
++		if ( !out ) { return; }
++		try {
++			cereal::BinaryOutputArchive ar(out);
++			ar(const_cast<std::string&>(preConversionCfgBytes),
++			   const_cast<SPIRVToMSLConversionConfiguration&>(convertedCfg),
++			   const_cast<SPIRVToMSLConversionResultInfo&>(conversionResult.resultInfo),
++			   const_cast<std::string&>(conversionResult.msl));
++		} catch (...) {
++			out.close();
++			unlink(tmpPath.c_str());
++			return;
++		}
++	}
++	rename(tmpPath.c_str(), path.c_str());
++}
++
++std::string mvkDiskShaderCacheSerializeConfig(const SPIRVToMSLConversionConfiguration& cfg) {
++	return mvkDiskShaderCacheEnabled() ? mvkSerializeShaderConfig(cfg) : std::string();
++}
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+index 3aa44a4..fdb7ac1 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+@@ -415,6 +415,14 @@ MVKMTLFunction MVKShaderModule::getMTLFunction(SPIRVToMSLConversionConfiguration
+ 	return mvkLib ? mvkLib->getMTLFunction(pSpecializationInfo, pShaderFeedback, this) : MVKMTLFunctionNull;
+ }
+ 
++// Persistent SPIR-V -> MSL disk cache (implemented in MVKPipeline.mm, next to the config serializers).
++bool mvkDiskShaderCacheLoad(SPIRVToMSLConversionConfiguration* pShaderConfig, const std::vector<uint32_t>& spirv,
++							SPIRVToMSLConversionResult& conversionResult);
++void mvkDiskShaderCacheStore(const std::string& preConversionCfgBytes, const std::vector<uint32_t>& spirv,
++							 const SPIRVToMSLConversionConfiguration& convertedCfg,
++							 const SPIRVToMSLConversionResult& conversionResult);
++std::string mvkDiskShaderCacheSerializeConfig(const SPIRVToMSLConversionConfiguration& cfg);
++
+ bool MVKShaderModule::convert(SPIRVToMSLConversionConfiguration* pShaderConfig,
+ 							  SPIRVToMSLConversionResult& conversionResult) {
+ 	const auto& mvkCfg = getMVKConfig();
+@@ -422,8 +430,18 @@ bool MVKShaderModule::convert(SPIRVToMSLConversionConfiguration* pShaderConfig,
+ 	bool shouldLogEstimatedGLSL = shouldLogCode && mvkCfg.shaderLogEstimatedGLSL;
+ 
+ 	uint64_t startTime = getPerformanceTimestamp();
++	const char* dumpDirCheck = getMVKConfig().shaderDumpDir;
++	bool useDiskCache = !shouldLogCode && !(dumpDirCheck && *dumpDirCheck);
++	if (useDiskCache && mvkDiskShaderCacheLoad(pShaderConfig, _spvConverter.getSPIRV(), conversionResult)) {
++		addPerformanceInterval(getPerformanceStats().shaderCompilation.shaderLibraryFromCache, startTime);
++		return true;
++	}
++	std::string preCfgBytes = useDiskCache ? mvkDiskShaderCacheSerializeConfig(*pShaderConfig) : std::string();
+ 	bool wasConverted = _spvConverter.convert(*pShaderConfig, conversionResult, shouldLogCode, shouldLogCode, shouldLogEstimatedGLSL);
+ 	addPerformanceInterval(getPerformanceStats().shaderCompilation.spirvToMSL, startTime);
++	if (wasConverted && useDiskCache && !preCfgBytes.empty()) {
++		mvkDiskShaderCacheStore(preCfgBytes, _spvConverter.getSPIRV(), *pShaderConfig, conversionResult);
++	}
+ 
+ 	const char* dumpDir = getMVKConfig().shaderDumpDir;
+ 	if (dumpDir && *dumpDir) {

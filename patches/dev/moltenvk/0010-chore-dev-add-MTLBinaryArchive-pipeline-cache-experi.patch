@@ -1,0 +1,367 @@
+From bbbdbca3e4d9db4cf55b83c5f314a8f6d1334808 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:12:18 -0500
+Subject: [PATCH 10/10] chore(dev): add MTLBinaryArchive pipeline cache
+ experiment
+
+Problem: Compile hitches were attributed to Metal's implicit cache not being written for Wine processes.
+
+Root cause: That premise was wrong: Metal's cache works under Wine (DARWIN_USER_CACHE_DIR/com.codeweavers.CrossOver.wineloader/com.apple.metal).
+
+Fix: Utility/MVKBinaryArchive.h: per-program archive segments in ~/Library/Caches/MoltenVK/archives; render/compute/mesh pipelines and attachment variants try a fail-on-miss lookup first. Kept as an experiment only; candidate for removal.
+
+Verified by: Deadlocked PRAGMATA SKETCHBOOK with a periodic save, MDB_MAP_FULL on large segments, and a hang loading a 21 MB segment; therefore off.
+
+Off switch: off by default; MVK_BINARY_ARCHIVE=1 enables
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm  |   7 +
+ MoltenVK/MoltenVK/Utility/MVKBinaryArchive.h | 294 +++++++++++++++++++
+ 2 files changed, 301 insertions(+)
+ create mode 100644 MoltenVK/MoltenVK/Utility/MVKBinaryArchive.h
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index d04440a..77a6f38 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include "../Utility/MVKDeferredPSO.h"
++#include "../Utility/MVKBinaryArchive.h"
+ #include "../Utility/MVKFrameStats.h"
+ #include "MVKPipeline.h"
+ #include "MVKCommandBuffer.h"
+@@ -1091,6 +1092,7 @@ id<MTLRenderPipelineState> MVKGraphicsPipeline::getPipelineStateForAttachments(c
+ 		// Compile directly (silently): a shader that writes depth / stencil ref cannot drop those formats,
+ 		// so on failure retry keeping the pipeline's own depth/stencil formats.
+ 		NSError* err = nil;
++		variant = MVKBinaryArchiveCache::get(getMTLDevice()).render(desc);	// retained; nil on an archive miss
+ 		if ( !variant ) { variant = [getMTLDevice() newRenderPipelineStateWithDescriptor: desc error: &err]; }	// retained
+ 		if ( !variant && (depth != _plDepthFormat || stencil != _plStencilFormat) ) {
+ 			desc.depthAttachmentPixelFormat = depth ? depth : _plDepthFormat;
+@@ -3460,6 +3462,7 @@ MVKPipelineCache::~MVKPipelineCache() {
+ 
+ id<MTLRenderPipelineState> MVKRenderPipelineCompiler::newMTLRenderPipelineState(MTLRenderPipelineDescriptor* mtlRPLDesc) {
+ 	MVKFrameStatTimer frameStatTimer(kMVKStatRenderPSO);
++	if (id<MTLRenderPipelineState> cached = MVKBinaryArchiveCache::get(getMTLDevice()).render(mtlRPLDesc)) { return cached; }
+ 	unique_lock<mutex> lock(_completionLock);
+ 
+ 	compile(lock, ^{
+@@ -3477,6 +3480,9 @@ id<MTLRenderPipelineState> MVKRenderPipelineCompiler::newMTLRenderPipelineState(
+ }
+ 
+ id<MTLRenderPipelineState> MVKRenderPipelineCompiler::newMTLMeshRenderPipelineState(id mtlMeshRPLDesc) {
++	if (@available(macOS 14.0, iOS 17.0, tvOS 17.0, *)) {
++		if (id<MTLRenderPipelineState> cached = MVKBinaryArchiveCache::get(getMTLDevice()).mesh(mtlMeshRPLDesc)) { return cached; }
++	}
+ 	if (@available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
+ 		unique_lock<mutex> lock(_completionLock);
+ 
+@@ -3516,6 +3522,7 @@ MVKRenderPipelineCompiler::~MVKRenderPipelineCompiler() {
+ 
+ id<MTLComputePipelineState> MVKComputePipelineCompiler::newMTLComputePipelineState(MTLComputePipelineDescriptor* plDesc) {
+ 	MVKFrameStatTimer frameStatTimer(kMVKStatComputePSO);
++	if (id<MTLComputePipelineState> cached = MVKBinaryArchiveCache::get(getMTLDevice()).compute(plDesc)) { return cached; }
+ 	unique_lock<mutex> lock(_completionLock);
+ 
+ 	compile(lock, ^{
+diff --git a/MoltenVK/MoltenVK/Utility/MVKBinaryArchive.h b/MoltenVK/MoltenVK/Utility/MVKBinaryArchive.h
+new file mode 100644
+index 0000000..d35ec5d
+--- /dev/null
++++ b/MoltenVK/MoltenVK/Utility/MVKBinaryArchive.h
+@@ -0,0 +1,294 @@
++/*
++ * MVKBinaryArchive.h — persistent Metal pipeline cache (MTLBinaryArchive) for MoltenVK under Wine.
++ *
++ * Metal's implicit shader cache is not written by Wine processes, so every launch recompiled every pipeline and the game
++ * stalled whenever it needed a pipeline compiled now (hundreds of ms each). This keeps a set of archive segments per
++ * program in ~/Library/Caches/MoltenVK/archives/<program>-<gpu>.<n>.metalarchive and searches all of them.
++ *
++ * - Lookup: fail-on-miss pipeline creation against all segments. On a miss the descriptor's functions are compiled into
++ *   the current (in-memory) segment, then the pipeline is created normally and finds them there.
++ * - Saving: once a minute (or after 250 additions, since Metal cannot serialize very large archives), the current segment is retired and replaced by a fresh one;
++ *   a background thread writes the retired one to disk once its in-flight additions have finished. No lock is ever held
++ *   across a Metal call and pipeline creation never waits on a save. (Earlier versions saved under a lock, which froze
++ *   Pragmata mid-cutscene, and then only at exit, which Pragmata's shutdown never reaches.)
++ * - Also a best-effort save at exit (MVK_BINARY_ARCHIVE_SAVE_SEC overrides the interval, for testing).
++ * - Old/unloadable segments are skipped and deleted; at most kMaxSegments are kept (oldest dropped).
++ * STATUS: experimental, OFF by default (MVK_BINARY_ARCHIVE=1 enables). The premise turned out wrong — Metal's implicit
++ * cache IS written for Wine processes, under DARWIN_USER_CACHE_DIR/com.codeweavers.CrossOver.wineloader/com.apple.metal —
++ * and on macOS 27 Metal fails to serialize large archives (MDB_MAP_FULL) and hung indefinitely loading a 21 MB archive
++ * it had written, even in a native test program.
++ */
++#pragma once
++
++#import <Metal/Metal.h>
++#include "MVKBaseObject.h"
++#include <mutex>
++#include <atomic>
++#include <memory>
++#include <string>
++#include <vector>
++#include <algorithm>
++#include <thread>
++#include <chrono>
++#include <stdlib.h>
++#include <stdio.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <dirent.h>
++#include <string.h>
++
++class MVKBinaryArchiveCache {
++	struct Segment {
++		id<MTLBinaryArchive> archive = nil;
++		std::atomic<int> inflight{0};
++		~Segment() { [archive release]; }
++	};
++
++public:
++	static MVKBinaryArchiveCache& get(id<MTLDevice> dev) {
++		static MVKBinaryArchiveCache* c = new MVKBinaryArchiveCache(dev);
++		return *c;
++	}
++
++	id<MTLRenderPipelineState> render(MTLRenderPipelineDescriptor* d) {
++		if ( !_enabled ) { return nil; }
++		NSArray* all = nil; std::shared_ptr<Segment> cur = snapshot(&all);
++		if ( !cur ) { return nil; }
++		d.binaryArchives = all;
++		NSError* err = nil;
++		id<MTLRenderPipelineState> ps = [_dev newRenderPipelineStateWithDescriptor: d options: MTLPipelineOptionFailOnBinaryArchiveMiss
++																		 reflection: nil error: &err];
++		[all release];
++		if (ps) { _hits++; return ps; }
++		bool ok;
++		{ Inflight g(cur); ok = [cur->archive addRenderPipelineFunctionsWithDescriptor: d error: &err]; }
++		if ( !ok ) { noteFailure("render", err); d.binaryArchives = nil; return nil; }
++		d.binaryArchives = @[cur->archive];
++		noteAdded();
++		return nil;
++	}
++
++	id<MTLComputePipelineState> compute(MTLComputePipelineDescriptor* d) {
++		if ( !_enabled ) { return nil; }
++		NSArray* all = nil; std::shared_ptr<Segment> cur = snapshot(&all);
++		if ( !cur ) { return nil; }
++		d.binaryArchives = all;
++		NSError* err = nil;
++		id<MTLComputePipelineState> ps = [_dev newComputePipelineStateWithDescriptor: d options: MTLPipelineOptionFailOnBinaryArchiveMiss
++																		  reflection: nil error: &err];
++		[all release];
++		if (ps) { _hits++; return ps; }
++		bool ok;
++		{ Inflight g(cur); ok = [cur->archive addComputePipelineFunctionsWithDescriptor: d error: &err]; }
++		if ( !ok ) { noteFailure("compute", err); d.binaryArchives = nil; return nil; }
++		d.binaryArchives = @[cur->archive];
++		noteAdded();
++		return nil;
++	}
++
++	id<MTLRenderPipelineState> mesh(id meshDesc) API_AVAILABLE(macos(14.0), ios(17.0)) {
++		if ( !_enabled ) { return nil; }
++		MTLMeshRenderPipelineDescriptor* d = (MTLMeshRenderPipelineDescriptor*)meshDesc;
++		NSArray* all = nil; std::shared_ptr<Segment> cur = snapshot(&all);
++		if ( !cur ) { return nil; }
++		d.binaryArchives = all;
++		NSError* err = nil;
++		id<MTLRenderPipelineState> ps = [_dev newRenderPipelineStateWithMeshDescriptor: d options: MTLPipelineOptionFailOnBinaryArchiveMiss
++																			reflection: nil error: &err];
++		[all release];
++		if (ps) { _hits++; return ps; }
++		bool ok;
++		{ Inflight g(cur); ok = [cur->archive addMeshRenderPipelineFunctionsWithDescriptor: d error: &err]; }
++		if ( !ok ) { noteFailure("mesh", err); d.binaryArchives = nil; return nil; }
++		d.binaryArchives = @[cur->archive];
++		noteAdded();
++		return nil;
++	}
++
++private:
++	static constexpr int kMaxSegments = 128;
++	static constexpr uint32_t kMaxPipelinesPerSegment = 250;	// Metal's serializer fails (MDB_MAP_FULL) on very large archives
++	static constexpr int kSaveIntervalSec = 60;
++
++	struct Inflight {
++		std::shared_ptr<Segment> s;
++		Inflight(std::shared_ptr<Segment> seg) : s(std::move(seg)) { s->inflight++; }
++		~Inflight() { s->inflight--; }
++	};
++
++	MVKBinaryArchiveCache(id<MTLDevice> dev) : _dev([dev retain]) {
++		const char* e = getenv("MVK_BINARY_ARCHIVE");
++		if ( !(e && e[0] == '1') ) { return; }		// experimental, off by default (see header)
++		if (@available(macOS 11.0, iOS 14.0, *)) {} else { return; }
++		const char* home = getenv("HOME");
++		if ( !home || !*home ) { return; }
++		_dir = std::string(home) + "/Library/Caches/MoltenVK";
++		mkdir(_dir.c_str(), 0755);
++		_dir += "/archives";
++		mkdir(_dir.c_str(), 0755);
++		std::string prog = getprogname() ? getprogname() : "app";
++		for (auto& ch : prog) { if (ch == '/' || ch == '\\' || ch == ' ') { ch = '_'; } }
++		char base[256];
++		snprintf(base, sizeof(base), "%s-%llx.", prog.c_str(), (unsigned long long)dev.registryID);
++		_base = base;
++
++		cleanStaleTempFiles();
++		loadSegments();
++		_current = newSegment();
++		_enabled = _current != nullptr;
++		_lastSave = time(nullptr);
++		if (const char* si = getenv("MVK_BINARY_ARCHIVE_SAVE_SEC")) { _saveInterval = std::max(1, atoi(si)); }
++		if (_enabled) { s_instance = this; atexit([]() { if (s_instance) { s_instance->saveAtExit(); } }); }
++	}
++
++	// Best effort: some programs' shutdown never runs atexit handlers; the periodic saves cover those.
++	void saveAtExit() {
++		if (_pending.load() == 0 || _saving.exchange(true)) { return; }
++		std::shared_ptr<Segment> cur;
++		{ std::lock_guard<std::mutex> g(_lock); cur = _current; }
++		if (cur && cur->inflight.load() == 0) { saveSegment(cur, _pending.exchange(0)); }
++	}
++
++	std::shared_ptr<Segment> newSegment() {
++		@autoreleasepool {
++			MTLBinaryArchiveDescriptor* ad = [[MTLBinaryArchiveDescriptor new] autorelease];
++			NSError* err = nil;
++			id<MTLBinaryArchive> a = [_dev newBinaryArchiveWithDescriptor: ad error: &err];
++			if ( !a ) { return nullptr; }
++			auto s = std::make_shared<Segment>();
++			s->archive = a;
++			return s;
++		}
++	}
++
++	// Returns the current segment and (retained) an array of every archive to search.
++	std::shared_ptr<Segment> snapshot(NSArray** all) {
++		std::lock_guard<std::mutex> g(_lock);		// guards pointers only; never held across Metal calls
++		if ( !_current ) { return nullptr; }
++		NSMutableArray* a = [[NSMutableArray alloc] initWithCapacity: _loaded.size() + 1];
++		[a addObject: _current->archive];
++		for (auto& s : _loaded) { [a addObject: s->archive]; }
++		*all = a;
++		return _current;
++	}
++
++	void noteFailure(const char* kind, NSError* err) {
++		if (_failures++ < 8) {
++			mvkLogFailure("binary-archive", "could not add a %s pipeline to the archive: %s", kind,
++						  err ? err.localizedDescription.UTF8String : "?");
++		}
++	}
++
++	void noteAdded() {
++		_added++;
++		_pending++;
++		time_t now = time(nullptr);
++		if ((now - _lastSave.load() < _saveInterval && _pending.load() < kMaxPipelinesPerSegment) || _saving.exchange(true)) { return; }
++		_lastSave = now;
++		std::shared_ptr<Segment> retired;
++		{
++			std::lock_guard<std::mutex> g(_lock);
++			auto fresh = newSegment();
++			if ( !fresh ) { _saving = false; return; }
++			retired = _current;
++			_current = fresh;
++			_loaded.insert(_loaded.begin(), retired);	// keep searching it
++		}
++		uint32_t n = _pending.exchange(0);
++		dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
++			// Wait for additions that were already in progress on the retired segment (bounded).
++			for (int i = 0; i < 3000 && retired->inflight.load() > 0; i++) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
++			if (retired->inflight.load() == 0) { saveSegment(retired, n); }
++			_saving = false;
++		});
++	}
++
++	void saveSegment(const std::shared_ptr<Segment>& s, uint32_t count) {
++		@autoreleasepool {
++			char name[64];
++			snprintf(name, sizeof(name), "%08lx%04x.metalarchive", (unsigned long)time(nullptr), (unsigned)(_seq++ & 0xffff));
++			std::string path = _dir + "/" + _base + name, tmp = path + ".tmp";
++			NSError* err = nil;
++			if ([s->archive serializeToURL: [NSURL fileURLWithPath: @(tmp.c_str())] error: &err] && rename(tmp.c_str(), path.c_str()) == 0) {
++				struct stat st; stat(path.c_str(), &st);
++				mvkLogFailure("binary-archive", "saved segment %s (%.1f MB, %u pipelines; %u added and %u loaded from archives this run)",
++							  name, st.st_size / 1e6, count, _added.load(), _hits.load());
++				pruneSegments();
++			} else {
++				unlink(tmp.c_str());
++				mvkLogFailure("binary-archive", "could not save %s: %s", path.c_str(), err ? err.localizedDescription.UTF8String : "?");
++			}
++		}
++	}
++
++	std::vector<std::string> segmentFiles() {
++		std::vector<std::string> v;
++		if (DIR* dd = opendir(_dir.c_str())) {
++			while (struct dirent* de = readdir(dd)) {
++				std::string n = de->d_name;
++				if (n.compare(0, _base.size(), _base) == 0 && n.size() > 13 && n.compare(n.size() - 13, 13, ".metalarchive") == 0) {
++					v.push_back(n);
++				}
++			}
++			closedir(dd);
++		}
++		std::sort(v.begin(), v.end());		// oldest first (names start with the save time)
++		return v;
++	}
++
++	void loadSegments() {
++		auto files = segmentFiles();
++		double mb = 0; int ok = 0;
++		for (auto it = files.rbegin(); it != files.rend(); ++it) {		// newest first
++			std::string path = _dir + "/" + *it;
++			@autoreleasepool {
++				MTLBinaryArchiveDescriptor* ad = [[MTLBinaryArchiveDescriptor new] autorelease];
++				ad.url = [NSURL fileURLWithPath: @(path.c_str())];
++				NSError* err = nil;
++				id<MTLBinaryArchive> a = (ok < kMaxSegments) ? [_dev newBinaryArchiveWithDescriptor: ad error: &err] : nil;
++				if ( !a ) { unlink(path.c_str()); continue; }		// unreadable (OS/driver update) or over the cap
++				auto s = std::make_shared<Segment>();
++				s->archive = a;
++				_loaded.push_back(s);
++				struct stat st; if (stat(path.c_str(), &st) == 0) { mb += st.st_size / 1e6; }
++				ok++;
++			}
++		}
++		if (ok) { mvkLogFailure("binary-archive", "loaded %d pipeline archive segment(s) for %s (%.1f MB)", ok, _base.c_str(), mb); }
++	}
++
++	void pruneSegments() {
++		auto files = segmentFiles();
++		for (size_t i = 0; i + kMaxSegments < files.size(); i++) { unlink((_dir + "/" + files[i]).c_str()); }
++	}
++
++	void cleanStaleTempFiles() {
++		// Metal's serializer writes temporary "<UUID>.metallib" files, and an interrupted save leaves "*.tmp".
++		if (DIR* dd = opendir(_dir.c_str())) {
++			while (struct dirent* de = readdir(dd)) {
++				const char* n = de->d_name;
++				size_t len = strlen(n);
++				bool uuidLib = len == 36 + 9 && strcmp(n + 36, ".metallib") == 0 && n[8] == '-' && n[13] == '-';
++				bool tmp = len > 4 && strcmp(n + len - 4, ".tmp") == 0;
++				if (uuidLib || tmp) {
++					std::string f = _dir + "/" + n;
++					struct stat st;
++					if (stat(f.c_str(), &st) == 0 && time(nullptr) - st.st_mtime > 600) { unlink(f.c_str()); }
++				}
++			}
++			closedir(dd);
++		}
++	}
++
++	id<MTLDevice> _dev;
++	bool _enabled = false;
++	std::string _dir, _base;
++	std::mutex _lock;
++	std::shared_ptr<Segment> _current;
++	std::vector<std::shared_ptr<Segment>> _loaded;
++	std::atomic<uint32_t> _added{0}, _hits{0}, _failures{0}, _pending{0}, _seq{0};
++	std::atomic<bool> _saving{false};
++	std::atomic<time_t> _lastSave{0};
++	int _saveInterval = kSaveIntervalSec;
++	static inline MVKBinaryArchiveCache* s_instance = nullptr;
++};

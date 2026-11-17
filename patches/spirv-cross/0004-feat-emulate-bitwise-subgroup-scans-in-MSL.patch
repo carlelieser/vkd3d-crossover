@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:06:29 -0500
+Subject: [PATCH 04/20] feat: emulate bitwise subgroup scans in MSL
+
+Problem: SM 6.5 wave intrinsics using bitwise/logical prefix operations
+(WavePrefix*/WaveMultiPrefix* on and/or/xor) cannot be translated.
+
+Root cause: Metal only provides SIMD-group prefix scans for sum and
+product.
+
+Fix: emulate inclusive and exclusive and/or/xor scans by broadcasting
+each active lane's value in lane order (spvSubgroup{Inclusive,Exclusive}
+Scan_*). The helpers use the active-lane rank instead of the lane id, so
+they stay correct when only part of the SIMD-group is active (e.g.
+partitioned WaveMultiPrefix* lowered to a waterfall loop).
+
+Verified by: vkd3d-proton SM 6.5 wave tests 582/582 (see NOTES.md
+Finding 7).
+
+Off switch: none.
+---
+ spirv_msl.cpp | 59 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ spirv_msl.hpp |  1 +
+ 2 files changed, 60 insertions(+)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index a000bfd..d311622 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -7247,6 +7247,48 @@ void CompilerMSL::emit_custom_functions()
+ 			break;
+ 		}
+ 
++		case SPVFuncImplSubgroupScanEmulation:
++		{
++			// Metal only has prefix scans for sum/product. Emulate bitwise/logical scans by
++			// broadcasting each active lane's value in lane order. Uses active-lane rank rather
++			// than lane id, so it is correct when only a subset of the SIMD-group is active
++			// (e.g. partitioned WaveMultiPrefix* lowered to a waterfall loop).
++			static const char *const scan_ops[][3] = {
++				{ "and", "a & b", "T(~0)" },
++				{ "or", "a | b", "T(0)" },
++				{ "xor", "a ^ b", "T(0)" },
++			};
++			for (auto &op : scan_ops)
++			{
++				for (int exclusive = 0; exclusive < 2; exclusive++)
++				{
++					statement("template<typename T>");
++					statement("inline T spvSubgroup", exclusive ? "Exclusive" : "Inclusive", "Scan_", op[0], "(T value)");
++					begin_scope();
++					statement("uint rank = simd_prefix_exclusive_sum(1u);");
++					statement("ulong mask = ulong((simd_vote::vote_t)simd_active_threads_mask());");
++					statement("T acc = ", op[2], ";");
++					statement("uint k = 0;");
++					statement("for (ushort l = 0; l < 64; l++)");
++					begin_scope();
++					statement("if ((mask & (1ul << l)) == 0)");
++					statement("    continue;");
++					statement("T b = simd_broadcast(value, l);");
++					statement("if (k ", exclusive ? "<" : "<=", " rank)");
++					begin_scope();
++					statement("T a = acc;");
++					statement("acc = ", op[1], ";");
++					end_scope();
++					statement("k++;");
++					end_scope();
++					statement("return acc;");
++					end_scope();
++					statement("");
++				}
++			}
++			break;
++		}
++
+ 		case SPVFuncImplSubgroupAllEqual:
+ 			// Metal doesn't provide a function to evaluate this directly. But, we can
+ 			// implement this by comparing every thread's value to one thread's value
+@@ -18424,6 +18466,14 @@ case OpGroupNonUniform##op: \
+ 		auto operation = static_cast<GroupOperation>(ops[op_idx++]); \
+ 		if (operation == GroupOperationReduce) \
+ 			emit_unary_func_op(result_type, id, ops[op_idx], "simd_" #msl_op); \
++		else if ((operation == GroupOperationInclusiveScan || operation == GroupOperationExclusiveScan) && \
++		         (strcmp(#msl_op, "and") == 0 || strcmp(#msl_op, "or") == 0 || strcmp(#msl_op, "xor") == 0)) \
++		{ \
++			add_spv_func_and_recompile(SPVFuncImplSubgroupScanEmulation); \
++			emit_unary_func_op(result_type, id, ops[op_idx], \
++			                   operation == GroupOperationInclusiveScan ? "spvSubgroupInclusiveScan_" #msl_op : \
++			                                                              "spvSubgroupExclusiveScan_" #msl_op); \
++		} \
+ 		else if (operation == GroupOperationInclusiveScan) \
+ 			SPIRV_CROSS_THROW("Metal doesn't support InclusiveScan for OpGroupNonUniform" #op "."); \
+ 		else if (operation == GroupOperationExclusiveScan) \
+@@ -18446,6 +18496,15 @@ case OpGroupNonUniform##op: \
+ 		auto operation = static_cast<GroupOperation>(ops[op_idx++]); \
+ 		if (operation == GroupOperationReduce) \
+ 			emit_unary_func_op_cast(result_type, id, ops[op_idx], "simd_" #msl_op, type, type); \
++		else if ((operation == GroupOperationInclusiveScan || operation == GroupOperationExclusiveScan) && \
++		         (strcmp(#msl_op, "and") == 0 || strcmp(#msl_op, "or") == 0 || strcmp(#msl_op, "xor") == 0)) \
++		{ \
++			add_spv_func_and_recompile(SPVFuncImplSubgroupScanEmulation); \
++			emit_unary_func_op_cast(result_type, id, ops[op_idx], \
++			                        operation == GroupOperationInclusiveScan ? "spvSubgroupInclusiveScan_" #msl_op : \
++			                                                                   "spvSubgroupExclusiveScan_" #msl_op, \
++			                        type, type); \
++		} \
+ 		else if (operation == GroupOperationInclusiveScan) \
+ 			SPIRV_CROSS_THROW("Metal doesn't support InclusiveScan for OpGroupNonUniform" #op "."); \
+ 		else if (operation == GroupOperationExclusiveScan) \
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index a438f2f..dc4cb9c 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -853,6 +853,7 @@ protected:
+ 		SPVFuncImplSubgroupBallotFindMSB,
+ 		SPVFuncImplSubgroupBallotBitCount,
+ 		SPVFuncImplSubgroupAllEqual,
++		SPVFuncImplSubgroupScanEmulation,
+ 		SPVFuncImplAtomic64Emulation,
+ 		SPVFuncImplSubgroupShuffle,
+ 		SPVFuncImplSubgroupShuffleXor,
+-- 
+2.51.0
+

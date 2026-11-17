@@ -1,0 +1,877 @@
+From 65971aaab67c2b017cf80ed7885b1cabdfc87263 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:11:55 -0500
+Subject: [PATCH 07/28] feat: implement VK_EXT_mesh_shader on Metal mesh
+ pipelines
+
+Problem: No mesh shaders: vkd3d-proton could not report D3D12 mesh shader tier 1.
+
+Root cause: MoltenVK did not implement VK_EXT_mesh_shader, although Metal 3 GPUs (M1 included) have object/mesh stages.
+
+Fix: Advertise taskShader/meshShader on Metal 3 GPUs (macOS 13+) with limits from Metal's mesh pipeline. Task and mesh shaders use the tessellation control/evaluation slots (a pipeline is never both) with bindings aliased to the TaskEXT/MeshEXT execution models; new Object/Mesh encoder stages. Pipelines are built as MTLMeshRenderPipelineDescriptor, the fragment stage on a scratch render descriptor, with an empty fragment function when Vulkan has none. vkCmdDrawMeshTasks{,Indirect,IndirectCount}EXT map to drawMeshThreadgroups{,WithIndirectBuffer}; the count variant reuses the indirect-count conversion kernel (reads 4 bytes past the last 12-byte command). Mesh pipelines have no vertex input state.
+
+Verified by: test_mesh_shader_rendering 260/260, test_amplification_shader 57/57, test_mesh_shader_execute_indirect 136/136, test_mesh_shader_create_pipeline 11 pass (+1 upstream todo); native harness (meshtest) with Metal validation clean.
+
+Off switch: none
+---
+ MoltenVK/MoltenVK/Commands/MVKCmdDraw.h       |  43 ++++
+ MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm      |  91 +++++++
+ .../Commands/MVKCommandEncoderState.h         |   6 +
+ .../Commands/MVKCommandEncoderState.mm        |  39 ++-
+ .../MoltenVK/Commands/MVKCommandTypePools.def |   2 +
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.h      |   8 +
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm     |  47 ++++
+ .../GPUObjects/MVKDeviceFeatureStructs.def    |   1 +
+ MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm   |   3 +
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h    |  24 ++
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm   | 226 +++++++++++++++++-
+ MoltenVK/MoltenVK/Layers/MVKExtensions.def    |   1 +
+ MoltenVK/MoltenVK/Vulkan/mvk_datatypes.mm     |  10 +-
+ MoltenVK/MoltenVK/Vulkan/vulkan.mm            |  41 ++++
+ .../MoltenVKShaderConverter/SPIRVReflection.h |   3 +
+ 15 files changed, 533 insertions(+), 12 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.h b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.h
+index 9afc3ed..517c6cb 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.h
+@@ -218,3 +218,46 @@ protected:
+ 	id<MTLBuffer> _mtlCountBuffer;
+ 	VkDeviceSize _mtlCountBufferOffset;
+ };
++
++#pragma mark -
++#pragma mark MVKCmdDrawMeshTasks
++
++/** Vulkan command to draw mesh tasks (VK_EXT_mesh_shader) via a Metal mesh render pipeline. */
++class MVKCmdDrawMeshTasks : public MVKCommand {
++
++public:
++	VkResult setContent(MVKCommandBuffer* cmdBuff, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ);
++
++	void encode(MVKCommandEncoder* cmdEncoder) override;
++
++protected:
++	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
++
++	uint32_t _groupCount[3];
++};
++
++
++#pragma mark -
++#pragma mark MVKCmdDrawMeshTasksIndirect
++
++/** Vulkan command to draw mesh tasks indirectly, optionally with a GPU draw count. */
++class MVKCmdDrawMeshTasksIndirect : public MVKCommand {
++
++public:
++	VkResult setContent(MVKCommandBuffer* cmdBuff, VkBuffer buffer, VkDeviceSize offset, uint32_t drawCount, uint32_t stride);
++
++	VkResult setContent(MVKCommandBuffer* cmdBuff, VkBuffer buffer, VkDeviceSize offset,
++	                    VkBuffer countBuffer, VkDeviceSize countBufferOffset, uint32_t maxDrawCount, uint32_t stride);
++
++	void encode(MVKCommandEncoder* cmdEncoder) override;
++
++protected:
++	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
++
++	id<MTLBuffer> _mtlIndirectBuffer = nil;
++	VkDeviceSize _mtlIndirectBufferOffset = 0;
++	id<MTLBuffer> _mtlCountBuffer = nil;
++	VkDeviceSize _mtlCountBufferOffset = 0;
++	uint32_t _drawCount = 0;
++	uint32_t _stride = 0;
++};
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+index 8720236..82fd7be 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+@@ -1544,3 +1544,94 @@ void MVKCmdDrawIndexedIndirect::encode(MVKCommandEncoder* cmdEncoder, const MVKI
+         }
+     }
+ }
++
++#pragma mark -
++#pragma mark MVKCmdDrawMeshTasks
++
++VkResult MVKCmdDrawMeshTasks::setContent(MVKCommandBuffer* cmdBuff, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ) {
++	_groupCount[0] = groupCountX;
++	_groupCount[1] = groupCountY;
++	_groupCount[2] = groupCountZ;
++	return VK_SUCCESS;
++}
++
++// Common preamble for mesh draws. Returns the pipeline if drawing can proceed, or nullptr.
++static MVKGraphicsPipeline* prepareMeshDraw(MVKCommandEncoder* cmdEncoder) {
++	cmdEncoder->restartMetalRenderPassIfNeeded();
++	auto* pipeline = cmdEncoder->getGraphicsPipeline();
++	if ( !pipeline || !pipeline->isMeshPipeline() ) { return nullptr; }
++	cmdEncoder->_isIndexedDraw = false;
++	cmdEncoder->finalizeDrawState(kMVKGraphicsStageRasterization);	// Ensure all updated state has been submitted to Metal
++	if ( !pipeline->hasValidMTLPipelineStates() ) { return nullptr; }
++	return pipeline;
++}
++
++void MVKCmdDrawMeshTasks::encode(MVKCommandEncoder* cmdEncoder) {
++	if (_groupCount[0] == 0 || _groupCount[1] == 0 || _groupCount[2] == 0) { return; }	// Nothing to do.
++	auto* pipeline = prepareMeshDraw(cmdEncoder);
++	if ( !pipeline ) { return; }
++	if (@available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
++		// Without a task shader, the Vulkan group counts are the mesh grid directly; Metal treats
++		// threadgroupsPerGrid the same way when the pipeline has no object function.
++		[cmdEncoder->_mtlRenderEncoder drawMeshThreadgroups: MTLSizeMake(_groupCount[0], _groupCount[1], _groupCount[2])
++		                         threadsPerObjectThreadgroup: pipeline->getTaskThreadgroupSize()
++		                           threadsPerMeshThreadgroup: pipeline->getMeshThreadgroupSize()];
++	}
++}
++
++
++#pragma mark -
++#pragma mark MVKCmdDrawMeshTasksIndirect
++
++VkResult MVKCmdDrawMeshTasksIndirect::setContent(MVKCommandBuffer* cmdBuff, VkBuffer buffer, VkDeviceSize offset,
++                                                 uint32_t drawCount, uint32_t stride) {
++	MVKBuffer* mvkBuffer = (MVKBuffer*)buffer;
++	_mtlIndirectBuffer = mvkBuffer->getMTLBuffer();
++	_mtlIndirectBufferOffset = mvkBuffer->getMTLBufferOffset() + offset;
++	_mtlCountBuffer = nil;
++	_mtlCountBufferOffset = 0;
++	_drawCount = drawCount;
++	_stride = stride ? stride : sizeof(VkDrawMeshTasksIndirectCommandEXT);
++	return VK_SUCCESS;
++}
++
++VkResult MVKCmdDrawMeshTasksIndirect::setContent(MVKCommandBuffer* cmdBuff, VkBuffer buffer, VkDeviceSize offset,
++                                                 VkBuffer countBuffer, VkDeviceSize countBufferOffset,
++                                                 uint32_t maxDrawCount, uint32_t stride) {
++	setContent(cmdBuff, buffer, offset, maxDrawCount, stride);
++	MVKBuffer* mvkCountBuffer = (MVKBuffer*)countBuffer;
++	_mtlCountBuffer = mvkCountBuffer->getMTLBuffer();
++	_mtlCountBufferOffset = mvkCountBuffer->getMTLBufferOffset() + countBufferOffset;
++	return VK_SUCCESS;
++}
++
++void MVKCmdDrawMeshTasksIndirect::encode(MVKCommandEncoder* cmdEncoder) {
++	if (_drawCount == 0) { return; }
++
++	id<MTLBuffer> argBuffer = _mtlIndirectBuffer;
++	VkDeviceSize argOffset = _mtlIndirectBufferOffset;
++	VkDeviceSize argStride = _stride;
++	if (_mtlCountBuffer) {
++		// Reuse the non-indexed indirect-count conversion kernel: it copies 16-byte records and zeroes the
++		// second word (instanceCount, i.e. groupCountY here) for draws past the GPU-side count.
++		// VkDrawMeshTasksIndirectCommandEXT {x,y,z} occupies the first 12 bytes of each 16-byte record.
++		// NOTE: with a 12-byte source stride the last record reads 4 bytes past the final command.
++		cmdEncoder->restartMetalRenderPassIfNeeded();
++		auto* converted = encodeIndirectCountConversion(cmdEncoder, _mtlIndirectBuffer, _mtlIndirectBufferOffset, _stride,
++		                                                _mtlCountBuffer, _mtlCountBufferOffset, _drawCount, false);
++		argBuffer = converted->_mtlBuffer;
++		argOffset = converted->_offset;
++		argStride = sizeof(MTLDrawPrimitivesIndirectArguments);
++	}
++
++	auto* pipeline = prepareMeshDraw(cmdEncoder);
++	if ( !pipeline ) { return; }
++	if (@available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
++		for (uint32_t i = 0; i < _drawCount; i++) {
++			[cmdEncoder->_mtlRenderEncoder drawMeshThreadgroupsWithIndirectBuffer: argBuffer
++			                                                 indirectBufferOffset: argOffset + i * argStride
++			                                          threadsPerObjectThreadgroup: pipeline->getTaskThreadgroupSize()
++			                                            threadsPerMeshThreadgroup: pipeline->getMeshThreadgroupSize()];
++		}
++	}
++}
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.h b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.h
+index 0a4d180..e257bbb 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.h
+@@ -37,6 +37,8 @@ struct MVKShaderImplicitRezBinding;
+ enum class MVKMetalGraphicsStage {
+ 	Vertex,
+ 	Fragment,
++	Object,   // Metal mesh pipelines: Vulkan task shader
++	Mesh,     // Metal mesh pipelines: Vulkan mesh shader
+ 	Count
+ };
+ 
+@@ -72,6 +74,8 @@ struct MVKResourceBinder {
+ 	enum class Stage {
+ 		Vertex   = static_cast<uint32_t>(MVKMetalGraphicsStage::Vertex),
+ 		Fragment = static_cast<uint32_t>(MVKMetalGraphicsStage::Fragment),
++		Object   = static_cast<uint32_t>(MVKMetalGraphicsStage::Object),
++		Mesh     = static_cast<uint32_t>(MVKMetalGraphicsStage::Mesh),
+ 		Compute  = static_cast<uint32_t>(MVKMetalGraphicsStage::Count),
+ 		Count
+ 	};
+@@ -139,6 +143,8 @@ struct MVKImplicitBufferData {
+ enum class MVKResourceUsageStages : uint8_t {
+ 	Vertex   = static_cast<uint32_t>(MVKMetalGraphicsStage::Vertex),
+ 	Fragment = static_cast<uint32_t>(MVKMetalGraphicsStage::Fragment),
++	Object   = static_cast<uint32_t>(MVKMetalGraphicsStage::Object),
++	Mesh     = static_cast<uint32_t>(MVKMetalGraphicsStage::Mesh),
+ 	All      = static_cast<uint32_t>(MVKMetalGraphicsStage::Count),
+ 	Count,
+ 	Compute  = 0, // Aliases with Render stages
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+index 199172a..d10d08a 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+@@ -42,7 +42,17 @@ static MTLRenderStages getMTLStages(MVKResourceUsageStages stages) {
+ 	switch (stages) {
+ 		case MVKResourceUsageStages::Vertex:   return MTLRenderStageVertex;
+ 		case MVKResourceUsageStages::Fragment: return MTLRenderStageFragment;
+-		case MVKResourceUsageStages::All:      return MTLRenderStageVertex | MTLRenderStageFragment;
++		case MVKResourceUsageStages::Object:
++			if (@available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) { return MTLRenderStageObject; }
++			return 0;
++		case MVKResourceUsageStages::Mesh:
++			if (@available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) { return MTLRenderStageMesh; }
++			return 0;
++		case MVKResourceUsageStages::All:
++			if (@available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
++				return MTLRenderStageVertex | MTLRenderStageFragment | MTLRenderStageObject | MTLRenderStageMesh;
++			}
++			return MTLRenderStageVertex | MTLRenderStageFragment;
+ 		case MVKResourceUsageStages::Count:    break;
+ 	}
+ 	assert(0);
+@@ -113,6 +123,20 @@ struct MVKVertexBinder {
+ 	}
+ };
+ 
++// Metal mesh pipelines (macOS 13+): object stage (Vulkan task shader) and mesh stage.
++#define MVK_DEFINE_MESH_STAGE_BINDER(NAME, STAGE)                                                                     \
++struct NAME {                                                                                                          \
++	static SEL selSetBytes()   { return @selector(set##STAGE##Bytes:length:atIndex:); }                                 \
++	static SEL selSetBuffer()  { return @selector(set##STAGE##Buffer:offset:atIndex:); }                                \
++	static SEL selSetOffset()  { return @selector(set##STAGE##BufferOffset:atIndex:); }                                 \
++	static SEL selSetTexture() { return @selector(set##STAGE##Texture:atIndex:); }                                      \
++	static SEL selSetSampler() { return @selector(set##STAGE##SamplerState:atIndex:); }                                 \
++	static MVKResourceBinder::UseResource useResource() { return useResourceGraphics; }                                \
++};
++MVK_DEFINE_MESH_STAGE_BINDER(MVKObjectBinder, Object)
++MVK_DEFINE_MESH_STAGE_BINDER(MVKMeshBinder, Mesh)
++#undef MVK_DEFINE_MESH_STAGE_BINDER
++
+ struct MVKComputeBinder {
+ 	static SEL selSetBytes()   { return @selector(setBytes:length:atIndex:); }
+ 	static SEL selSetBuffer()  { return @selector(setBuffer:offset:atIndex:); }
+@@ -161,6 +185,8 @@ static ResourceBinderTable<MVKResourceBinder> GenResourceBinders() {
+ 	ResourceBinderTable<MVKResourceBinder> res = {};
+ 	res[MVKResourceBinder::Stage::Vertex]   = MVKResourceBinder::Create<MVKVertexBinder>();
+ 	res[MVKResourceBinder::Stage::Fragment] = MVKResourceBinder::Create<MVKFragmentBinder>();
++	res[MVKResourceBinder::Stage::Object]   = MVKResourceBinder::Create<MVKObjectBinder>();
++	res[MVKResourceBinder::Stage::Mesh]     = MVKResourceBinder::Create<MVKMeshBinder>();
+ 	res[MVKResourceBinder::Stage::Compute]  = MVKResourceBinder::Create<MVKComputeBinder>();
+ 	return res;
+ }
+@@ -1454,7 +1480,7 @@ void MVKMetalGraphicsCommandEncoderState::prepareDraw(
+ 		_flags.add(MVKMetalRenderEncoderStateFlag::PipelineReady);
+ 		id<MTLRenderPipelineState> mtlPipeline;
+ 		const MVKRenderSubpass* subpass = mvkEncoder.getSubpass();
+-		if (subpass->isMultiview() && !pipeline->isTessellationPipeline()) {
++		if (subpass->isMultiview() && !pipeline->isTessellationPipeline() && !pipeline->isMeshPipeline()) {
+ 			mtlPipeline = pipeline->getMultiviewPipelineState(subpass->getViewCountInMetalPass(mvkEncoder.getMultiviewPassIndex()));
+ 		} else {
+ 			mtlPipeline = pipeline->getMainPipelineState();
+@@ -1469,7 +1495,14 @@ void MVKMetalGraphicsCommandEncoderState::prepareDraw(
+ 	bindState(encoder, mvkEncoder, vk);
+ 
+ 	// Resources
+-	if (pipeline->isTessellationPipeline()) {
++	if (pipeline->isMeshPipeline()) {
++		// Task shader (if any) -> Metal object stage, mesh shader -> Metal mesh stage.
++		// They use the tessellation stage slots for their Vulkan-side resources.
++		if (pipeline->hasTaskShader()) {
++			bindVulkanGraphicsToMetalGraphics(encoder, mvkEncoder, vk, vkShared, *this, pipeline, kMVKShaderStageTessCtl, MVKMetalGraphicsStage::Object);
++		}
++		bindVulkanGraphicsToMetalGraphics(encoder, mvkEncoder, vk, vkShared, *this, pipeline, kMVKShaderStageTessEval, MVKMetalGraphicsStage::Mesh);
++	} else if (pipeline->isTessellationPipeline()) {
+ 		bindVulkanGraphicsToMetalGraphics(encoder, mvkEncoder, vk, vkShared, *this, pipeline, kMVKShaderStageTessEval, MVKMetalGraphicsStage::Vertex);
+ 	} else {
+ 		bindVulkanGraphicsToMetalGraphics(encoder, mvkEncoder, vk, vkShared, *this, pipeline, kMVKShaderStageVertex,   MVKMetalGraphicsStage::Vertex);
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandTypePools.def b/MoltenVK/MoltenVK/Commands/MVKCommandTypePools.def
+index 9d3b046..a51135e 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandTypePools.def
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandTypePools.def
+@@ -120,6 +120,8 @@ MVK_CMD_TYPE_POOL(Draw)
+ MVK_CMD_TYPE_POOL(DrawIndexed)
+ MVK_CMD_TYPE_POOL(DrawIndirect)
+ MVK_CMD_TYPE_POOL(DrawIndexedIndirect)
++MVK_CMD_TYPE_POOL(DrawMeshTasks)
++MVK_CMD_TYPE_POOL(DrawMeshTasksIndirect)
+ MVK_CMD_TYPE_POOLS_FROM_THRESHOLD(CopyImage, 1)
+ MVK_CMD_TYPE_POOLS_FROM_THRESHOLD(BlitImage, 1)
+ MVK_CMD_TYPE_POOLS_FROM_THRESHOLD(ResolveImage, 1)
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+index 9666685..879cce0 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+@@ -423,6 +423,14 @@ public:
+ 	/** Populates the specified structure with the Metal-specific features of this device. */
+ 	const MVKPhysicalDeviceMetalFeatures* getMetalFeatures() const { return &_metalFeatures; }
+ 
++	/** Returns whether Metal mesh pipelines (object/mesh functions) are available on this device. */
++	bool supportsMeshShaders() const {
++		if (@available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
++			return [_mtlDevice supportsFamily: MTLGPUFamilyMetal3];
++		}
++		return false;
++	}
++
+ 	/** Returns whether argument buffers are in use. */
+ 	bool isUsingMetalArgumentBuffers() const { return _isUsingMetalArgumentBuffers; }
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index ad4d22e..a03822d 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -813,6 +813,17 @@ void MVKPhysicalDevice::getFeatures(VkPhysicalDeviceFeatures2* features) {
+ 				atomicFloatFeatures->sparseImageFloat32AtomicAdd = false;
+ 				break;
+ 			}
++			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT: {
++				// Task/mesh shaders map to Metal object/mesh functions (Metal 3 GPU family, macOS 13+).
++				auto* meshFeatures = (VkPhysicalDeviceMeshShaderFeaturesEXT*)next;
++				bool supported = supportsMeshShaders();
++				meshFeatures->taskShader = supported;
++				meshFeatures->meshShader = supported;
++				meshFeatures->multiviewMeshShader = false;
++				meshFeatures->primitiveFragmentShadingRateMeshShader = false;
++				meshFeatures->meshShaderQueries = false;
++				break;
++			}
+ 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_FEATURES_EXT: {
+ 				auto* texelBuffAlignFeatures = (VkPhysicalDeviceTexelBufferAlignmentFeaturesEXT*)next;
+ 				texelBuffAlignFeatures->texelBufferAlignment = true;
+@@ -1189,6 +1200,42 @@ void MVKPhysicalDevice::getProperties(VkPhysicalDeviceProperties2* properties) {
+ 				subgroupSizeProps->requiredSubgroupSizeStages = supportedProps13.requiredSubgroupSizeStages;
+ 				break;
+ 			}
++			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT: {
++				// Limits follow Metal's mesh pipeline: 1024 threads per object/mesh threadgroup,
++				// 16 KB payload, 32 KB threadgroup memory, mesh<> up to 256 vertices / 512 primitives.
++				auto* meshProps = (VkPhysicalDeviceMeshShaderPropertiesEXT*)next;
++				meshProps->maxTaskWorkGroupTotalCount = 1u << 22;
++				meshProps->maxTaskWorkGroupCount[0] = meshProps->maxTaskWorkGroupCount[1] = meshProps->maxTaskWorkGroupCount[2] = 65535;
++				meshProps->maxTaskWorkGroupInvocations = 1024;
++				meshProps->maxTaskWorkGroupSize[0] = meshProps->maxTaskWorkGroupSize[1] = 1024;
++				meshProps->maxTaskWorkGroupSize[2] = 64;
++				meshProps->maxTaskPayloadSize = 16384;
++				meshProps->maxTaskSharedMemorySize = 32768;
++				meshProps->maxTaskPayloadAndSharedMemorySize = 32768;
++				meshProps->maxMeshWorkGroupTotalCount = 1u << 22;
++				meshProps->maxMeshWorkGroupCount[0] = meshProps->maxMeshWorkGroupCount[1] = meshProps->maxMeshWorkGroupCount[2] = 65535;
++				meshProps->maxMeshWorkGroupInvocations = 1024;
++				meshProps->maxMeshWorkGroupSize[0] = meshProps->maxMeshWorkGroupSize[1] = 1024;
++				meshProps->maxMeshWorkGroupSize[2] = 64;
++				meshProps->maxMeshSharedMemorySize = 28672;
++				meshProps->maxMeshPayloadAndSharedMemorySize = 28672 + 16384;
++				meshProps->maxMeshOutputMemorySize = 32768;
++				meshProps->maxMeshPayloadAndOutputMemorySize = 32768 + 16384;
++				meshProps->maxMeshOutputComponents = 128;
++				meshProps->maxMeshOutputVertices = 256;
++				meshProps->maxMeshOutputPrimitives = 256;
++				meshProps->maxMeshOutputLayers = _properties.limits.maxFramebufferLayers;
++				meshProps->maxMeshMultiviewViewCount = 1;
++				meshProps->meshOutputPerVertexGranularity = 32;
++				meshProps->meshOutputPerPrimitiveGranularity = 32;
++				meshProps->maxPreferredTaskWorkGroupInvocations = 32;
++				meshProps->maxPreferredMeshWorkGroupInvocations = 32;
++				meshProps->prefersLocalInvocationVertexOutput = true;
++				meshProps->prefersLocalInvocationPrimitiveOutput = true;
++				meshProps->prefersCompactVertexOutput = false;
++				meshProps->prefersCompactPrimitiveOutput = false;
++				break;
++			}
+ 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES: {
+ 				// Save the 'next' pointer; we'll unintentionally overwrite it
+ 				// on the next line. Put it back when we're done.
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def
+index ae05d92..0c73e52 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def
+@@ -105,6 +105,7 @@ MVK_DEVICE_FEATURE_EXTN(ExtendedDynamicState2,            EXTENDED_DYNAMIC_STATE
+ MVK_DEVICE_FEATURE_EXTN(ExtendedDynamicState3,            EXTENDED_DYNAMIC_STATE_3,             EXT,  31)
+ MVK_DEVICE_FEATURE_EXTN(FragmentShaderInterlock,          FRAGMENT_SHADER_INTERLOCK,            EXT,   3)
+ MVK_DEVICE_FEATURE_EXTN(Image2DViewOf3D,                  IMAGE_2D_VIEW_OF_3D,                  EXT,   2)
++MVK_DEVICE_FEATURE_EXTN(MeshShader,                       MESH_SHADER,                          EXT,   5)
+ MVK_DEVICE_FEATURE_EXTN(LegacyDithering,                  LEGACY_DITHERING,                     EXT,   1)
+ MVK_DEVICE_FEATURE_EXTN(MultiDraw,                        MULTI_DRAW,                           EXT,   1)
+ MVK_DEVICE_FEATURE_EXTN(NestedCommandBuffer,              NESTED_COMMAND_BUFFER,                EXT,   3)
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm b/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm
+index ef69994..cd5e5fa 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKInstance.mm
+@@ -788,6 +788,9 @@ void MVKInstance::initProcAddrs() {
+ 	ADD_DVC_EXT_ENTRY_POINT(vkGetMemoryHostPointerPropertiesEXT, EXT_EXTERNAL_MEMORY_HOST);
+ 	ADD_DVC_EXT_ENTRY_POINT(vkSetHdrMetadataEXT, EXT_HDR_METADATA);
+ 	ADD_DVC_EXT_ENTRY_POINT(vkCmdDrawMultiEXT, EXT_MULTI_DRAW);
++	ADD_DVC_EXT_ENTRY_POINT(vkCmdDrawMeshTasksEXT, EXT_MESH_SHADER);
++	ADD_DVC_EXT_ENTRY_POINT(vkCmdDrawMeshTasksIndirectEXT, EXT_MESH_SHADER);
++	ADD_DVC_EXT_ENTRY_POINT(vkCmdDrawMeshTasksIndirectCountEXT, EXT_MESH_SHADER);
+ 	ADD_DVC_EXT_ENTRY_POINT(vkCmdDrawMultiIndexedEXT, EXT_MULTI_DRAW);
+ 	ADD_DVC_EXT_ENTRY_POINT(vkExportMetalObjectsEXT, EXT_METAL_OBJECTS);
+ 	ADD_DVC_EXT_ENTRY_POINT(vkGetPhysicalDeviceMultisamplePropertiesEXT, EXT_SAMPLE_LOCATIONS);
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+index e385e9b..4ef5d30 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+@@ -250,6 +250,18 @@ public:
+ 	/** Returns whether this pipeline has tessellation shaders. */
+ 	bool isTessellationPipeline() { return _isTessellationPipeline; }
+ 
++	/** Returns whether this pipeline uses task/mesh shaders (a Metal mesh render pipeline). */
++	bool isMeshPipeline() { return _isMeshPipeline; }
++
++	/** Returns whether this mesh pipeline has a task shader (Metal object function). */
++	bool hasTaskShader() { return _hasTaskShader; }
++
++	/** Returns the threads per object (task) threadgroup of a mesh pipeline. */
++	MTLSize getTaskThreadgroupSize() const { return _taskThreadgroupSize; }
++
++	/** Returns the threads per mesh threadgroup of a mesh pipeline. */
++	MTLSize getMeshThreadgroupSize() const { return _meshThreadgroupSize; }
++
+ 	/** Returns the number of output tessellation patch control points. */
+ 	uint32_t getOutputControlPointCount() { return _outputControlPointCount; }
+ 
+@@ -334,6 +346,11 @@ protected:
+ 	typedef MVKSmallVector<mvk::SPIRVShaderInterfaceVariable, 32> SPIRVShaderInputs;
+ 
+     id<MTLRenderPipelineState> getOrCompilePipeline(MTLRenderPipelineDescriptor* plDesc, id<MTLRenderPipelineState>& plState);
++    id<MTLRenderPipelineState> getOrCompileMeshPipeline(id meshPLDesc, id<MTLRenderPipelineState>& plState);
++	id newMTLMeshRenderPipelineDescriptor(const VkGraphicsPipelineCreateInfo* pCreateInfo, const mvk::SPIRVTessReflectionData& reflectData,
++	                                      const VkPipelineShaderStageCreateInfo* pTaskSS, VkPipelineCreationFeedback* pTaskFB,
++	                                      const VkPipelineShaderStageCreateInfo* pMeshSS, VkPipelineCreationFeedback* pMeshFB,
++	                                      const VkPipelineShaderStageCreateInfo* pFragmentSS, VkPipelineCreationFeedback* pFragmentFB);
+     id<MTLComputePipelineState> getOrCompilePipeline(MTLComputePipelineDescriptor* plDesc, id<MTLComputePipelineState>& plState, const char* compilerType);
+ 	bool compileTessVertexStageState(MTLComputePipelineDescriptor* vtxPLDesc, MVKMTLFunction* pVtxFunctions, VkPipelineCreationFeedback* pVertexFB);
+ 	bool compileTessControlStageState(MTLComputePipelineDescriptor* tcPLDesc, VkPipelineCreationFeedback* pTessCtlFB);
+@@ -411,6 +428,10 @@ protected:
+ 	bool _isRasterizing = false;
+ 	bool _isRasterizingColor = false;
+ 	bool _isTessellationPipeline = false;
++	bool _isMeshPipeline = false;
++	bool _hasTaskShader = false;
++	MTLSize _taskThreadgroupSize = {1, 1, 1};
++	MTLSize _meshThreadgroupSize = {1, 1, 1};
+ 	bool _inputAttachmentIsDSAttachment = false;
+ 	bool _hasRemappedAttachmentLocations = false;
+ };
+@@ -547,6 +568,9 @@ public:
+ 	 */
+ 	id<MTLRenderPipelineState> newMTLRenderPipelineState(MTLRenderPipelineDescriptor* mtlRPLDesc);
+ 
++	/** Same as above, for a Metal mesh render pipeline (MTLMeshRenderPipelineDescriptor). */
++	id<MTLRenderPipelineState> newMTLMeshRenderPipelineState(id mtlMeshRPLDesc);
++
+ 
+ #pragma mark Construction
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 4108750..c065c5d 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -759,6 +759,10 @@ MVKGraphicsPipeline::MVKGraphicsPipeline(MVKDevice* device,
+ 	VkPipelineCreationFeedback* pTessCtlFB = nullptr;
+ 	VkPipelineCreationFeedback* pTessEvalFB = nullptr;
+ 	VkPipelineCreationFeedback* pFragmentFB = nullptr;
++	const VkPipelineShaderStageCreateInfo* pTaskSS = nullptr;
++	const VkPipelineShaderStageCreateInfo* pMeshSS = nullptr;
++	VkPipelineCreationFeedback* pTaskFB = nullptr;
++	VkPipelineCreationFeedback* pMeshFB = nullptr;
+ 	for (uint32_t i = 0; i < pCreateInfo->stageCount; i++) {
+ 		const auto* pSS = &pCreateInfo->pStages[i];
+ 		switch (pSS->stage) {
+@@ -786,6 +790,18 @@ MVKGraphicsPipeline::MVKGraphicsPipeline(MVKDevice* device,
+ 					pFragmentFB = &pFeedbackInfo->pPipelineStageCreationFeedbacks[i];
+ 				}
+ 				break;
++			case VK_SHADER_STAGE_TASK_BIT_EXT:
++				pTaskSS = pSS;
++				if (pFeedbackInfo && pFeedbackInfo->pPipelineStageCreationFeedbacks) {
++					pTaskFB = &pFeedbackInfo->pPipelineStageCreationFeedbacks[i];
++				}
++				break;
++			case VK_SHADER_STAGE_MESH_BIT_EXT:
++				pMeshSS = pSS;
++				if (pFeedbackInfo && pFeedbackInfo->pPipelineStageCreationFeedbacks) {
++					pMeshFB = &pFeedbackInfo->pPipelineStageCreationFeedbacks[i];
++				}
++				break;
+ 			default:
+ 				break;
+ 		}
+@@ -796,6 +812,17 @@ MVKGraphicsPipeline::MVKGraphicsPipeline(MVKDevice* device,
+ 	_tessEvalModule = getOrCreateShaderModule(device, pTessEvalSS, _ownsTessEvalModule);
+ 	_fragmentModule = getOrCreateShaderModule(device, pFragmentSS, _ownsFragmentModule);
+ 
++	// Mesh pipelines: task/mesh shaders occupy the tessellation control/evaluation slots
++	// (modules, stage resources, implicit buffers). A pipeline is never both.
++	if (pMeshSS) {
++		_isMeshPipeline = true;
++		_hasTaskShader = pTaskSS != nullptr;
++		_tessCtlModule = getOrCreateShaderModule(device, pTaskSS, _ownsTessCtlModule);
++		_tessEvalModule = getOrCreateShaderModule(device, pMeshSS, _ownsTessEvalModule);
++		pTessCtlSS = pTaskSS;   pTessCtlFB = pTaskFB;
++		pTessEvalSS = pMeshSS;  pTessEvalFB = pMeshFB;
++	}
++
+ 	warnIfUnsupportedRobustnessEnabled(this, pVertexSS);
+ 	warnIfUnsupportedRobustnessEnabled(this, pTessCtlSS);
+ 	warnIfUnsupportedRobustnessEnabled(this, pTessEvalSS);
+@@ -804,7 +831,7 @@ MVKGraphicsPipeline::MVKGraphicsPipeline(MVKDevice* device,
+ 	// Get the tessellation parameters from the shaders.
+ 	SPIRVTessReflectionData reflectData;
+ 	std::string reflectErrorLog;
+-	if (pTessCtlSS && pTessEvalSS) {
++	if (pTessCtlSS && pTessEvalSS && !_isMeshPipeline) {
+ 		_isTessellationPipeline = true;
+ 
+ 		if (!getTessReflectionData(_tessCtlModule->getSPIRV(), pTessCtlSS->pName, _tessEvalModule->getSPIRV(), pTessEvalSS->pName, reflectData, reflectErrorLog) ) {
+@@ -1010,6 +1037,17 @@ id<MTLRenderPipelineState> MVKGraphicsPipeline::getOrCompilePipeline(MTLRenderPi
+ 	return plState;
+ }
+ 
++id<MTLRenderPipelineState> MVKGraphicsPipeline::getOrCompileMeshPipeline(id meshPLDesc,
++																		 id<MTLRenderPipelineState>& plState) {
++	if ( !plState ) {
++		MVKRenderPipelineCompiler* plc = new MVKRenderPipelineCompiler(this);
++		plState = plc->newMTLMeshRenderPipelineState(meshPLDesc);	// retained
++		plc->destroy();
++		if ( !plState ) { _hasValidMTLPipelineStates = false; }
++	}
++	return plState;
++}
++
+ // Either returns an existing pipeline state or compiles a new one.
+ id<MTLComputePipelineState> MVKGraphicsPipeline::getOrCompilePipeline(MTLComputePipelineDescriptor* plDesc,
+ 																	  id<MTLComputePipelineState>& plState,
+@@ -1100,7 +1138,16 @@ void MVKGraphicsPipeline::initMTLRenderPipelineState(const VkGraphicsPipelineCre
+ 		}
+ 	}
+ 
+-	if (!isTessellationPipeline()) {
++	if (isMeshPipeline()) {
++		id meshDesc = newMTLMeshRenderPipelineDescriptor(pCreateInfo, reflectData, pTessCtlSS, pTessCtlFB,
++		                                                 pTessEvalSS, pTessEvalFB, pFragmentSS, pFragmentFB);	// temp retain
++		if (meshDesc) {
++			getOrCompileMeshPipeline(meshDesc, _mtlPipelineState);
++			[meshDesc release];																			// temp release
++		} else {
++			_hasValidMTLPipelineStates = false;
++		}
++	} else if (!isTessellationPipeline()) {
+ 		MTLRenderPipelineDescriptor* plDesc = newMTLRenderPipelineDescriptor(pCreateInfo, reflectData, pVertexSS, pVertexFB, pFragmentSS, pFragmentFB);	// temp retain
+ 		if (plDesc) {
+ 			auto viewMask = getRenderingCreateInfo(pCreateInfo)->viewMask;
+@@ -1210,6 +1257,148 @@ MTLRenderPipelineDescriptor* MVKGraphicsPipeline::newMTLRenderPipelineDescriptor
+ 	return plDesc;
+ }
+ 
++static void addCommonImplicitBuffersToShaderConfig(SPIRVToMSLConversionConfiguration& dst, const MVKOnePerEnumEntry<uint8_t, MVKImplicitBuffer>& src);
++static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfiguration& shaderConfig, const MVKOnePerEnumEntry<uint8_t, MVKImplicitBuffer>& implicit, bool enable);
++static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig, const MVKOnePerEnumEntry<uint8_t, MVKImplicitBuffer>& implicit, bool enable);
++
++// SPIRV-Cross looks up resource bindings by the entry point's execution model. Mesh pipelines reuse the
++// tessellation stage slots, so duplicate those bindings under the task/mesh execution models.
++static void aliasTessBindingsForMeshStages(SPIRVToMSLConversionConfiguration& shaderConfig) {
++	auto remap = [](spv::ExecutionModel m) {
++		return m == spv::ExecutionModelTessellationControl ? spv::ExecutionModelTaskEXT :
++		       m == spv::ExecutionModelTessellationEvaluation ? spv::ExecutionModelMeshEXT : spv::ExecutionModelMax;
++	};
++	size_t rbCount = shaderConfig.resourceBindings.size();
++	for (size_t i = 0; i < rbCount; i++) {
++		auto to = remap(shaderConfig.resourceBindings[i].resourceBinding.stage);
++		if (to == spv::ExecutionModelMax) { continue; }
++		auto copy = shaderConfig.resourceBindings[i];
++		copy.resourceBinding.stage = to;
++		shaderConfig.resourceBindings.push_back(copy);
++	}
++	size_t dbCount = shaderConfig.dynamicBufferDescriptors.size();
++	for (size_t i = 0; i < dbCount; i++) {
++		auto to = remap(shaderConfig.dynamicBufferDescriptors[i].stage);
++		if (to == spv::ExecutionModelMax) { continue; }
++		auto copy = shaderConfig.dynamicBufferDescriptors[i];
++		copy.stage = to;
++		shaderConfig.dynamicBufferDescriptors.push_back(copy);
++	}
++}
++
++// Metal requires a fragment function on mesh render pipelines, while Vulkan allows none.
++// Returns a cached empty fragment function to use in that case.
++static id<MTLFunction> getNullMeshFragmentFunction(id<MTLDevice> mtlDev) {
++	static id<MTLFunction> nullFrag = nil;
++	static dispatch_once_t once;
++	dispatch_once(&once, ^{
++		NSError* err = nil;
++		id<MTLLibrary> lib = [mtlDev newLibraryWithSource: @"#include <metal_stdlib>\nfragment void mvkNullMeshFragment() {}\n"
++		                                          options: nil
++		                                            error: &err];
++		nullFrag = [lib newFunctionWithName: @"mvkNullMeshFragment"];	// retained for process lifetime
++		[lib release];
++	});
++	return nullFrag;
++}
++
++// Returns a retained MTLMeshRenderPipelineDescriptor (as id) for a task/mesh pipeline, or nil on error.
++id MVKGraphicsPipeline::newMTLMeshRenderPipelineDescriptor(const VkGraphicsPipelineCreateInfo* pCreateInfo,
++                                                           const SPIRVTessReflectionData& reflectData,
++                                                           const VkPipelineShaderStageCreateInfo* pTaskSS,
++                                                           VkPipelineCreationFeedback* pTaskFB,
++                                                           const VkPipelineShaderStageCreateInfo* pMeshSS,
++                                                           VkPipelineCreationFeedback* pMeshFB,
++                                                           const VkPipelineShaderStageCreateInfo* pFragmentSS,
++                                                           VkPipelineCreationFeedback* pFragmentFB) {
++	if (@available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
++		if ( !getPhysicalDevice()->supportsMeshShaders() ) {
++			setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "This device does not support Metal mesh pipelines."));
++			return nil;
++		}
++
++		SPIRVToMSLConversionConfiguration shaderConfig;
++		initShaderConversionConfig(shaderConfig, pCreateInfo, reflectData);
++		aliasTessBindingsForMeshStages(shaderConfig);
++
++		MTLMeshRenderPipelineDescriptor* meshDesc = [MTLMeshRenderPipelineDescriptor new];	// retained
++
++		// Object (task) function
++		if (pTaskSS) {
++			const auto& implicit = _stageResources[kMVKShaderStageTessCtl].implicitBuffers.ids;
++			shaderConfig.options.entryPointStage = spv::ExecutionModelTaskEXT;
++			shaderConfig.options.entryPointName = pTaskSS->pName;
++			addCommonImplicitBuffersToShaderConfig(shaderConfig, implicit);
++			shaderConfig.options.mslOptions.capture_output_to_buffer = false;
++			setEmulatedReversedDepthViewportConfig(shaderConfig, implicit, false);
++			setDepthClipConfig(shaderConfig, implicit, false);
++			MVKMTLFunction func = getMTLFunction(shaderConfig, pTaskSS, pTaskFB, _tessCtlModule, "Task");
++			id<MTLFunction> mtlFunc = func.getMTLFunction();
++			if ( !mtlFunc ) { [meshDesc release]; return nil; }
++			meshDesc.objectFunction = mtlFunc;
++			_taskThreadgroupSize = func.threadGroupSize;
++			meshDesc.maxTotalThreadsPerObjectThreadgroup = _taskThreadgroupSize.width * _taskThreadgroupSize.height * _taskThreadgroupSize.depth;
++			meshDesc.payloadMemoryLength = 16384;
++			populateResourceUsage(_stageResources[kMVKShaderStageTessCtl], shaderConfig, func.shaderConversionResults, spv::ExecutionModelTaskEXT);
++			_layout->populateBindOperations(_stageResources[kMVKShaderStageTessCtl].bindScript, shaderConfig, spv::ExecutionModelTaskEXT);
++			if ( !verifyImplicitBuffers(kMVKShaderStageTessCtl) ) { [meshDesc release]; return nil; }
++		}
++
++		// Mesh function
++		SPIRVShaderOutputs meshOutputs;
++		{
++			std::string errorLog;
++			if ( !getShaderOutputs(_tessEvalModule->getSPIRV(), spv::ExecutionModelMeshEXT, pMeshSS->pName, meshOutputs, errorLog) ) {
++				setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "Failed to get mesh shader outputs: %s", errorLog.c_str()));
++				[meshDesc release];
++				return nil;
++			}
++			const auto& implicit = _stageResources[kMVKShaderStageTessEval].implicitBuffers.ids;
++			shaderConfig.options.entryPointStage = spv::ExecutionModelMeshEXT;
++			shaderConfig.options.entryPointName = pMeshSS->pName;
++			addCommonImplicitBuffersToShaderConfig(shaderConfig, implicit);
++			shaderConfig.options.mslOptions.capture_output_to_buffer = false;
++			shaderConfig.options.mslOptions.disable_rasterization = !_isRasterizing;
++			setEmulatedReversedDepthViewportConfig(shaderConfig, implicit, false);
++			setDepthClipConfig(shaderConfig, implicit, false);
++			MVKMTLFunction func = getMTLFunction(shaderConfig, pMeshSS, pMeshFB, _tessEvalModule, "Mesh");
++			id<MTLFunction> mtlFunc = func.getMTLFunction();
++			if ( !mtlFunc ) { [meshDesc release]; return nil; }
++			meshDesc.meshFunction = mtlFunc;
++			_meshThreadgroupSize = func.threadGroupSize;
++			meshDesc.maxTotalThreadsPerMeshThreadgroup = _meshThreadgroupSize.width * _meshThreadgroupSize.height * _meshThreadgroupSize.depth;
++			populateResourceUsage(_stageResources[kMVKShaderStageTessEval], shaderConfig, func.shaderConversionResults, spv::ExecutionModelMeshEXT);
++			_layout->populateBindOperations(_stageResources[kMVKShaderStageTessEval].bindScript, shaderConfig, spv::ExecutionModelMeshEXT);
++			if ( !verifyImplicitBuffers(kMVKShaderStageTessEval) ) { [meshDesc release]; return nil; }
++		}
++
++		// Fragment function and outputs: reuse the regular render-pipeline code on a scratch
++		// descriptor, then copy the relevant state onto the mesh descriptor.
++		MTLRenderPipelineDescriptor* scratch = [MTLRenderPipelineDescriptor new];	// temp retain
++		bool ok = addFragmentShaderToPipeline(scratch, pCreateInfo, shaderConfig, meshOutputs, _isRasterizing ? pFragmentSS : nullptr, pFragmentFB);
++		if (ok) {
++			addFragmentOutputToPipeline(scratch, pCreateInfo);
++			meshDesc.fragmentFunction = scratch.fragmentFunction ? scratch.fragmentFunction : getNullMeshFragmentFunction(getMTLDevice());
++			for (uint32_t i = 0; i < kMVKMaxColorAttachmentCount; i++) {
++				meshDesc.colorAttachments[i] = scratch.colorAttachments[i];
++			}
++			meshDesc.depthAttachmentPixelFormat = scratch.depthAttachmentPixelFormat;
++			meshDesc.stencilAttachmentPixelFormat = scratch.stencilAttachmentPixelFormat;
++			meshDesc.rasterSampleCount = scratch.rasterSampleCount;
++			meshDesc.alphaToCoverageEnabled = scratch.alphaToCoverageEnabled;
++			meshDesc.alphaToOneEnabled = scratch.alphaToOneEnabled;
++			meshDesc.rasterizationEnabled = _isRasterizing;
++		}
++		[scratch release];	// temp release
++		if ( !ok ) { [meshDesc release]; return nil; }
++
++		setMetalObjectLabel(meshDesc, ((MVKPipelineLayout*)pCreateInfo->layout)->getDebugName());
++		return meshDesc;
++	}
++	setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "Mesh pipelines require macOS 13 / iOS 16."));
++	return nil;
++}
++
+ // Returns a retained MTLComputePipelineDescriptor for the vertex stage of a tessellated draw constructed from this instance, or nil if an error occurs.
+ // It is the responsibility of the caller to release the returned descriptor.
+ MTLComputePipelineDescriptor* MVKGraphicsPipeline::newMTLTessVertexStageDescriptor(const VkGraphicsPipelineCreateInfo* pCreateInfo,
+@@ -2139,9 +2328,10 @@ void MVKGraphicsPipeline::initReservedVertexAttributeBufferCount(const VkGraphic
+ 	int32_t maxBinding = -1;
+ 	uint32_t xltdBuffCnt = 0;
+ 
+-	const VkPipelineVertexInputStateCreateInfo* pVI = pCreateInfo->pVertexInputState;
+-	uint32_t vaCnt = pVI->vertexAttributeDescriptionCount;
+-	uint32_t vbCnt = pVI->vertexBindingDescriptionCount;
++	// Mesh pipelines have no vertex input (pVertexInputState is ignored and may be null).
++	const VkPipelineVertexInputStateCreateInfo* pVI = _isMeshPipeline ? nullptr : pCreateInfo->pVertexInputState;
++	uint32_t vaCnt = pVI ? pVI->vertexAttributeDescriptionCount : 0;
++	uint32_t vbCnt = pVI ? pVI->vertexBindingDescriptionCount : 0;
+ 
+ 	// Determine the highest binding number used by the vertex buffers
+ 	for (uint32_t vbIdx = 0; vbIdx < vbCnt; vbIdx++) {
+@@ -2168,8 +2358,9 @@ void MVKGraphicsPipeline::initReservedVertexAttributeBufferCount(const VkGraphic
+ 	// attribute binding number, plus any synthetic buffer bindings created to support translated offsets.
+ 	mvkClear<uint32_t>(_reservedVertexAttributeBufferCount.stages, kMVKShaderStageCount);
+ 	_reservedVertexAttributeBufferCount.stages[kMVKShaderStageVertex] = (maxBinding + 1) + xltdBuffCnt;
+-	_reservedVertexAttributeBufferCount.stages[kMVKShaderStageTessCtl] = kMVKTessCtlNumReservedBuffers;
+-	_reservedVertexAttributeBufferCount.stages[kMVKShaderStageTessEval] = kMVKTessEvalNumReservedBuffers;
++	// The tessellation slots are reused by mesh pipelines (task/mesh), which need no reserved stage-in buffers.
++	_reservedVertexAttributeBufferCount.stages[kMVKShaderStageTessCtl] = _isMeshPipeline ? 0 : kMVKTessCtlNumReservedBuffers;
++	_reservedVertexAttributeBufferCount.stages[kMVKShaderStageTessEval] = _isMeshPipeline ? 0 : kMVKTessEvalNumReservedBuffers;
+ }
+ 
+ // Initializes the vertex attributes in a shader conversion configuration.
+@@ -3044,6 +3235,27 @@ id<MTLRenderPipelineState> MVKRenderPipelineCompiler::newMTLRenderPipelineState(
+ 	return [_mtlRenderPipelineState retain];
+ }
+ 
++id<MTLRenderPipelineState> MVKRenderPipelineCompiler::newMTLMeshRenderPipelineState(id mtlMeshRPLDesc) {
++	if (@available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
++		unique_lock<mutex> lock(_completionLock);
++
++		compile(lock, ^{
++			auto mtlDev = getMTLDevice();
++			@synchronized (mtlDev) {
++				[mtlDev newRenderPipelineStateWithMeshDescriptor: (MTLMeshRenderPipelineDescriptor*)mtlMeshRPLDesc
++				                                         options: MTLPipelineOptionNone
++				                               completionHandler: ^(id<MTLRenderPipelineState> ps, MTLRenderPipelineReflection* reflection, NSError* error) {
++					bool isLate = compileComplete(ps, error);
++					if (isLate) { destroy(); }
++				}];
++			}
++		});
++
++		return [_mtlRenderPipelineState retain];
++	}
++	return nil;
++}
++
+ bool MVKRenderPipelineCompiler::compileComplete(id<MTLRenderPipelineState> mtlRenderPipelineState, NSError* compileError) {
+ 	lock_guard<mutex> lock(_completionLock);
+ 
+diff --git a/MoltenVK/MoltenVK/Layers/MVKExtensions.def b/MoltenVK/MoltenVK/Layers/MVKExtensions.def
+index 6bb79d5..d86cb32 100644
+--- a/MoltenVK/MoltenVK/Layers/MVKExtensions.def
++++ b/MoltenVK/MoltenVK/Layers/MVKExtensions.def
+@@ -160,6 +160,7 @@ MVK_EXTENSION(EXT_legacy_dithering,                     EXT_LEGACY_DITHERING,
+ MVK_EXTENSION(EXT_line_rasterization,                   EXT_LINE_RASTERIZATION,                   DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(EXT_load_store_op_none,                   EXT_LOAD_STORE_OP_NONE,                   DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(EXT_memory_budget,                        EXT_MEMORY_BUDGET,                        DEVICE,   10.13, 11.0,  1.0)
++MVK_EXTENSION(EXT_mesh_shader,                          EXT_MESH_SHADER,                          DEVICE,   13.0,  16.0,  1.0)
+ MVK_EXTENSION(EXT_metal_objects,                        EXT_METAL_OBJECTS,                        DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(EXT_metal_surface,                        EXT_METAL_SURFACE,                        INSTANCE, 10.11,  8.0,  1.0)
+ MVK_EXTENSION(EXT_multi_draw,                           EXT_MULTI_DRAW,                           DEVICE,   10.11,  8.0,  1.0)
+diff --git a/MoltenVK/MoltenVK/Vulkan/mvk_datatypes.mm b/MoltenVK/MoltenVK/Vulkan/mvk_datatypes.mm
+index 9ee4db1..3009a8e 100644
+--- a/MoltenVK/MoltenVK/Vulkan/mvk_datatypes.mm
++++ b/MoltenVK/MoltenVK/Vulkan/mvk_datatypes.mm
+@@ -751,6 +751,10 @@ MVKShaderStage mvkShaderStageFromVkShaderStageFlagBitsInObj(VkShaderStageFlagBit
+ 		case VK_SHADER_STAGE_VERTEX_BIT:					return kMVKShaderStageVertex;
+ 		case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT:		return kMVKShaderStageTessCtl;
+ 		case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT:	return kMVKShaderStageTessEval;
++		/* Mesh pipelines reuse the tessellation stage slots (a pipeline is never both):
++		 * task -> TessCtl (Metal object stage), mesh -> TessEval (Metal mesh stage). */
++		case VK_SHADER_STAGE_TASK_BIT_EXT:					return kMVKShaderStageTessCtl;
++		case VK_SHADER_STAGE_MESH_BIT_EXT:					return kMVKShaderStageTessEval;
+ 		/* FIXME: VK_SHADER_STAGE_GEOMETRY_BIT */
+ 		case VK_SHADER_STAGE_FRAGMENT_BIT:					return kMVKShaderStageFragment;
+ 		case VK_SHADER_STAGE_COMPUTE_BIT:					return kMVKShaderStageCompute;
+@@ -763,8 +767,10 @@ MVKShaderStage mvkShaderStageFromVkShaderStageFlagBitsInObj(VkShaderStageFlagBit
+ MVK_PUBLIC_SYMBOL VkShaderStageFlagBits mvkVkShaderStageFlagBitsFromMVKShaderStage(MVKShaderStage mvkStage) {
+ 	switch (mvkStage) {
+ 		case kMVKShaderStageVertex:		return VK_SHADER_STAGE_VERTEX_BIT;
+-		case kMVKShaderStageTessCtl:	return VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
+-		case kMVKShaderStageTessEval:	return VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
++		// The tessellation slots are shared with the mesh pipeline stages (see above), so these
++		// return stage *masks* for use in flag tests.
++		case kMVKShaderStageTessCtl:	return (VkShaderStageFlagBits)(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT | VK_SHADER_STAGE_TASK_BIT_EXT);
++		case kMVKShaderStageTessEval:	return (VkShaderStageFlagBits)(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT | VK_SHADER_STAGE_MESH_BIT_EXT);
+ 		/* FIXME: kMVKShaderStageGeometry */
+ 		case kMVKShaderStageFragment:	return VK_SHADER_STAGE_FRAGMENT_BIT;
+ 		case kMVKShaderStageCompute:	return VK_SHADER_STAGE_COMPUTE_BIT;
+diff --git a/MoltenVK/MoltenVK/Vulkan/vulkan.mm b/MoltenVK/MoltenVK/Vulkan/vulkan.mm
+index 9ee0c4e..f4e1e5f 100644
+--- a/MoltenVK/MoltenVK/Vulkan/vulkan.mm
++++ b/MoltenVK/MoltenVK/Vulkan/vulkan.mm
+@@ -4297,6 +4297,47 @@ MVK_PUBLIC_VULKAN_CORE_ALIAS(vkResetQueryPool, EXT);
+ MVK_PUBLIC_VULKAN_CORE_ALIAS(vkCmdSetLineStipple, EXT);
+ 
+ 
++#pragma mark -
++#pragma mark VK_EXT_mesh_shader extension
++
++MVK_PUBLIC_VULKAN_SYMBOL void vkCmdDrawMeshTasksEXT(
++	VkCommandBuffer                             commandBuffer,
++	uint32_t                                    groupCountX,
++	uint32_t                                    groupCountY,
++	uint32_t                                    groupCountZ) {
++
++	MVKTraceVulkanCallStart();
++	MVKAddCmd(DrawMeshTasks, commandBuffer, groupCountX, groupCountY, groupCountZ);
++	MVKTraceVulkanCallEnd();
++}
++
++MVK_PUBLIC_VULKAN_SYMBOL void vkCmdDrawMeshTasksIndirectEXT(
++	VkCommandBuffer                             commandBuffer,
++	VkBuffer                                    buffer,
++	VkDeviceSize                                offset,
++	uint32_t                                    drawCount,
++	uint32_t                                    stride) {
++
++	MVKTraceVulkanCallStart();
++	MVKAddCmd(DrawMeshTasksIndirect, commandBuffer, buffer, offset, drawCount, stride);
++	MVKTraceVulkanCallEnd();
++}
++
++MVK_PUBLIC_VULKAN_SYMBOL void vkCmdDrawMeshTasksIndirectCountEXT(
++	VkCommandBuffer                             commandBuffer,
++	VkBuffer                                    buffer,
++	VkDeviceSize                                offset,
++	VkBuffer                                    countBuffer,
++	VkDeviceSize                                countBufferOffset,
++	uint32_t                                    maxDrawCount,
++	uint32_t                                    stride) {
++
++	MVKTraceVulkanCallStart();
++	MVKAddCmd(DrawMeshTasksIndirect, commandBuffer, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, stride);
++	MVKTraceVulkanCallEnd();
++}
++
++
+ #pragma mark -
+ #pragma mark VK_EXT_multi_draw extension
+ 
+diff --git a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVReflection.h b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVReflection.h
+index 6e58d48..b66baa9 100644
+--- a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVReflection.h
++++ b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVReflection.h
+@@ -338,6 +338,9 @@ namespace mvk {
+ 					(biType == spv::BuiltInMax || biType == spv::BuiltInPosition || biType == spv::BuiltInPointSize ||
+ 					 biType == spv::BuiltInClipDistance || biType == spv::BuiltInCullDistance))
+ 					type = &reflect.get_type(type->parent_type);
++				// Mesh shader outputs are arrayed per vertex / per primitive. Peel that array too.
++				else if (model == spv::ExecutionModelMeshEXT && storage == spv::StorageClassOutput && !type->array.empty())
++					type = &reflect.get_type(type->parent_type);
+ 
+ 				uint32_t elemCnt = (type->array.empty() ? 1 : type->array[0]) * type->columns;
+ 				for (uint32_t i = 0; i < elemCnt; i++) {

@@ -1,0 +1,219 @@
+From 2487f27e16cacb969daa067c39ed9fd096ac642c Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:12:09 -0500
+Subject: [PATCH 25/28] fix: pass shader interface types to SPIRV-Cross and fix
+ vertex format classes
+
+Problem: Pipeline creation rejected by Metal for interface mismatches D3D allows (one source of RE Engine E_OUTOFMEMORY/E_FAIL).
+
+Root cause: Fragment output type != render target type (e.g. float4 -> R32_UINT), VS->PS interface type mismatches, and vertex attribute format class != shader input type (e.g. UInt4 -> float4) are legal in Vulkan/D3D12 but rejected by Metal.
+
+Fix: Fill SPIRV-Cross fragment_output_basetypes from the color attachment formats and fragment_input_basetypes from the previous stage's outputs (single, unpacked outputs only), and serialize both in the pipeline cache. Reflect vertex shader input base types and remap the Metal vertex format to the shader's type class. Requires the SPIRV-Cross patches of this series (patches/spirv-cross).
+
+Verified by: test_shader_io_mismatch 3 -> 0 failures; vkd3d-proton re-sweep 0 regressions.
+
+Off switch: none
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h  |   1 +
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm | 128 ++++++++++++++++++++
+ 2 files changed, 129 insertions(+)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+index 4e56480..5056681 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+@@ -444,6 +444,7 @@ protected:
+ 	bool _isRasterizing = false;
+ 	bool _isRasterizingColor = false;
+ 	bool _isTessellationPipeline = false;
++	std::unordered_map<uint32_t, uint8_t> _vertexInputTypeClass;	// location -> 0 float, 1 int, 2 uint
+ 	bool _isMeshPipeline = false;
+ 	bool _hasTaskShader = false;
+ 	MTLSize _taskThreadgroupSize = {1, 1, 1};
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 515e6b6..ece3392 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -1191,6 +1191,22 @@ void MVKGraphicsPipeline::initMTLRenderPipelineState(const VkGraphicsPipelineCre
+ 		}
+ 	}
+ 
++	// Reflect vertex shader input base types per location, for vertex attribute format type-class fixups.
++	_vertexInputTypeClass.clear();
++	if (pVertexSS && _vertexModule) {
++		SPIRVShaderInputs vtxInputs;
++		std::string errLog;
++		if (getShaderInputs(_vertexModule->getSPIRV(), spv::ExecutionModelVertex, pVertexSS->pName, vtxInputs, errLog)) {
++			for (auto& in : vtxInputs) {
++				if (in.builtin != spv::BuiltInMax || in.location == uint32_t(-1)) { continue; }
++				using BT = SPIRV_CROSS_NAMESPACE::SPIRType;
++				uint8_t tc = (in.baseType == BT::Int || in.baseType == BT::Short || in.baseType == BT::SByte || in.baseType == BT::Int64) ? 1 :
++				             (in.baseType == BT::UInt || in.baseType == BT::UShort || in.baseType == BT::UByte || in.baseType == BT::UInt64) ? 2 : 0;
++				_vertexInputTypeClass[in.location] = tc;
++			}
++		}
++	}
++
+ 	if (isMeshPipeline()) {
+ 		id meshDesc = newMTLMeshRenderPipelineDescriptor(pCreateInfo, reflectData, pTessCtlSS, pTessCtlFB,
+ 		                                                 pTessEvalSS, pTessEvalFB, pFragmentSS, pFragmentFB);	// temp retain
+@@ -1320,6 +1336,67 @@ static void addCommonImplicitBuffersToShaderConfig(SPIRVToMSLConversionConfigura
+ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfiguration& shaderConfig, const MVKOnePerEnumEntry<uint8_t, MVKImplicitBuffer>& implicit, bool enable);
+ static void setDepthClipConfig(SPIRVToMSLConversionConfiguration& shaderConfig, const MVKOnePerEnumEntry<uint8_t, MVKImplicitBuffer>& implicit, bool enable);
+ 
++// Vulkan/D3D12 allow a vertex attribute's format type class (float vs signed vs unsigned integer) to differ
++// from the shader input's type (values are then undefined), but Metal rejects such pipelines. Remap the Metal
++// vertex format to one of the same size and component count in the shader's type class.
++// typeClass: 0 = float, 1 = signed int, 2 = unsigned int.
++static MTLVertexFormat mvkVertexFormatForShaderTypeClass(MTLVertexFormat f, uint8_t typeClass) {
++	struct Row { MTLVertexFormat flt, sint, uint; };
++	static const Row rows[] = {
++		// 32-bit components: bit reinterpretation.
++		{ MTLVertexFormatFloat,  MTLVertexFormatInt,  MTLVertexFormatUInt },
++		{ MTLVertexFormatFloat2, MTLVertexFormatInt2, MTLVertexFormatUInt2 },
++		{ MTLVertexFormatFloat3, MTLVertexFormatInt3, MTLVertexFormatUInt3 },
++		{ MTLVertexFormatFloat4, MTLVertexFormatInt4, MTLVertexFormatUInt4 },
++		// 16-bit components.
++		{ MTLVertexFormatHalf,  MTLVertexFormatShort,  MTLVertexFormatUShort },
++		{ MTLVertexFormatHalf2, MTLVertexFormatShort2, MTLVertexFormatUShort2 },
++		{ MTLVertexFormatHalf3, MTLVertexFormatShort3, MTLVertexFormatUShort3 },
++		{ MTLVertexFormatHalf4, MTLVertexFormatShort4, MTLVertexFormatUShort4 },
++	};
++	struct NormRow { MTLVertexFormat sNorm, uNorm, sint, uint; };
++	static const NormRow normRows[] = {
++		{ MTLVertexFormatCharNormalized,   MTLVertexFormatUCharNormalized,   MTLVertexFormatChar,   MTLVertexFormatUChar },
++		{ MTLVertexFormatChar2Normalized,  MTLVertexFormatUChar2Normalized,  MTLVertexFormatChar2,  MTLVertexFormatUChar2 },
++		{ MTLVertexFormatChar3Normalized,  MTLVertexFormatUChar3Normalized,  MTLVertexFormatChar3,  MTLVertexFormatUChar3 },
++		{ MTLVertexFormatChar4Normalized,  MTLVertexFormatUChar4Normalized,  MTLVertexFormatChar4,  MTLVertexFormatUChar4 },
++		{ MTLVertexFormatShortNormalized,  MTLVertexFormatUShortNormalized,  MTLVertexFormatShort,  MTLVertexFormatUShort },
++		{ MTLVertexFormatShort2Normalized, MTLVertexFormatUShort2Normalized, MTLVertexFormatShort2, MTLVertexFormatUShort2 },
++		{ MTLVertexFormatShort3Normalized, MTLVertexFormatUShort3Normalized, MTLVertexFormatShort3, MTLVertexFormatUShort3 },
++		{ MTLVertexFormatShort4Normalized, MTLVertexFormatUShort4Normalized, MTLVertexFormatShort4, MTLVertexFormatUShort4 },
++	};
++	for (auto& r : rows) {
++		if (f == r.flt || f == r.sint || f == r.uint) {
++			return typeClass == 0 ? r.flt : (typeClass == 1 ? r.sint : r.uint);
++		}
++	}
++	for (auto& r : normRows) {
++		bool isInt = (f == r.sint || f == r.uint);
++		bool isNorm = (f == r.sNorm || f == r.uNorm);
++		if (!isInt && !isNorm) { continue; }
++		bool isSigned = (f == r.sint || f == r.sNorm);
++		if (typeClass == 0) { return isNorm ? f : (isSigned ? r.sNorm : r.uNorm); }	// int -> normalized float
++		if (typeClass == 1) { return isSigned ? r.sint : r.sint; }
++		return r.uint;
++	}
++	return f;
++}
++
++static uint8_t mvkVertexFormatTypeClass(MTLVertexFormat f) {
++	switch (f) {
++		case MTLVertexFormatInt: case MTLVertexFormatInt2: case MTLVertexFormatInt3: case MTLVertexFormatInt4:
++		case MTLVertexFormatShort: case MTLVertexFormatShort2: case MTLVertexFormatShort3: case MTLVertexFormatShort4:
++		case MTLVertexFormatChar: case MTLVertexFormatChar2: case MTLVertexFormatChar3: case MTLVertexFormatChar4:
++			return 1;
++		case MTLVertexFormatUInt: case MTLVertexFormatUInt2: case MTLVertexFormatUInt3: case MTLVertexFormatUInt4:
++		case MTLVertexFormatUShort: case MTLVertexFormatUShort2: case MTLVertexFormatUShort3: case MTLVertexFormatUShort4:
++		case MTLVertexFormatUChar: case MTLVertexFormatUChar2: case MTLVertexFormatUChar3: case MTLVertexFormatUChar4:
++			return 2;
++		default:
++			return 0;
++	}
++}
++
+ // SPIRV-Cross looks up resource bindings by the entry point's execution model. Mesh pipelines reuse the
+ // tessellation stage slots, so duplicate those bindings under the task/mesh execution models.
+ static void aliasTessBindingsForMeshStages(SPIRVToMSLConversionConfiguration& shaderConfig) {
+@@ -1880,6 +1957,28 @@ bool MVKGraphicsPipeline::addFragmentShaderToPipeline(MTLRenderPipelineDescripto
+ 	auto& mtlFeats = getMetalFeatures();
+ 	if (pFragmentSS) {
+ 		shaderConfig.options.entryPointStage = spv::ExecutionModelFragment;
++		// Tell SPIRV-Cross each color attachment's base type, so outputs whose type doesn't match
++		// (legal in Vulkan/D3D12, rejected by Metal) are retyped and bit-cast instead of failing the pipeline.
++		mvkClear(shaderConfig.options.mslOptions.fragment_output_basetypes, 8);
++		if (const VkPipelineRenderingCreateInfo* pRendInfo = getRenderingCreateInfo(pCreateInfo)) {
++			for (uint32_t caIdx = 0; caIdx < pRendInfo->colorAttachmentCount && caIdx < 8; caIdx++) {
++				VkFormat fmt = pRendInfo->pColorAttachmentFormats ? pRendInfo->pColorAttachmentFormats[caIdx] : VK_FORMAT_UNDEFINED;
++				if (fmt == VK_FORMAT_UNDEFINED) { continue; }
++				uint8_t bt = 0;
++				switch (getPixelFormats()->getFormatType(fmt)) {
++					case kMVKFormatColorHalf:
++					case kMVKFormatColorFloat:   bt = 1; break;
++					case kMVKFormatColorInt8:
++					case kMVKFormatColorInt16:
++					case kMVKFormatColorInt32:   bt = 2; break;
++					case kMVKFormatColorUInt8:
++					case kMVKFormatColorUInt16:
++					case kMVKFormatColorUInt32:  bt = 3; break;
++					default: break;
++				}
++				shaderConfig.options.mslOptions.fragment_output_basetypes[caIdx] = bt;
++			}
++		}
+ 		addCommonImplicitBuffersToShaderConfig(shaderConfig, implicit);
+ 		shaderConfig.options.mslOptions.view_mask_buffer_index = implicit[MVKImplicitBuffer::ViewRange];
+ 		shaderConfig.options.entryPointName = pFragmentSS->pName;
+@@ -2055,6 +2154,10 @@ bool MVKGraphicsPipeline::addVertexInputToPipeline(T* inputDesc,
+ 				}
+ 			}
+ 
++			auto tcIt = _vertexInputTypeClass.find(pVKVA->location);
++			if (tcIt != _vertexInputTypeClass.end() && mvkVertexFormatTypeClass((MTLVertexFormat)mtlFormat) != tcIt->second) {
++				mtlFormat = (decltype(vaDesc.format))mvkVertexFormatForShaderTypeClass((MTLVertexFormat)mtlFormat, tcIt->second);
++			}
+ 			vaDesc.format = mtlFormat;
+ 			vaDesc.bufferIndex = (decltype(vaDesc.bufferIndex))getMetalBufferIndexForVertexAttributeBinding(vaBinding);
+ 			vaDesc.offset = vaOffset;
+@@ -2528,12 +2631,24 @@ void MVKGraphicsPipeline::addNextStageInputToShaderConversionConfig(SPIRVToMSLCo
+ void MVKGraphicsPipeline::addPrevStageOutputToShaderConversionConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+                                                                      SPIRVShaderOutputs& shaderOutputs) {
+     shaderConfig.shaderInputs.clear();
++	// Record the previous stage's 32-bit output base types per location, so SPIRV-Cross can bit-cast fragment
++	// inputs whose type differs (legal in Vulkan/D3D12, rejected by Metal at pipeline creation).
++	mvkClear(shaderConfig.options.mslOptions.fragment_input_basetypes, 32);
+ 
+ 	mvk::MSLShaderInput si;
+ 	auto& sisv = si.shaderVar;
+ 	for (auto& so : shaderOutputs) {
+ 		if ( !so.isUsed ) { continue; }
+ 
++		if (so.builtin == spv::BuiltInMax && so.location < 32) {
++			// Only describe locations written by a single, unpacked output. Component-packed locations can mix types.
++			uint32_t sharers = 0;
++			for (auto& o2 : shaderOutputs) { if (o2.isUsed && o2.builtin == spv::BuiltInMax && o2.location == so.location) { sharers++; } }
++			using BT = SPIRV_CROSS_NAMESPACE::SPIRType;
++			uint8_t bt = so.baseType == BT::Float ? 1 : so.baseType == BT::Int ? 2 : so.baseType == BT::UInt ? 3 : 0;
++			shaderConfig.options.mslOptions.fragment_input_basetypes[so.location] = (sharers == 1 && so.component == 0) ? bt : 0;
++		}
++
+         sisv.location = so.location;
+ 		sisv.component = so.component;
+         sisv.builtin = so.builtin;
+@@ -2544,6 +2659,7 @@ void MVKGraphicsPipeline::addPrevStageOutputToShaderConversionConfig(SPIRVToMSLC
+ 
+         shaderConfig.shaderInputs.push_back(si);
+     }
++
+ }
+ 
+ // We render points if either the static topology or static polygon-mode dictate it.
+@@ -3098,6 +3214,18 @@ namespace SPIRV_CROSS_NAMESPACE {
+ 				opt.runtime_array_rich_descriptor,
+ 				opt.enable_base_index_zero,
+ 				opt.pad_fragment_output_components,
++				opt.fragment_output_basetypes[0], opt.fragment_output_basetypes[1],
++				opt.fragment_output_basetypes[2], opt.fragment_output_basetypes[3],
++				opt.fragment_output_basetypes[4], opt.fragment_output_basetypes[5],
++				opt.fragment_output_basetypes[6], opt.fragment_output_basetypes[7],
++				opt.fragment_input_basetypes[0], opt.fragment_input_basetypes[1], opt.fragment_input_basetypes[2], opt.fragment_input_basetypes[3],
++				opt.fragment_input_basetypes[4], opt.fragment_input_basetypes[5], opt.fragment_input_basetypes[6], opt.fragment_input_basetypes[7],
++				opt.fragment_input_basetypes[8], opt.fragment_input_basetypes[9], opt.fragment_input_basetypes[10], opt.fragment_input_basetypes[11],
++				opt.fragment_input_basetypes[12], opt.fragment_input_basetypes[13], opt.fragment_input_basetypes[14], opt.fragment_input_basetypes[15],
++				opt.fragment_input_basetypes[16], opt.fragment_input_basetypes[17], opt.fragment_input_basetypes[18], opt.fragment_input_basetypes[19],
++				opt.fragment_input_basetypes[20], opt.fragment_input_basetypes[21], opt.fragment_input_basetypes[22], opt.fragment_input_basetypes[23],
++				opt.fragment_input_basetypes[24], opt.fragment_input_basetypes[25], opt.fragment_input_basetypes[26], opt.fragment_input_basetypes[27],
++				opt.fragment_input_basetypes[28], opt.fragment_input_basetypes[29], opt.fragment_input_basetypes[30], opt.fragment_input_basetypes[31],
+ 				opt.vertex_input_1010102_uint_mask, opt.vertex_input_1010102_sint_mask,
+ 				opt.ios_support_base_vertex_instance,
+ 				opt.use_framebuffer_fetch_subpasses,

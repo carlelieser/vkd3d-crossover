@@ -1,0 +1,177 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:06:40 -0500
+Subject: [PATCH 05/20] fix: emulate 64-bit subgroup arithmetic in MSL
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: RE Engine aborts with "Fatal D3D error (1, E_FAIL)".
+
+Root cause: WaveActiveSum/WavePrefixSum and similar wave ops on uint64
+are emitted as Metal simd_sum/simd_prefix_* calls, which reject 64-bit
+types. The compute pipeline fails to compile, vkCreateComputePipelines
+returns VK_ERROR_INITIALIZATION_FAILED, and vkd3d-proton reports E_FAIL.
+
+Fix: emulate scalar 64-bit integer group ops exactly from 32-bit ones
+(spvSubgroup64*). Add reduces/scans lo16, hi16 of the low word and the
+high word separately so each partial sum fits in 32 bits; and/or/xor
+work per half, with scans built on the bitwise scan emulation; signed
+and unsigned min/max reduce the high half first, then the low half among
+lanes tied on it.
+
+Verified by: PRAGMATA SKETCHBOOK demo gets past the E_FAIL (see NOTES.md
+§17).
+
+Off switch: none.
+---
+ spirv_msl.cpp | 113 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ spirv_msl.hpp |   1 +
+ 2 files changed, 114 insertions(+)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index d311622..3ebfd04 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -7247,6 +7247,78 @@ void CompilerMSL::emit_custom_functions()
+ 			break;
+ 		}
+ 
++		case SPVFuncImplSubgroup64:
++		{
++			// Metal SIMD-group functions don't accept 64-bit types. Emulate 64-bit integer
++			// reductions/scans exactly from 32-bit ones, so inactive lanes behave as natively.
++			// Add: split into lo16 | lo-hi16 | hi32 so each partial sum fits in 32 bits.
++			static const char *const add_modes[][2] = {
++				{ "Reduce", "simd_sum" },
++				{ "InclusiveScan", "simd_prefix_inclusive_sum" },
++				{ "ExclusiveScan", "simd_prefix_exclusive_sum" },
++			};
++			for (auto &m : add_modes)
++			{
++				statement("template<typename T>");
++				statement("inline T spvSubgroup64", m[0], "_add(T v)");
++				begin_scope();
++				statement("ulong u = as_type<ulong>(v);");
++				statement("uint lo = uint(u), hi = uint(u >> 32);");
++				statement("uint a = ", m[1], "(lo & 0xFFFFu);");
++				statement("uint b = ", m[1], "(lo >> 16);");
++				statement("uint c = ", m[1], "(hi);");
++				statement("return as_type<T>(ulong(a) + (ulong(b) << 16) + (ulong(c) << 32));");
++				end_scope();
++				statement("");
++			}
++			// Bitwise: independent per half.
++			static const char *const bit_ops[] = { "and", "or", "xor" };
++			for (auto *op : bit_ops)
++			{
++				statement("template<typename T>");
++				statement("inline T spvSubgroup64Reduce_", op, "(T v)");
++				begin_scope();
++				statement("ulong u = as_type<ulong>(v);");
++				statement("return as_type<T>(ulong(simd_", op, "(uint(u))) | (ulong(simd_", op, "(uint(u >> 32))) << 32));");
++				end_scope();
++				statement("");
++				for (int ex = 0; ex < 2; ex++)
++				{
++					const char *mode = ex ? "Exclusive" : "Inclusive";
++					statement("template<typename T>");
++					statement("inline T spvSubgroup64", mode, "Scan_", op, "(T v)");
++					begin_scope();
++					statement("ulong u = as_type<ulong>(v);");
++					statement("return as_type<T>(ulong(spvSubgroup", mode, "Scan_", op, "(uint(u))) | (ulong(spvSubgroup", mode,
++					          "Scan_", op, "(uint(u >> 32))) << 32));");
++					end_scope();
++					statement("");
++				}
++			}
++			// Min/max: reduce the high half (signed or unsigned), then the low half among lanes tied on it.
++			static const char *const mm[][4] = {
++				{ "umin", "uint", "min", "0xFFFFFFFFu" },
++				{ "umax", "uint", "max", "0u" },
++				{ "smin", "int", "min", "0xFFFFFFFFu" },
++				{ "smax", "int", "max", "0u" },
++			};
++			for (auto &m : mm)
++			{
++				statement("template<typename T>");
++				statement("inline T spvSubgroup64Reduce_", m[0], "(T v)");
++				begin_scope();
++				statement("ulong u = as_type<ulong>(v);");
++				statement(m[1], " hi = as_type<", m[1], ">(uint(u >> 32));");
++				statement(m[1], " h = simd_", m[2], "(hi);");
++				statement("uint lo = (hi == h) ? uint(u) : ", m[3], ";");
++				statement("uint l = simd_", m[2], "(lo);");
++				statement("return as_type<T>((ulong(as_type<uint>(h)) << 32) | ulong(l));");
++				end_scope();
++				statement("");
++			}
++			break;
++		}
++
+ 		case SPVFuncImplSubgroupScanEmulation:
+ 		{
+ 			// Metal only has prefix scans for sum/product. Emulate bitwise/logical scans by
+@@ -18315,6 +18387,47 @@ void CompilerMSL::emit_subgroup_op(const Instruction &i)
+ 	if (scope != ScopeSubgroup)
+ 		SPIRV_CROSS_THROW("Only subgroup scope is supported.");
+ 
++	// 64-bit integer arithmetic/bitwise group ops: Metal SIMD-group functions reject 64-bit types.
++	{
++		const char *op64 = nullptr;
++		bool has_scans = true;
++		switch (op)
++		{
++		case OpGroupNonUniformIAdd: op64 = "add"; break;
++		case OpGroupNonUniformBitwiseAnd: op64 = "and"; break;
++		case OpGroupNonUniformBitwiseOr: op64 = "or"; break;
++		case OpGroupNonUniformBitwiseXor: op64 = "xor"; break;
++		case OpGroupNonUniformUMin: op64 = "umin"; has_scans = false; break;
++		case OpGroupNonUniformUMax: op64 = "umax"; has_scans = false; break;
++		case OpGroupNonUniformSMin: op64 = "smin"; has_scans = false; break;
++		case OpGroupNonUniformSMax: op64 = "smax"; has_scans = false; break;
++		default: break;
++		}
++		auto &rtype = get<SPIRType>(result_type);
++		if (op64 && rtype.width == 64 && rtype.vecsize == 1 &&
++		    (rtype.basetype == SPIRType::Int64 || rtype.basetype == SPIRType::UInt64))
++		{
++			auto operation = static_cast<GroupOperation>(ops[op_idx]);
++			const char *mode = nullptr;
++			if (operation == GroupOperationReduce)
++				mode = "Reduce";
++			else if (has_scans && operation == GroupOperationInclusiveScan)
++				mode = "InclusiveScan";
++			else if (has_scans && operation == GroupOperationExclusiveScan)
++				mode = "ExclusiveScan";
++			if (mode)
++			{
++				// The 64-bit helper block wraps the 32-bit scan emulation helpers, so it always needs them.
++				add_spv_func_and_recompile(SPVFuncImplSubgroupScanEmulation);
++				add_spv_func_and_recompile(SPVFuncImplSubgroup64);
++				std::string fn = join("spvSubgroup64", mode, "_", op64);
++				emit_unary_func_op(result_type, id, ops[op_idx + 1], fn.c_str());
++				register_control_dependent_expression(id);
++				return;
++			}
++		}
++	}
++
+ 	switch (op)
+ 	{
+ 	case OpGroupNonUniformElect:
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index dc4cb9c..3ddc13f 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -854,6 +854,7 @@ protected:
+ 		SPVFuncImplSubgroupBallotBitCount,
+ 		SPVFuncImplSubgroupAllEqual,
+ 		SPVFuncImplSubgroupScanEmulation,
++		SPVFuncImplSubgroup64,
+ 		SPVFuncImplAtomic64Emulation,
+ 		SPVFuncImplSubgroupShuffle,
+ 		SPVFuncImplSubgroupShuffleXor,
+-- 
+2.51.0
+

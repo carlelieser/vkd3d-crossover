@@ -1,0 +1,208 @@
+From a68101bc49db646de6c60d874ff0f7cca8822499 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:12:10 -0500
+Subject: [PATCH 26/28] feat: hoist indirect-count conversions in front of
+ render passes
+
+Problem: PRAGMATA SKETCHBOOK GPU-bound: the G-buffer was split into 73 render passes (187 per frame).
+
+Root cause: Metal has no indirect-count draws; MoltenVK converted each one with a compute dispatch at the draw, ending and restarting the Metal render pass (store + reload of every attachment).
+
+Fix: When a render pass begins, look ahead to its end and encode the conversions of all its indirect-count draws first; the draws use the pre-converted arguments. Inside a render pass the indirect and count buffers can only change through shader writes.
+
+Verified by: Median fps 12.4 -> 15.5 (+25%), render passes per frame 187 -> 66; all 8 execute_indirect tests identical with and without the hoist.
+
+Off switch: MVK_HOIST_INDIRECT_COUNT=0
+---
+ MoltenVK/MoltenVK/Commands/MVKCmdDraw.h       |  6 +++
+ MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm      | 52 ++++++++++++++++++-
+ MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h |  7 +++
+ .../MoltenVK/Commands/MVKCommandBuffer.mm     | 22 ++++++++
+ 4 files changed, 85 insertions(+), 2 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.h b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.h
+index 517c6cb..966b66b 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.h
+@@ -161,6 +161,9 @@ public:
+ 						uint32_t maxDrawCount,
+ 						uint32_t stride);
+ 
++	/** Encodes this draw's indirect-count conversion now (before its render pass begins). */
++	void hoistCountConversion(MVKCommandEncoder* cmdEncoder);
++
+ 	void encode(MVKCommandEncoder* cmdEncoder) override;
+ 
+ protected:
+@@ -205,6 +208,9 @@ public:
+ 						uint32_t drawCount,
+ 						uint32_t stride);
+ 
++	/** Encodes this draw's indirect-count conversion now (before its render pass begins). */
++	void hoistCountConversion(MVKCommandEncoder* cmdEncoder);
++
+ 	void encode(MVKCommandEncoder* cmdEncoder) override;
+ 	void encode(MVKCommandEncoder* cmdEncoder, const MVKIndexMTLBufferBinding& ibbOrig);
+ 
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+index 82fd7be..b1fb238 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+@@ -691,6 +691,38 @@ static const MVKMTLBufferAllocation* encodeIndirectCountConversion(
+ 	return convertedBuffer;
+ }
+ 
++// Same conversion, encoded outside any render pass (hoisted in front of it): no store actions, no restart.
++static const MVKMTLBufferAllocation* encodeIndirectCountConversionHoisted(
++		MVKCommandEncoder* cmdEncoder,
++		id<MTLBuffer> indirectBuffer,
++		VkDeviceSize indirectBufferOffset,
++		uint32_t indirectBufferStride,
++		id<MTLBuffer> countBuffer,
++		VkDeviceSize countBufferOffset,
++		uint32_t drawCount,
++		bool indexed) {
++	VkDeviceSize commandSize = indexed ? sizeof(MTLDrawIndexedPrimitivesIndirectArguments) : sizeof(MTLDrawPrimitivesIndirectArguments);
++	auto* convertedBuffer = cmdEncoder->getTempMTLBuffer(commandSize * drawCount, true);
++	auto* computeEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseDrawIndirectConvertBuffers);
++	MVKMetalComputeCommandEncoderState& state = cmdEncoder->getMtlCompute();
++	id<MTLComputePipelineState> pipeline = cmdEncoder->getCommandEncodingPool()->getCmdDrawIndirectCountConvertBuffersMTLComputePipelineState(indexed);
++	state.bindPipeline(computeEncoder, pipeline);
++	state.bindBuffer(computeEncoder, indirectBuffer, indirectBufferOffset, 0);
++	state.bindBuffer(computeEncoder, convertedBuffer->_mtlBuffer, convertedBuffer->_offset, 1);
++	state.bindStructBytes(computeEncoder, &indirectBufferStride, 2);
++	state.bindStructBytes(computeEncoder, &drawCount, 3);
++	state.bindBuffer(computeEncoder, countBuffer, countBufferOffset, 4);
++	NSUInteger threadWidth = pipeline.threadExecutionWidth;
++	if (cmdEncoder->getMetalFeatures().nonUniformThreadgroups) {
++		[computeEncoder dispatchThreads: MTLSizeMake(drawCount, 1, 1)
++						threadsPerThreadgroup: MTLSizeMake(threadWidth, 1, 1)];
++	} else {
++		[computeEncoder dispatchThreadgroups: MTLSizeMake(mvkCeilingDivide<NSUInteger>(drawCount, threadWidth), 1, 1)
++						  threadsPerThreadgroup: MTLSizeMake(threadWidth, 1, 1)];
++	}
++	return convertedBuffer;
++}
++
+ typedef struct MVKIndirectZeroDivisorVertexBuffer {
+ 	uint32_t mtlBufferIndex;
+ 	uint32_t stride;
+@@ -873,6 +905,12 @@ void MVKCmdDrawIndirect::encodeIndexedIndirect(MVKCommandEncoder* cmdEncoder,
+ 	diiCmd.encode(cmdEncoder, ibb);
+ }
+ 
++void MVKCmdDrawIndirect::hoistCountConversion(MVKCommandEncoder* cmdEncoder) {
++	if ( !_mtlCountBuffer || _drawCount == 0 ) { return; }
++	cmdEncoder->_hoistedIndirectCount[this] = encodeIndirectCountConversionHoisted(cmdEncoder, _mtlIndirectBuffer,
++			_mtlIndirectBufferOffset, _mtlIndirectBufferStride, _mtlCountBuffer, _mtlCountBufferOffset, _drawCount, false);
++}
++
+ void MVKCmdDrawIndirect::encode(MVKCommandEncoder* cmdEncoder) {
+ 
+ 	cmdEncoder->restartMetalRenderPassIfNeeded();
+@@ -881,7 +919,9 @@ void MVKCmdDrawIndirect::encode(MVKCommandEncoder* cmdEncoder) {
+ 	uint32_t indirectBufferStride = _mtlIndirectBufferStride;
+ 
+ 	if (_mtlCountBuffer && _drawCount > 0) {
+-		auto* convertedBuffer = encodeIndirectCountConversion(cmdEncoder,
++		auto hoisted = cmdEncoder->_hoistedIndirectCount.find(this);
++		auto* convertedBuffer = hoisted != cmdEncoder->_hoistedIndirectCount.end() ? hoisted->second :
++			encodeIndirectCountConversion(cmdEncoder,
+ 				indirectBuffer,
+ 				indirectBufferOffset,
+ 				indirectBufferStride,
+@@ -1222,6 +1262,12 @@ VkResult MVKCmdDrawIndexedIndirect::setContent(MVKCommandBuffer* cmdBuff,
+ 	return VK_SUCCESS;
+ }
+ 
++void MVKCmdDrawIndexedIndirect::hoistCountConversion(MVKCommandEncoder* cmdEncoder) {
++	if ( !_mtlCountBuffer || _drawCount == 0 ) { return; }
++	cmdEncoder->_hoistedIndirectCount[this] = encodeIndirectCountConversionHoisted(cmdEncoder, _mtlIndirectBuffer,
++			_mtlIndirectBufferOffset, _mtlIndirectBufferStride, _mtlCountBuffer, _mtlCountBufferOffset, _drawCount, true);
++}
++
+ void MVKCmdDrawIndexedIndirect::encode(MVKCommandEncoder* cmdEncoder) {
+ 	cmdEncoder->restartMetalRenderPassIfNeeded();
+ 	encode(cmdEncoder, cmdEncoder->getVkGraphics()._indexBuffer);
+@@ -1233,7 +1279,9 @@ void MVKCmdDrawIndexedIndirect::encode(MVKCommandEncoder* cmdEncoder, const MVKI
+ 	VkDeviceSize indirectBufferOffset = _mtlIndirectBufferOffset;
+ 	uint32_t indirectBufferStride = _mtlIndirectBufferStride;
+ 	if (_mtlCountBuffer && _drawCount > 0) {
+-		auto* convertedBuffer = encodeIndirectCountConversion(cmdEncoder,
++		auto hoisted = cmdEncoder->_hoistedIndirectCount.find(this);
++		auto* convertedBuffer = hoisted != cmdEncoder->_hoistedIndirectCount.end() ? hoisted->second :
++			encodeIndirectCountConversion(cmdEncoder,
+ 				indirectBuffer,
+ 				indirectBufferOffset,
+ 				indirectBufferStride,
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
+index f6c9462..ce221d0 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
+@@ -538,6 +538,13 @@ protected:
+ 
+ 	VkRect2D _renderArea;
+ 	MVKCommand* _lastMultiviewPassCmd;
++	MVKCommand* _currentEncodingCmd = nullptr;	// command being encoded (render-pass look-ahead)
++
++public:
++	/** Indirect-count draws whose count conversion was hoisted in front of the current render pass. */
++	std::unordered_map<const void*, const MVKMTLBufferAllocation*> _hoistedIndirectCount;
++protected:
++	void hoistIndirectCountConversions(MVKCommand* fromCmd);
+     MVKActivatedQueries* _pActivatedQueries;
+ 	MVKSmallVector<GPUCounterQuery, 16> _timestampStageCounterQueries;
+ 	MVKSmallVector<VkClearValue, kMVKDefaultAttachmentCount> _clearValues;
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+index 9baaade..f7b18a7 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+@@ -451,6 +451,7 @@ void MVKCommandEncoder::encodeCommands(MVKCommand* command) {
+ void MVKCommandEncoder::encodeCommandsImpl(MVKCommand* command) {
+     while(command) {
+         uint32_t prevMVPassIdx = _multiviewPassIndex;
++        _currentEncodingCmd = command;
+         command->encode(this);
+ 
+         if(_multiviewPassIndex > prevMVPassIdx) {
+@@ -473,12 +474,32 @@ void MVKCommandEncoder::encodeSecondary(MVKCommandBuffer* secondaryCmdBuffer) {
+ 	secondaryCmdBuffer->beginSecondaryEncoding(this);
+ 	MVKCommand* cmd = secondaryCmdBuffer->_head;
+ 	while (cmd) {
++		_currentEncodingCmd = cmd;
+ 		cmd->encode(this);
+ 		cmd = cmd->_next;
+ 	}
+ }
+ 
++// Metal has no indirect-count draws; MoltenVK converts each one with a compute dispatch. Done at the draw, that
++// splits the render pass (store + reload of every attachment), which on tile-based GPUs costs more than the draw.
++// Instead, before a render pass starts, convert every indirect-count draw recorded in it. Inside a Vulkan render
++// pass the indirect and count buffers can only change through shader writes, which GPU-driven renderers don't do to
++// their own draw arguments. MVK_HOIST_INDIRECT_COUNT=0 restores the per-draw path.
++void MVKCommandEncoder::hoistIndirectCountConversions(MVKCommand* fromCmd) {
++	static const bool enabled = !(getenv("MVK_HOIST_INDIRECT_COUNT") && getenv("MVK_HOIST_INDIRECT_COUNT")[0] == '0');
++	_hoistedIndirectCount.clear();
++	if ( !enabled || !fromCmd ) { return; }
++	for (MVKCommand* cmd = fromCmd->_next; cmd; cmd = cmd->_next) {
++		if (dynamic_cast<MVKCmdEndRendering*>(cmd) || dynamic_cast<MVKCmdEndRenderPass*>(cmd) ||
++			dynamic_cast<MVKCmdNextSubpass*>(cmd) ||
++			dynamic_cast<MVKCmdBeginRenderPassBase*>(cmd)) { break; }
++		if (auto* d = dynamic_cast<MVKCmdDrawIndexedIndirect*>(cmd)) { d->hoistCountConversion(this); }
++		else if (auto* d = dynamic_cast<MVKCmdDrawIndirect*>(cmd)) { d->hoistCountConversion(this); }
++	}
++}
++
+ void MVKCommandEncoder::beginRendering(MVKCommand* rendCmd, const VkRenderingInfo* pRenderingInfo) {
++	hoistIndirectCountConversions(_currentEncodingCmd == rendCmd ? rendCmd : nullptr);
+ 
+ 	VkSubpassContents contents = (mvkIsAnyFlagEnabled(pRenderingInfo->flags, VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT)
+ 								  ? VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS
+@@ -544,6 +565,7 @@ void MVKCommandEncoder::beginRenderpass(MVKCommand* passCmd,
+ 										MVKArrayRef<VkClearValue> clearValues,
+ 										MVKArrayRef<MVKImageView*> attachments,
+ 										MVKCommandUse cmdUse) {
++	hoistIndirectCountConversions(_currentEncodingCmd == passCmd ? passCmd : nullptr);
+ 	_pEncodingContext->setRenderingContext(renderPass, framebuffer);
+ 	_renderArea = renderArea;
+ 	_isRenderingEntireAttachment = (mvkVkOffset2DsAreEqual(_renderArea.offset, {0,0}) &&

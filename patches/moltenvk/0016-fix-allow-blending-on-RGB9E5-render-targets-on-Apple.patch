@@ -1,0 +1,38 @@
+From 5e98d5c27f8df7f9c342ddea676657f71f073e78 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:12:02 -0500
+Subject: [PATCH 16/28] fix: allow blending on RGB9E5 render targets on Apple
+ GPUs
+
+Problem: Black 3D world in PRAGMATA SKETCHBOOK.
+
+Root cause: The format capabilities drop blending for RGB9E5Float on macOS (channels cannot be write-masked individually while blending); RE Engine accumulates HDR lighting into R9G9B9E5 with blending.
+
+Fix: On Apple GPUs allow blending on RGB9E5Float when all RGB channels are written.
+
+Verified by: The world renders in PRAGMATA SKETCHBOOK.
+
+Off switch: none
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index c065c5d..71964ce 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -2122,6 +2122,14 @@ void MVKGraphicsPipeline::addFragmentOutputToPipeline(MTLRenderPipelineDescripto
+ 			VkFormat attachFmt = pRendInfo->pColorAttachmentFormats[caIdx];
+ 			MTLPixelFormat mtlPixFmt = getPixelFormats()->getMTLPixelFormat(attachFmt);
+ 			bool supportsBlend = getPixelFormats()->getCapabilities(mtlPixFmt) & kMVKMTLFmtCapsBlend;
++			// RGB9E5Float blends fine on Apple GPUs; the format caps only drop Blend on macOS because channels
++			// can't be individually write-enabled while blending. With all channels written (the write mask is
++			// forced to all-or-none below), allow it, so additive HDR accumulation into RGB9E5 targets works.
++			if (!supportsBlend && mtlPixFmt == MTLPixelFormatRGB9E5Float && isAppleGPU() &&
++				(pCA->colorWriteMask & (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT)) ==
++				(VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT)) {
++				supportsBlend = true;
++			}
+ 			MTLRenderPipelineColorAttachmentDescriptor* colorDesc = plDesc.colorAttachments[caLoc];
+             colorDesc.pixelFormat = mtlPixFmt;
+ 

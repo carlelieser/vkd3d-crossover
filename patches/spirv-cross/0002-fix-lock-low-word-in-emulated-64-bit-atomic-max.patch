@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:06:06 -0500
+Subject: [PATCH 02/20] fix: lock low word in emulated 64-bit atomic max
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: the emulated 64-bit atomic max can leave torn depth/ID pairs in
+visibility buffers (depth << 32 | payload).
+
+Root cause: the two 32-bit halves are updated without mutual exclusion,
+so with several writers per element the final low word can belong to a
+different writer than the final high word.
+
+Fix: UMax/SMax decide the high word with one 32-bit max, then write the
+low word under a short per-element lock: the low word is swapped to a
+busy sentinel (~0), the high word is re-read, and only a writer whose
+high word is still current stores its low word. Acquire, update and
+release happen in one loop iteration, so SIMD lanes contending for the
+same element cannot deadlock. The loop is bounded; a writer that cannot
+take the lock, or whose low word equals the sentinel, falls back to the
+existing write-and-repair scheme. Min keeps write-and-repair.
+
+Verified by: test_shader_sm66_64bit_atomics unchanged at 79/85, all
+min/max cases pass (see NOTES.md §34).
+
+Off switch: none.
+---
+ spirv_msl.cpp | 53 +++++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 51 insertions(+), 2 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index b1bf0e1..d91799a 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -7151,9 +7151,56 @@ void CompilerMSL::emit_custom_functions()
+ 				for (auto &m : mm)
+ 				{
+ 					bool sgn = strcmp(m[2], "int") == 0;
++					bool is_max = strcmp(m[1], "max") == 0;
+ 					statement("inline ulong spvAtomic64", m[0], "(", P, " p, ulong v)");
+ 					begin_scope();
+ 					statement("uint hi = uint(v >> 32), lo = uint(v);");
++					if (is_max)
++					{
++						// Max (visibility buffers: depth << 32 | payload). The high word is decided by one 32-bit max.
++						// The low word is written under a short lock: the low word itself is swapped to a BUSY
++						// sentinel (~0), the high word is re-read, and only a writer whose high word is still the
++						// current one stores its low word. Every writer that raises the high word takes the lock
++						// afterwards, so the final low word always belongs to the final high word (no torn pairs,
++						// even with many writers per element). Acquire, update and release happen in one loop
++						// iteration, so SIMD lanes contending for the same element cannot deadlock. A writer whose
++						// low word equals the sentinel, or that cannot get the lock in a bounded number of tries
++						// (memory left at ~0), falls back to the write-and-repair scheme below.
++						if (sgn)
++						{
++							statement("int ohs = atomic_fetch_max_explicit((", as, " atomic_int*)&p[1], int(hi), memory_order_relaxed);");
++							statement("uint oh = uint(ohs);");
++							statement("bool wins = int(hi) > ohs;");
++						}
++						else
++						{
++							statement("uint oh = atomic_fetch_max_explicit(&p[1], hi, memory_order_relaxed);");
++							statement("bool wins = hi > oh;");
++						}
++						statement("if (!wins && hi != oh)");
++						statement("    return spvAtomic64Pack(atomic_load_explicit(&p[0], memory_order_relaxed), oh);");
++						fence();
++						statement("uint lol = 0u;");
++						statement("bool done = lo == 0xFFFFFFFFu;");
++						statement("for (uint i = 0u; i < 4096u && !done; i++)");
++						begin_scope();
++						statement("uint cur = atomic_load_explicit(&p[0], memory_order_relaxed);");
++						statement("if (cur != 0xFFFFFFFFu && atomic_compare_exchange_weak_explicit(&p[0], &cur, 0xFFFFFFFFu, memory_order_relaxed, memory_order_relaxed))");
++						begin_scope();
++						fence();
++						statement("uint nh = atomic_load_explicit(&p[1], memory_order_relaxed);");
++						statement("lol = cur;");
++						statement("uint nl = (nh != hi) ? cur : (wins ? lo : max(cur, lo));");
++						fence();
++						statement("atomic_store_explicit(&p[0], nl, memory_order_relaxed);");
++						statement("done = true;");
++						end_scope();
++						end_scope();
++						statement("if (done && lo != 0xFFFFFFFFu)");
++						statement("    return spvAtomic64Pack(lol, oh);");
++					}
++					else
++					{
+ 					if (sgn)
+ 					{
+ 						statement("int ohs = atomic_fetch_", m[1], "_explicit((", as, " atomic_int*)&p[1], int(hi), memory_order_relaxed);");
+@@ -7165,9 +7212,11 @@ void CompilerMSL::emit_custom_functions()
+ 						statement("uint oh = atomic_fetch_", m[1], "_explicit(&p[1], hi, memory_order_relaxed);");
+ 						statement("bool wins = hi ", m[3], " oh;");
+ 					}
+-					// Write-and-repair. The fence orders our high-word update before our
++					}
++					// Write-and-repair (min ops; fallback for max). The fence orders our high-word update before our
+ 					// low-word write, so a writer that later displaces our low word is guaranteed to see our high word.
+-					fence();
++					if ( !is_max )
++						fence();
+ 					statement("uint ol;");
+ 					statement("if (wins)");
+ 					statement("    ol = atomic_exchange_explicit(&p[0], lo, memory_order_relaxed);");
+-- 
+2.51.0
+

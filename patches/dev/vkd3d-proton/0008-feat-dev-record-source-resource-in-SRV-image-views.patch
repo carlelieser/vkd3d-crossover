@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 12:00:00 +0000
+Subject: [PATCH 08/13] feat(dev): record source resource in SRV image views
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Dev only, not for release builds.
+
+Problem: the backbuffer-draw logger and the event recorder need to name the
+resource behind a descriptor.
+
+Root cause: n/a (diagnostic).
+
+Fix: texture SRV views keep the resource pointer, size, DXGI format and
+resource flags they were created from. Always filled in.
+
+Verified by: used by the backbuffer-draw logger in the Requiem investigation
+(N§29).
+
+Off switch: none (passive fields).
+---
+ libs/vkd3d/resource.c      | 13 ++++++++++++-
+ libs/vkd3d/vkd3d_private.h |  5 +++++
+ 2 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index 046f673..a5b4334 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -7260,7 +7260,18 @@ static struct vkd3d_view *vkd3d_create_texture_srv_view(struct d3d12_device *dev
+         }
+     }
+ 
+-    return vkd3d_view_map_create_view(&resource->view_map, device, &key);
++    {
++        struct vkd3d_view *view = vkd3d_view_map_create_view(&resource->view_map, device, &key);
++        if (view)
++        {
++            view->diag_resource = resource;
++            view->diag_width = (uint32_t)resource->desc.Width;
++            view->diag_height = resource->desc.Height;
++            view->diag_dxgi_format = resource->desc.Format;
++            view->diag_resource_flags = resource->flags;
++        }
++        return view;
++    }
+ }
+ 
+ static void vkd3d_create_texture_srv_embedded(vkd3d_cpu_descriptor_va_t desc_va,
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index f09c7cc..4fadd89 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -1381,6 +1381,11 @@ struct vkd3d_view
+             unsigned int w_size;
+         } texture;
+     } info;
++    /* Diagnostics: the resource an SRV image view was made from. */
++    const void *diag_resource;
++    uint32_t diag_width, diag_height;
++    uint32_t diag_dxgi_format;
++    uint32_t diag_resource_flags;
+ };
+ 
+ void vkd3d_view_decref(struct vkd3d_view *view, struct d3d12_device *device);

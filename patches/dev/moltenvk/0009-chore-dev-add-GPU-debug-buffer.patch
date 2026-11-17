@@ -1,0 +1,168 @@
+From 13ba6a777a55bd64a3d8edac0d8df69903f491e3 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:12:17 -0500
+Subject: [PATCH 09/10] chore(dev): add GPU debug buffer
+
+Problem: Needed values from inside game shaders ("GPU printf").
+
+Root cause: Diagnostics only; no defect.
+
+Fix: MVKDebugBuffer.h: a shared buffer bound at Metal buffer index 20 for fragment and compute pipelines; records are appended to $WINEPREFIX/drive_c/gfx-dbg.bin every 2 s on present (decoder tools/dev/dbgcap/decode.py).
+
+Verified by: Captured ~60 values per pixel in one run, which found the CAS comparator bug (SPIRV-Cross S1).
+
+Off switch: off by default; MVK_DEBUG_BUFFER=1, or automatic with MVK_MSL_OVERRIDE_DIR (MVK_DEBUG_BUFFER=0 disables)
+---
+ .../MoltenVK/Commands/MVKCommandBuffer.mm     |  2 +
+ .../Commands/MVKCommandEncoderState.mm        |  5 ++
+ MoltenVK/MoltenVK/Utility/MVKDebugBuffer.h    | 77 +++++++++++++++++++
+ 3 files changed, 84 insertions(+)
+ create mode 100644 MoltenVK/MoltenVK/Utility/MVKDebugBuffer.h
+
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+index 84a9dbe..9b47e99 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include "MVKCommandBuffer.h"
++#include "../Utility/MVKDebugBuffer.h"
+ #include "MVKFramebuffer.h"
+ #include "MVKCommandPool.h"
+ #include "MVKQueue.h"
+@@ -1145,6 +1146,7 @@ void passProbeWriteLocked(MVKPassProbe& pp) {
+ } // namespace
+ 
+ void mvkPassProbeOnPresent() {
++	MVKDebugBuffer::get().onPresent();
+ 	auto& pp = passProbe();
+ 	if ( !pp.enabled ) { return; }
+ 	std::lock_guard<std::mutex> guard(pp.lock);
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+index 4bb8e6c..bfa91d4 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+@@ -19,6 +19,7 @@
+ #include "MVKCommandEncoderState.h"
+ #include "MVKCommandEncodingPool.h"
+ #include "MVKCommandBuffer.h"
++#include "../Utility/MVKDebugBuffer.h"
+ #include "MVKImage.h"
+ #include "MVKRenderPass.h"
+ #include "MVKPipeline.h"
+@@ -1506,6 +1507,7 @@ void MVKMetalGraphicsCommandEncoderState::prepareDraw(
+ 		if (mtlPipeline != _pipeline) {
+ 			_pipeline = mtlPipeline;
+ 			[encoder setRenderPipelineState:mtlPipeline];
++			if (MVKDebugBuffer::get().enabled()) { [encoder setFragmentBuffer: MVKDebugBuffer::get().buffer(encoder.device) offset: 0 atIndex: MVKDebugBuffer::kIndex]; }
+ 		}
+ 	}
+ 
+@@ -1560,6 +1562,7 @@ void MVKMetalGraphicsCommandEncoderState::prepareHelperDraw(
+ 	if (_pipeline != state.pipeline) {
+ 		_pipeline = state.pipeline;
+ 		[encoder setRenderPipelineState:state.pipeline];
++		if (MVKDebugBuffer::get().enabled()) { [encoder setFragmentBuffer: MVKDebugBuffer::get().buffer(encoder.device) offset: 0 atIndex: MVKDebugBuffer::kIndex]; }
+ 	}
+ 	if (_cullMode != MTLCullModeNone) {
+ 		_cullMode = MTLCullModeNone;
+@@ -1669,6 +1672,7 @@ void MVKMetalComputeCommandEncoderState::prepareComputeDispatch(
+ 	if (_pipeline != mtlPipeline) {
+ 		_pipeline = mtlPipeline;
+ 		[encoder setComputePipelineState:mtlPipeline];
++		if (MVKDebugBuffer::get().enabled()) { [encoder setBuffer: MVKDebugBuffer::get().buffer(encoder.device) offset: 0 atIndex: MVKDebugBuffer::kIndex]; }
+ 	}
+ 
+ 	if (_vkStage != kMVKShaderStageCompute) {
+@@ -1718,6 +1722,7 @@ void MVKMetalComputeCommandEncoderState::prepareRenderDispatch(
+ 	if (_pipeline != mtlPipeline) {
+ 		_pipeline = mtlPipeline;
+ 		[encoder setComputePipelineState:mtlPipeline];
++		if (MVKDebugBuffer::get().enabled()) { [encoder setBuffer: MVKDebugBuffer::get().buffer(encoder.device) offset: 0 atIndex: MVKDebugBuffer::kIndex]; }
+ 	}
+ 
+ 	if (_vkStage != stage) {
+diff --git a/MoltenVK/MoltenVK/Utility/MVKDebugBuffer.h b/MoltenVK/MoltenVK/Utility/MVKDebugBuffer.h
+new file mode 100644
+index 0000000..cd3398d
+--- /dev/null
++++ b/MoltenVK/MoltenVK/Utility/MVKDebugBuffer.h
+@@ -0,0 +1,77 @@
++/*
++ * MVKDebugBuffer.h
++ *
++ * Diagnostics only (MVK_DEBUG_BUFFER=1): a shared buffer bound at Metal buffer index 20 for every fragment and
++ * compute pipeline, so hand-instrumented shaders (MVK_MSL_OVERRIDE_DIR) can record values ("GPU printf").
++ * Layout (uint32 words): [0] record counter, records of 64 words from word 64. A shader reserves a record with
++ * atomic_fetch_add on word 0 and writes it only if the slot is below kMaxRecords. Every 2 s (on present) the
++ * recorded words are appended to $WINEPREFIX/drive_c/gfx-dbg.bin as: "MVKDBG01", uint32 count, count * 64 words,
++ * and the counter is reset.
++ */
++
++#pragma once
++
++#import <Metal/Metal.h>
++#include <mutex>
++#include <chrono>
++#include <string>
++#include <cstdlib>
++#include <cstring>
++#include <fcntl.h>
++#include <unistd.h>
++
++class MVKDebugBuffer {
++public:
++	static constexpr uint32_t kIndex = 20;
++	static constexpr uint32_t kRecordWords = 64;
++	static constexpr uint32_t kMaxRecords = 8192;
++	static constexpr uint32_t kHeaderWords = 64;
++
++	static MVKDebugBuffer& get() { static MVKDebugBuffer* d = new MVKDebugBuffer(); return *d; }
++
++	bool enabled() const { return _enabled; }
++
++	id<MTLBuffer> buffer(id<MTLDevice> dev) {
++		if ( !_enabled ) { return nil; }
++		std::lock_guard<std::mutex> lock(_lock);
++		if ( !_buffer ) {
++			NSUInteger len = (kHeaderWords + kMaxRecords * kRecordWords) * 4;
++			_buffer = [dev newBufferWithLength: len options: MTLResourceStorageModeShared];
++			memset(_buffer.contents, 0, len);
++		}
++		return _buffer;
++	}
++
++	void onPresent() {
++		if ( !_enabled || !_buffer ) { return; }
++		double t = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
++		std::lock_guard<std::mutex> lock(_lock);
++		if (t - _lastDump < 2.0 || _dumps >= 400) { return; }
++		_lastDump = t;
++		volatile uint32_t* w = (volatile uint32_t*)_buffer.contents;
++		uint32_t count = w[0];
++		if ( !count ) { return; }
++		if (count > kMaxRecords) { count = kMaxRecords; }
++		std::string path;
++		if (const char* pfx = getenv("WINEPREFIX")) { path = std::string(pfx) + "/drive_c/gfx-dbg.bin"; }
++		else { path = "/tmp/gfx-dbg.bin"; }
++		int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
++		if (fd >= 0) {
++			ssize_t r = write(fd, "MVKDBG01", 8);
++			r = write(fd, &count, 4);
++			r = write(fd, (const void*)(w + kHeaderWords), (size_t)count * kRecordWords * 4);
++			(void)r;
++			close(fd);
++		}
++		w[0] = 0;
++		_dumps++;
++	}
++
++private:
++	MVKDebugBuffer() { const char* e = getenv("MVK_DEBUG_BUFFER"); const char* o = getenv("MVK_MSL_OVERRIDE_DIR"); _enabled = (e && e[0] == '1') || (o && *o && !(e && e[0] == '0')); }
++	bool _enabled = false;
++	std::mutex _lock;
++	id<MTLBuffer> _buffer = nil;
++	double _lastDump = 0;
++	int _dumps = 0;
++};

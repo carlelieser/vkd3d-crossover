@@ -1,0 +1,118 @@
+From cc81671bd3b04b5ac0dba7c4762cfa142080abf4 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:12:03 -0500
+Subject: [PATCH 17/28] fix: gate Metal private OpenGL mode behind
+ MVK_METAL_OPENGL_MODE
+
+Problem: With MVK_USE_METAL_PRIVATE_API=1 (needed for logic ops), geometry with z < 0 was drawn instead of clipped (test_depth_clip 0 -> 2 failures).
+
+Root cause: The private "OpenGL mode" that unlocks disabling primitive restart also switches clipping to OpenGL's z range [-w, w].
+
+Fix: Add mvkUseMetalOpenGLMode(): OpenGL mode only with MVK_METAL_OPENGL_MODE=1 (and the private API). Primitive-restart disable and VK_EXT_primitive_topology_list_restart follow it, so primitive restart stays always on as without the private API.
+
+Verified by: test_depth_clip back to 0 failures; test_primitive_restart (1) and test_dynamic_index_strip_cut (6) failures unchanged from the build without the private API.
+
+Off switch: MVK_METAL_OPENGL_MODE=1 re-enables OpenGL mode
+---
+ MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm | 2 +-
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm            | 3 ++-
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm          | 2 +-
+ MoltenVK/MoltenVK/GPUObjects/MVKRenderPass.mm        | 2 +-
+ MoltenVK/MoltenVK/Utility/MVKEnvironment.cpp         | 5 +++++
+ MoltenVK/MoltenVK/Utility/MVKEnvironment.h           | 7 +++++++
+ 6 files changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+index d10d08a..02fa230 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+@@ -1416,7 +1416,7 @@ void MVKMetalGraphicsCommandEncoderState::bindState(
+ #endif
+ #if MVK_USE_METAL_PRIVATE_API
+ 		if (anyStateNeeded.has(MVKRenderStateFlag::PrimitiveRestartEnable) &&
+-		    mvkEncoder.getMVKConfig().useMetalPrivateAPI &&
++		    mvkUseMetalOpenGLMode() &&
+ 		    [mvkEncoder._mtlRenderEncoder respondsToSelector:@selector(setPrimitiveRestartEnabled:index:)])
+ 		{
+ 			auto mvkRendEnc = static_cast<id<MVKMTLRenderCommandEncoder>>(mvkEncoder._mtlRenderEncoder);
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index 01096f8..8147faf 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -786,7 +786,7 @@ void MVKPhysicalDevice::getFeatures(VkPhysicalDeviceFeatures2* features) {
+ 			}
+ 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT: {
+ 				auto* listRestartFeatures = (VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT*)next;
+-				listRestartFeatures->primitiveTopologyListRestart = getMVKConfig().useMetalPrivateAPI;
++				listRestartFeatures->primitiveTopologyListRestart = mvkUseMetalOpenGLMode();
+ 				listRestartFeatures->primitiveTopologyPatchListRestart = false;
+ 				break;
+ 			}
+@@ -3684,6 +3684,7 @@ void MVKPhysicalDevice::initExtensions() {
+ 		pWritableExtns->vk_EXT_provoking_vertex.enabled = false;
+ #if MVK_USE_METAL_PRIVATE_API
+ 	}
++	if ( !mvkUseMetalOpenGLMode() ) { pWritableExtns->vk_EXT_primitive_topology_list_restart.enabled = false; }
+ #endif
+ }
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 71964ce..7a6dc98 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -909,7 +909,7 @@ MVKGraphicsPipeline::MVKGraphicsPipeline(MVKDevice* device,
+ 	_staticStateData.enable.set(MVKRenderStateEnableFlag::PrimitiveRestart, primitiveRestart);
+ 
+ #if MVK_USE_METAL_PRIVATE_API
+-	if (!getMVKConfig().useMetalPrivateAPI) {
++	if (!mvkUseMetalOpenGLMode()) {
+ #endif
+ 		// In Metal, primitive restart cannot be disabled, so issue a warning if the app
+ 		// has disabled it statically, or indicates that it might do so dynamically.
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKRenderPass.mm b/MoltenVK/MoltenVK/GPUObjects/MVKRenderPass.mm
+index b684166..0585be3 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKRenderPass.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKRenderPass.mm
+@@ -286,7 +286,7 @@ void MVKRenderSubpass::populateMTLRenderPassDescriptor(MTLRenderPassDescriptor*
+ 		if ([mtlRPDesc respondsToSelector: @selector(setDitherEnabled:)]) {
+ 			[mtlRPDesc setDitherEnabled:_isDitheringEnabled];
+ 		}
+-		if ([mtlRPDesc respondsToSelector: @selector(setOpenGLModeEnabled:)]) {
++		if (mvkUseMetalOpenGLMode() && [mtlRPDesc respondsToSelector: @selector(setOpenGLModeEnabled:)]) {
+ 			// Unlocks APIs such as setPrimitiveRestartEnabled.
+ 			[mtlRPDesc setOpenGLModeEnabled:true];
+ 		}
+diff --git a/MoltenVK/MoltenVK/Utility/MVKEnvironment.cpp b/MoltenVK/MoltenVK/Utility/MVKEnvironment.cpp
+index 5c91403..b3da1b9 100644
+--- a/MoltenVK/MoltenVK/Utility/MVKEnvironment.cpp
++++ b/MoltenVK/MoltenVK/Utility/MVKEnvironment.cpp
+@@ -150,6 +150,11 @@ static std::string _globalMVKConfigStringHolders[kMVKConfigurationStringCount] =
+ // Returns the MoltenVK config, lazily initializing it if necessary.
+ // We initialize lazily instead of in a library constructor function to
+ // ensure the NSProcessInfo environment is available when called upon.
++bool mvkUseMetalOpenGLMode() {
++	static const bool envOn = [] { const char* v = getenv("MVK_METAL_OPENGL_MODE"); return v && v[0] == '1'; }();
++	return envOn && getGlobalMVKConfig().useMetalPrivateAPI;
++}
++
+ const MVKConfiguration& getGlobalMVKConfig() {
+ 	if ( !_mvkGlobalConfigInitialized ) {
+ 		mvkInitGlobalConfigFromEnvVars();
+diff --git a/MoltenVK/MoltenVK/Utility/MVKEnvironment.h b/MoltenVK/MoltenVK/Utility/MVKEnvironment.h
+index e6d176c..92d666a 100644
+--- a/MoltenVK/MoltenVK/Utility/MVKEnvironment.h
++++ b/MoltenVK/MoltenVK/Utility/MVKEnvironment.h
+@@ -76,6 +76,13 @@ static constexpr uint32_t kMVKConfigurationStringCount = 2;
+ /** Global function to access MoltenVK configuration info. */
+ const MVKConfiguration& getGlobalMVKConfig();
+ 
++/**
++ * Whether render passes enable Metal's private "OpenGL mode". It unlocks disabling primitive restart, but it
++ * also switches clipping to the OpenGL z range [-w, w], so geometry behind a D3D/Vulkan near plane (z < 0)
++ * is no longer clipped. Off unless MVK_METAL_OPENGL_MODE=1 (and the private API is in use).
++ */
++bool mvkUseMetalOpenGLMode();
++
+ /** Sets the MoltenVK global configuration content. */
+ void mvkSetGlobalConfig(const MVKConfiguration& srcMVKConfig);
+ 

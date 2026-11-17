@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:11:05 -0500
+Subject: [PATCH 20/20] fix: honour LocalSizeId for gl_WorkGroupSize in MSL
+
+Problem: mesh shaders hung the GPU (WindowServer watchdog, user logged
+out).
+
+Root cause: with ExecutionModeLocalSizeId (SPIR-V 1.6, glslang) the
+literal workgroup size fields are 0, so gl_WorkGroupSize was emitted as
+uint3(0, 0, 0) and the mesh output and workgroup initialization loops
+stepped by 0 forever.
+
+Fix: read the sizes from the LocalSizeId constants, treat any remaining
+zero dimension as 1, and clamp the spvThreadCount and workgroup
+initialization strides to at least 1.
+
+Verified by: vkd3d-proton mesh shader suites pass (see NOTES.md
+Finding 11).
+
+Off switch: none.
+---
+ spirv_msl.cpp | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 0415847..3d87d7a 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -9087,9 +9087,20 @@ void CompilerMSL::emit_specialization_constants_and_structs()
+ 	if (workgroup_size_id == 0 && is_mesh_shader())
+ 	{
+ 		auto &execution = get_entry_point();
++		uint32_t wg[3] = { execution.workgroup_size.x, execution.workgroup_size.y, execution.workgroup_size.z };
++		// With LocalSizeId (SPIR-V 1.6), the literal fields are 0 and the sizes live in constant IDs.
++		// A zero size here makes the mesh output loops (spvThreadCount stride) spin forever and hang the GPU.
++		if (execution.flags.get(ExecutionModeLocalSizeId))
++		{
++			const uint32_t ids[3] = { execution.workgroup_size.id_x, execution.workgroup_size.id_y, execution.workgroup_size.id_z };
++			for (int i = 0; i < 3; i++)
++				wg[i] = ids[i] ? evaluate_constant_u32(ids[i]) : 1u;
++		}
++		for (auto &d : wg)
++			if (d == 0)
++				d = 1;
+ 		statement("constant uint3 ", builtin_to_glsl(BuiltInWorkgroupSize, StorageClassWorkgroup),
+-		          " [[maybe_unused]] = ", "uint3(", execution.workgroup_size.x, ", ", execution.workgroup_size.y, ", ",
+-		          execution.workgroup_size.z, ");");
++		          " [[maybe_unused]] = ", "uint3(", wg[0], ", ", wg[1], ", ", wg[2], ");");
+ 		statement("");
+ 	}
+ 
+@@ -22064,7 +22075,7 @@ void CompilerMSL::emit_mesh_outputs()
+ 	end_scope();
+ 	statement("spvMesh.set_primitive_count(spvMeshSizes.y);");
+ 
+-	statement("const uint spvThreadCount [[maybe_unused]] = (gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z);");
++	statement("const uint spvThreadCount [[maybe_unused]] = max(gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z, 1u);");
+ 
+ 	if (mesh_out_per_vertex != 0)
+ 	{
+@@ -22279,7 +22290,7 @@ void CompilerMSL::emit_workgroup_initialization(const SPIRVariable &var)
+ 		statement("threadgroup uint *", var_ptr_name, " = (threadgroup uint *)&", var_name, ";");
+ 		statement("uint ", var_size_name, " = ", "sizeof(", var_name, ");");
+ 		statement("uint ", var_pos_name, " = gl_LocalInvocationIndex;");
+-		statement("uint ", var_stride_name, " = gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z;");
++		statement("uint ", var_stride_name, " = max(gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z, 1u);");
+ 
+ 		statement("while (sizeof(uint) * ", var_pos_name, " < ", var_size_name, ")");
+ 		begin_scope();
+-- 
+2.51.0
+

@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:07:40 -0500
+Subject: [PATCH 10/20] fix: pass lane id to helper functions using emulated
+ derivatives
+
+Problem: compute, mesh and task shaders that use derivatives,
+implicit-LOD sampling or LOD queries inside a non-entry function fail to
+compile in Metal.
+
+Root cause: the emulated derivatives reference gl_SubgroupInvocationID,
+but extract_global_variables_from_function did not add it to the
+arguments of the functions that use it.
+
+Fix: add the SIMD lane id builtin to the function's arguments for
+derivative, implicit-LOD sample and OpImageQueryLod instructions in
+compute-like shaders.
+
+Verified by: vkd3d-proton mesh shader tests 260/260 (see NOTES.md
+Finding 11).
+
+Off switch: none.
+---
+ spirv_msl.cpp | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index a3939a6..f421f15 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -2296,6 +2296,25 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
+ 					added_arg_ids.insert(builtin_subgroup_invocation_id_id);
+ 				break;
+ 
++			// Emulated compute/mesh/task derivatives (and implicit-LOD sampling / LOD queries built on them)
++			// need the SIMD lane id inside whatever function uses them.
++			case OpDPdx:
++			case OpDPdxFine:
++			case OpDPdxCoarse:
++			case OpDPdy:
++			case OpDPdyFine:
++			case OpDPdyCoarse:
++			case OpFwidth:
++			case OpFwidthFine:
++			case OpFwidthCoarse:
++			case OpImageSampleImplicitLod:
++			case OpImageSampleProjImplicitLod:
++			case OpImageSparseSampleImplicitLod:
++			case OpImageQueryLod:
++				if (is_compute_like_shader() && builtin_subgroup_invocation_id_id)
++					added_arg_ids.insert(builtin_subgroup_invocation_id_id);
++				break;
++
+ 			case OpDemoteToHelperInvocation:
+ 				if (needs_manual_helper_invocation_updates() && needs_helper_invocation)
+ 					added_arg_ids.insert(builtin_helper_invocation_id);
+-- 
+2.51.0
+

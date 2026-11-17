@@ -1,0 +1,46 @@
+From 076f093781ef51099d04f460810b9213bcb36442 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:11:56 -0500
+Subject: [PATCH 08/28] fix: cap layers of no-attachment render passes
+
+Problem: Device lost (MTLCommandBuffer Internal Error 0x10d) on mesh draws in render passes without attachments.
+
+Root cause: vkd3d-proton's no-attachment pass is 16384x16384 x 2048 layers; on Apple GPUs mesh draws in a no-attachment pass with huge width*height*layers fault. Everything up to 2^34 pixels passed (reproduced natively).
+
+Fix: For passes without attachments, cap renderTargetArrayLength so width*height*layers <= 2^34. The extent is left alone (a smaller one would clip viewports and drop fragment UAV writes).
+
+Verified by: test_mesh_shader_rendering culling and cull_primitive subtests pass; native repro culltest.
+
+Off switch: none
+---
+ MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+index de39c96..9baaade 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+@@ -825,6 +825,23 @@ void MVKCommandEncoder::beginMetalRenderPass(MVKCommandUse cmdUse) {
+         } else {
+ 			renderTargetArrayLength = getFramebufferLayerCount();
+         }
++        // A render pass with no attachments (e.g. UAV-only rendering) has nothing to store per layer, but apps
++        // (and vkd3d-proton) often declare a maximal extent and layer count for it, e.g. 16384x16384 x 2048.
++        // On Apple GPUs, drawing with a mesh render pipeline into such a pass faults the command buffer
++        // ("Internal Error"); empirically, keeping width*height*layers <= 2^34 avoids it. Cap the layer count
++        // rather than the extent, since a smaller extent would clip large viewports and drop fragment UAV writes.
++        bool hasAttachments = mtlRPDesc.depthAttachment.texture || mtlRPDesc.stencilAttachment.texture;
++        for (uint32_t i = 0; i < 8 && !hasAttachments; i++) {
++            hasAttachments = mtlRPDesc.colorAttachments[i].texture != nil;
++        }
++        if ( !hasAttachments && renderTargetArrayLength > 1 ) {
++            static constexpr uint64_t kMaxNoAttachmentPixels = 1ull << 34;
++            uint64_t areaPixels = (uint64_t)mtlRPDesc.renderTargetWidth * (uint64_t)mtlRPDesc.renderTargetHeight;
++            uint64_t maxLayers = std::max<uint64_t>(kMaxNoAttachmentPixels / std::max<uint64_t>(areaPixels, 1), 1);
++            if (renderTargetArrayLength > maxLayers) {
++                renderTargetArrayLength = (uint32_t)maxLayers;
++            }
++        }
+         // Metal does not allow layered render passes where some RTs are 3D and others are 2D.
+         if (!(found3D && found2D) || renderTargetArrayLength > 1) {
+             mtlRPDesc.renderTargetArrayLength = renderTargetArrayLength;

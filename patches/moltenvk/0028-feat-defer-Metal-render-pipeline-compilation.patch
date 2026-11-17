@@ -1,0 +1,277 @@
+From c1cbf12dbb0d99a5bca62af8218edf841cf4e8cc Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:12:11 -0500
+Subject: [PATCH 28/28] feat: defer Metal render pipeline compilation
+
+Problem: Freezes whenever the game needs a pipeline that is still being created.
+
+Root cause: RE Engine re-creates its whole pipeline set (~48k render PSOs) on background threads every launch at ~16 ms each (~11 ms of it the Metal render pipeline compile), so the warm-up runs for minutes during play.
+
+Fix: vkCreateGraphicsPipelines (plain non-multiview, non-tessellation, non-mesh path) builds the descriptor and hands the Metal compile to MVKDeferredPSOScheduler, which keeps 4 compiles in flight. The first use of a still-queued pipeline submits it ahead of the queue and waits for it alone; while a draw waits, no background compiles are submitted and shader-library compiles yield (at most 50 ms each). Compile failures surface at first use; draws without a pipeline state are skipped as before.
+
+Verified by: Stutter shorter and rarer (user); 20 rendering/pipeline/multithread tests and psostress (8 threads x 300 PSOs) identical with deferral on and off.
+
+Off switch: MVK_DEFERRED_PSO=0 (MVK_DEFERRED_PSO_INFLIGHT sets the concurrency, default 4)
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h    |  17 ++-
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm   |  20 ++-
+ .../MoltenVK/GPUObjects/MVKShaderModule.mm    |   2 +
+ MoltenVK/MoltenVK/Utility/MVKDeferredPSO.h    | 142 ++++++++++++++++++
+ 4 files changed, 175 insertions(+), 6 deletions(-)
+ create mode 100644 MoltenVK/MoltenVK/Utility/MVKDeferredPSO.h
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+index 5056681..8153d54 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+@@ -266,8 +266,13 @@ public:
+ 	/** Returns the number of output tessellation patch control points. */
+ 	uint32_t getOutputControlPointCount() { return _outputControlPointCount; }
+ 
+-	/** Returns the MTLRenderPipelineState for the final stage of the pipeline */
+-	id<MTLRenderPipelineState> getMainPipelineState() const { return _mtlPipelineState; }
++	/**
++	 * Returns the MTLRenderPipelineState for the final stage of the pipeline. With deferred compilation
++	 * (MVKDeferredPSO.h) the first call waits for this pipeline's compile, moving it ahead of the queue if needed.
++	 */
++	id<MTLRenderPipelineState> getMainPipelineState() {
++		return _mainDeferred.load(std::memory_order_acquire) ? resolveDeferredMainState() : _mtlPipelineState;
++	}
+ 
+ 	/**
+ 	 * VK_EXT_dynamic_rendering_unused_attachments: returns a pipeline state whose attachment formats match the
+@@ -277,8 +282,8 @@ public:
+ 	id<MTLRenderPipelineState> getPipelineStateForAttachments(const MTLPixelFormat* color, MTLPixelFormat depth, MTLPixelFormat stencil);
+ 
+ 	/** Returns the MTLRenderPipelineState for the final stage of the pipeline */
+-	id<MTLRenderPipelineState> getMultiviewPipelineState(uint32_t mv) const {
+-		return _multiviewMTLPipelineStates.empty() ? _mtlPipelineState : _multiviewMTLPipelineStates.find(mv)->second;
++	id<MTLRenderPipelineState> getMultiviewPipelineState(uint32_t mv) {
++		return _multiviewMTLPipelineStates.empty() ? getMainPipelineState() : _multiviewMTLPipelineStates.find(mv)->second;
+ 	}
+ 
+ 	/** Returns the MTLComputePipelineState object for the vertex stage of a tessellated draw with no indices. */
+@@ -418,6 +423,10 @@ protected:
+ 	id<MTLComputePipelineState> _mtlTessVertexStageIndex32State = nil;
+ 	id<MTLComputePipelineState> _mtlTessControlStageState = nil;
+ 	id<MTLRenderPipelineState> _mtlPipelineState = nil;
++	std::shared_ptr<struct MVKDeferredRenderPSO> _deferredMain;	// main state compiling in the background
++	std::atomic<bool> _mainDeferred{false};
++	std::mutex _deferredLock;
++	id<MTLRenderPipelineState> resolveDeferredMainState();
+ 
+ 	// Attachment-format variants (VK_EXT_dynamic_rendering_unused_attachments).
+ 	MTLRenderPipelineDescriptor* _variantBaseDesc = nil;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index fd6fd0d..3ebf3e3 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -16,6 +16,7 @@
+  * limitations under the License.
+  */
+ 
++#include "../Utility/MVKDeferredPSO.h"
+ #include "MVKPipeline.h"
+ #include "MVKCommandBuffer.h"
+ #include "MVKInlineObjectConstructor.h"
+@@ -1037,6 +1038,16 @@ id<MTLRenderPipelineState> MVKGraphicsPipeline::getOrCompilePipeline(MTLRenderPi
+ 	return plState;
+ }
+ 
++id<MTLRenderPipelineState> MVKGraphicsPipeline::resolveDeferredMainState() {
++	std::lock_guard<std::mutex> g(_deferredLock);
++	if (_deferredMain) {
++		_mtlPipelineState = MVKDeferredPSOScheduler::get(getMTLDevice()).wait(_deferredMain);	// retained
++		_deferredMain.reset();
++	}
++	_mainDeferred.store(false, std::memory_order_release);
++	return _mtlPipelineState;
++}
++
+ id<MTLRenderPipelineState> MVKGraphicsPipeline::getPipelineStateForAttachments(const MTLPixelFormat* color,
+ 																			   MTLPixelFormat depth,
+ 																			   MTLPixelFormat stencil) {
+@@ -1246,8 +1257,13 @@ void MVKGraphicsPipeline::initMTLRenderPipelineState(const VkGraphicsPipelineCre
+ 					}
+ 				}
+ 			} else {
+-				getOrCompilePipeline(plDesc, _mtlPipelineState);
+-				if (_mtlPipelineState) {
++				if (MVKDeferredPSOScheduler::enabled()) {
++					_deferredMain = MVKDeferredPSOScheduler::get(getMTLDevice()).enqueue(plDesc);
++					_mainDeferred.store(true, std::memory_order_release);
++				} else {
++					getOrCompilePipeline(plDesc, _mtlPipelineState);
++				}
++				if (_mtlPipelineState || _mainDeferred.load()) {
+ 					_variantBaseDesc = [plDesc copy];	// retained; used to build attachment-format variants
+ 					for (uint32_t i = 0; i < 8; i++) { _plColorFormats[i] = plDesc.colorAttachments[i].pixelFormat; }
+ 					_plDepthFormat = plDesc.depthAttachmentPixelFormat;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+index fdb7ac1..5243f37 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+@@ -16,6 +16,7 @@
+  * limitations under the License.
+  */
+ 
++#include "../Utility/MVKDeferredPSO.h"
+ #include "MVKShaderModule.h"
+ #include "MVKPipeline.h"
+ #include "MVKFoundation.h"
+@@ -575,6 +576,7 @@ MVKShaderModule::~MVKShaderModule() {
+ id<MTLLibrary> MVKShaderLibraryCompiler::newMTLLibrary(NSString* mslSourceCode,
+ 													   const SPIRVToMSLConversionResultInfo& shaderConversionResults,
+ 													   const vector<pair<MSLSpecializationMacroInfo, MVKShaderMacroValue>>& specializationMacroDef) {
++	if (MVKDeferredPSOScheduler::enabled()) { MVKDeferredPSOScheduler::get(getMTLDevice()).yieldToUrgent(); }
+ 	unique_lock<mutex> lock(_completionLock);
+ 
+ 	compile(lock, ^{
+diff --git a/MoltenVK/MoltenVK/Utility/MVKDeferredPSO.h b/MoltenVK/MoltenVK/Utility/MVKDeferredPSO.h
+new file mode 100644
+index 0000000..9037bd8
+--- /dev/null
++++ b/MoltenVK/MoltenVK/Utility/MVKDeferredPSO.h
+@@ -0,0 +1,142 @@
++/*
++ * MVKDeferredPSO.h — deferred Metal render pipeline compilation.
++ *
++ * RE Engine (and other D3D12 games) re-create their whole pipeline set (~48k for Pragmata) on background threads every
++ * launch. On Windows a driver-cache hit costs a few hundredths of a ms; through vkd3d -> MoltenVK -> Metal it cost ~16 ms
++ * per pipeline (~11 ms of it the Metal render pipeline compile), so the warm-up never finished and the game stalled for
++ * 1-3 s whenever it needed a pipeline still queued.
++ *
++ * Here vkCreateGraphicsPipelines does the CPU work (shader conversion, libraries, descriptor) and hands the Metal
++ * pipeline compile to this scheduler, which keeps only a few compiles in flight. The first draw that needs a pipeline
++ * that is still queued submits it immediately (ahead of the queue) and waits for it alone; while any draw is waiting,
++ * no new background compiles are submitted, and shader-library compiles on the game's threads pause (yieldToUrgent,
++ * at most 50 ms each), so Metal's compiler service works on the urgent ones first.
++ * MVK_DEFERRED_PSO=0 disables; MVK_DEFERRED_PSO_INFLIGHT sets the background concurrency (default 4).
++ */
++#pragma once
++
++#import <Metal/Metal.h>
++#include "MVKBaseObject.h"
++#include <mutex>
++#include <condition_variable>
++#include <deque>
++#include <memory>
++#include <vector>
++#include <chrono>
++#include <stdlib.h>
++
++struct MVKDeferredRenderPSO {
++	MTLRenderPipelineDescriptor* desc = nil;		// retained copy
++	id<MTLRenderPipelineState> state = nil;		// retained when done
++	std::mutex lock;
++	std::condition_variable done;
++	int status = 0;								// 0 queued, 1 submitted, 2 done (guarded: 0->1 by scheduler lock, 1->2 by lock)
++	~MVKDeferredRenderPSO() { [desc release]; [state release]; }
++};
++
++class MVKDeferredPSOScheduler {
++public:
++	static bool enabled() {
++		static const bool e = !(getenv("MVK_DEFERRED_PSO") && getenv("MVK_DEFERRED_PSO")[0] == '0');
++		return e;
++	}
++
++	static MVKDeferredPSOScheduler& get(id<MTLDevice> dev) {
++		static MVKDeferredPSOScheduler* s = new MVKDeferredPSOScheduler(dev);
++		return *s;
++	}
++
++	/** Queues a compile of a copy of the descriptor. */
++	std::shared_ptr<MVKDeferredRenderPSO> enqueue(MTLRenderPipelineDescriptor* desc) {
++		auto job = std::make_shared<MVKDeferredRenderPSO>();
++		job->desc = [desc copy];
++		std::vector<std::shared_ptr<MVKDeferredRenderPSO>> submit;
++		{
++			std::lock_guard<std::mutex> g(_lock);
++			_queue.push_back(job);
++			takeLocked(submit);
++		}
++		for (auto& j : submit) { submitJob(j); }
++		return job;
++	}
++
++	/**
++	 * Called before other Metal compiles (shader libraries, synchronous pipelines) on the game's threads: while a draw is
++	 * waiting on a pipeline, waits (at most maxWaitMs) so Metal's compiler service works on the urgent one first.
++	 */
++	void yieldToUrgent(int maxWaitMs = 50) {
++		std::unique_lock<std::mutex> g(_lock);
++		if (_waiting == 0) { return; }
++		_urgentClear.wait_for(g, std::chrono::milliseconds(maxWaitMs), [&] { return _waiting == 0; });
++	}
++
++	/** Returns the compiled state (retained +1 for the caller), compiling it now if it is still queued. */
++	id<MTLRenderPipelineState> wait(const std::shared_ptr<MVKDeferredRenderPSO>& job) {
++		bool urgent = false;
++		{
++			std::lock_guard<std::mutex> g(_lock);
++			if (job->status == 0) { job->status = 1; _inflight++; urgent = true; }
++			_waiting++;		// pauses background submissions until every waiting draw has its pipeline
++		}
++		if (urgent) { submitJob(job, /*alreadyMarked*/ true); }
++		{
++			std::unique_lock<std::mutex> lk(job->lock);
++			job->done.wait(lk, [&] { return job->status == 2; });
++		}
++		std::vector<std::shared_ptr<MVKDeferredRenderPSO>> resume;
++		{
++			std::lock_guard<std::mutex> g(_lock);
++			_waiting--;
++			takeLocked(resume);
++		}
++		_urgentClear.notify_all();
++		for (auto& j : resume) { submitJob(j); }
++		return [job->state retain];
++	}
++
++private:
++	MVKDeferredPSOScheduler(id<MTLDevice> dev) : _dev([dev retain]) {
++		if (const char* v = getenv("MVK_DEFERRED_PSO_INFLIGHT")) { _maxInflight = std::max(1, atoi(v)); }
++	}
++
++	void takeLocked(std::vector<std::shared_ptr<MVKDeferredRenderPSO>>& out) {
++		while (_waiting == 0 && _inflight < _maxInflight && !_queue.empty()) {
++			auto j = _queue.front().lock();
++			_queue.pop_front();
++			if ( !j || j->status != 0 ) { continue; }		// pipeline destroyed, or already submitted urgently
++			j->status = 1;
++			_inflight++;
++			out.push_back(j);
++		}
++	}
++
++	// Called without the scheduler lock held (Metal may run the completion handler on this thread).
++	void submitJob(std::shared_ptr<MVKDeferredRenderPSO> job, bool alreadyMarked = true) {
++		[_dev newRenderPipelineStateWithDescriptor: job->desc
++								 completionHandler: ^(id<MTLRenderPipelineState> ps, NSError* error) {
++			{
++				std::lock_guard<std::mutex> g(job->lock);
++				job->state = [ps retain];
++				job->status = 2;
++				[job->desc release];
++				job->desc = nil;
++			}
++			job->done.notify_all();
++			std::vector<std::shared_ptr<MVKDeferredRenderPSO>> next;
++			{
++				std::lock_guard<std::mutex> g(_lock);
++				_inflight--;
++				takeLocked(next);
++			}
++			for (auto& j : next) { submitJob(j); }
++		}];
++	}
++
++	id<MTLDevice> _dev;
++	std::mutex _lock;
++	std::deque<std::weak_ptr<MVKDeferredRenderPSO>> _queue;
++	int _inflight = 0;
++	int _waiting = 0;		// draws currently blocked on a pipeline
++	std::condition_variable _urgentClear;
++	int _maxInflight = 4;
++};

@@ -1,0 +1,62 @@
+From a877a633c590f322ac141289c81afd811cc709f0 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:12:08 -0500
+Subject: [PATCH 23/28] fix: support A2B10G10R10 UINT/SINT vertex attributes
+
+Problem: Pipeline creation failed for vertex attributes in VK_FORMAT_A2B10G10R10_UINT/SINT_PACK32 (RE Engine "Fatal D3D error (1, E_FAIL)" hunt).
+
+Root cause: Metal has no 10:10:10:2 integer vertex format.
+
+Fix: Fetch the attribute as MTLVertexFormatUInt and unpack it in the vertex shader (SPIRV-Cross vertex_input_1010102_{uint,sint}_mask, included in the pipeline-cache serialization). Requires the SPIRV-Cross patches of this series (patches/spirv-cross).
+
+Verified by: PRAGMATA SKETCHBOOK demo: 0 pipeline failures.
+
+Off switch: none
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 60a7a13..e476cc9 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -2006,7 +2006,9 @@ bool MVKGraphicsPipeline::addVertexInputToPipeline(T* inputDesc,
+ 			uint32_t vaBinding = pVKVA->binding;
+ 			uint32_t vaOffset = pVKVA->offset;
+ 			auto vaDesc = inputDesc.attributes[pVKVA->location];
+-			auto mtlFormat = (decltype(vaDesc.format))getPixelFormats()->getMTLVertexFormat(pVKVA->format);
++			auto mtlFormat = (pVKVA->format == VK_FORMAT_A2B10G10R10_UINT_PACK32 || pVKVA->format == VK_FORMAT_A2B10G10R10_SINT_PACK32)
++				? (decltype(vaDesc.format))MTLVertexFormatUInt	// unpacked in the shader (vertex_input_1010102_*_mask)
++				: (decltype(vaDesc.format))getPixelFormats()->getMTLVertexFormat(pVKVA->format);
+ 
+ 			// Vulkan allows offsets to exceed the buffer stride, but Metal doesn't.
+ 			// If this is the case, fetch a translated artificial buffer binding, using the same MTLBuffer,
+@@ -2439,10 +2441,20 @@ void MVKGraphicsPipeline::addVertexInputToShaderConversionConfig(SPIRVToMSLConve
+                                                                  const VkGraphicsPipelineCreateInfo* pCreateInfo) {
+     // Set the shader conversion config vertex attribute information
+     shaderConfig.shaderInputs.clear();
++    shaderConfig.options.mslOptions.vertex_input_1010102_uint_mask = 0;
++    shaderConfig.options.mslOptions.vertex_input_1010102_sint_mask = 0;
+     uint32_t vaCnt = pCreateInfo->pVertexInputState->vertexAttributeDescriptionCount;
+     for (uint32_t vaIdx = 0; vaIdx < vaCnt; vaIdx++) {
+         const VkVertexInputAttributeDescription* pVKVA = &pCreateInfo->pVertexInputState->pVertexAttributeDescriptions[vaIdx];
+ 
++        // Metal has no 10:10:10:2 integer vertex format: fetch the packed word and unpack it in the shader.
++        if (pVKVA->location < 32) {
++            if (pVKVA->format == VK_FORMAT_A2B10G10R10_UINT_PACK32)
++                shaderConfig.options.mslOptions.vertex_input_1010102_uint_mask |= 1u << pVKVA->location;
++            else if (pVKVA->format == VK_FORMAT_A2B10G10R10_SINT_PACK32)
++                shaderConfig.options.mslOptions.vertex_input_1010102_sint_mask |= 1u << pVKVA->location;
++        }
++
+         // Set binding and offset from Vulkan vertex attribute
+         mvk::MSLShaderInput si;
+         si.shaderVar.location = pVKVA->location;
+@@ -3082,6 +3094,7 @@ namespace SPIRV_CROSS_NAMESPACE {
+ 				opt.runtime_array_rich_descriptor,
+ 				opt.enable_base_index_zero,
+ 				opt.pad_fragment_output_components,
++				opt.vertex_input_1010102_uint_mask, opt.vertex_input_1010102_sint_mask,
+ 				opt.ios_support_base_vertex_instance,
+ 				opt.use_framebuffer_fetch_subpasses,
+ 				opt.invariant_float_math,

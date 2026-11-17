@@ -1,0 +1,94 @@
+From a0be97c6dbe7e4936e0cb4b62239d82271eba63b Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:12:06 -0500
+Subject: [PATCH 21/28] fix: resume after command-buffer errors and host-signal
+ their semaphores
+
+Problem: One slow dispatch turned into a permanently black game that still presents; with resume on, fence waits could block forever.
+
+Root cause: Metal's watchdog kills command buffers running longer than ~0.5 s while the GPU drives the display (kIOGPUCommandBufferCallbackErrorImpactingInteractivity; Windows TDR is 2 s), and MoltenVK marked the device lost for good. Semaphore signals are encoded into the submission's last MTLCommandBuffer, so when it failed they never ran and timeline-semaphore (D3D12 fence) waiters blocked.
+
+Fix: Default MVK_CONFIG_RESUME_LOST_DEVICE to 1: a failed command buffer's work is dropped and the device stays usable (GPU removal / not-permitted still mark it lost). When the command buffer carrying the signals fails, deliver timeline-semaphore signals from the host (signalOnHostAfterGPUError).
+
+Verified by: hang probe: after the kill, follow-up work completes, Present works and a 1 MiB GPU copy is bit-exact; test_resolve_image_exhaustive_descriptors no longer hangs (16 s, same pre-existing failures); fence-wait robustness and device_removed_reason tests rechecked.
+
+Off switch: MVK_CONFIG_RESUME_LOST_DEVICE=0
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKQueue.h    | 1 +
+ MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm   | 5 +++++
+ MoltenVK/MoltenVK/GPUObjects/MVKSync.h     | 9 +++++++++
+ MoltenVK/MoltenVK/Utility/MVKEnvironment.h | 6 +++++-
+ 4 files changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.h b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.h
+index b18549c..f70ad0d 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.h
+@@ -180,6 +180,7 @@ public:
+ 
+ 	void encodeWait(id<MTLCommandBuffer> mtlCmdBuff);
+ 	void encodeSignal(id<MTLCommandBuffer> mtlCmdBuff);
++	void signalOnHostAfterGPUError() { if (_semaphore) { _semaphore->signalOnHostAfterGPUError(value); } }
+ 	MVKSemaphoreSubmitInfo(const VkSemaphoreSubmitInfo& semaphoreSubmitInfo);
+ 	MVKSemaphoreSubmitInfo(const VkSemaphore semaphore, VkPipelineStageFlags stageMask);
+ 	MVKSemaphoreSubmitInfo(const MVKSemaphoreSubmitInfo& other);
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
+index dec4b45..3c046ed 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
+@@ -548,6 +548,11 @@ VkResult MVKQueueCommandBufferSubmission::commitActiveMTLCommandBuffer(bool sign
+ 	uint64_t startTime = getPerformanceTimestamp();
+ 	[mtlCmdBuff addCompletedHandler: ^(id<MTLCommandBuffer> mtlCB) {
+ 		addPerformanceInterval(getPerformanceStats().queue.mtlCommandBufferExecution, startTime);
++		// The semaphore signals were encoded into this command buffer; if it failed they never ran.
++		// Deliver them from the host so waiters (e.g. D3D12 fences on timeline semaphores) are released.
++		if (signalCompletion && mtlCB.status == MTLCommandBufferStatusError) {
++			for (auto& ss : _signalSemaphores) { ss.signalOnHostAfterGPUError(); }
++		}
+ 		if (signalCompletion) { this->finish(); }	// Must be the last thing the completetion callback does.
+ 	}];
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKSync.h b/MoltenVK/MoltenVK/GPUObjects/MVKSync.h
+index e357299..3c98b98 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKSync.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKSync.h
+@@ -161,6 +161,12 @@ public:
+ 	 */
+ 	virtual void encodeSignal(id<MTLCommandBuffer> mtlCmdBuff, uint64_t value) = 0;
+ 
++	/**
++	 * Called when the MTLCommandBuffer that carried an encoded signal failed (and the device resumes):
++	 * the encoded signal never executed, so perform it on the host, or waiters would block forever.
++	 */
++	virtual void signalOnHostAfterGPUError(uint64_t value) {}
++
+ 	/**
+ 	 * Begin a deferred signal operation.
+ 	 *
+@@ -323,6 +329,9 @@ class MVKTimelineSemaphoreMTLEvent : public MVKTimelineSemaphore {
+ public:
+ 	void encodeWait(id<MTLCommandBuffer> mtlCmdBuff, uint64_t value) override;
+ 	void encodeSignal(id<MTLCommandBuffer> mtlCmdBuff, uint64_t value) override;
++	void signalOnHostAfterGPUError(uint64_t value) override {
++		if (_mtlEvent.signaledValue < value) { _mtlEvent.signaledValue = value; }
++	}
+ 	bool isUsingCommandEncoding() override { return true; }
+ 	id<MTLSharedEvent> getMTLSharedEvent() override { return _mtlEvent; };
+ 
+diff --git a/MoltenVK/MoltenVK/Utility/MVKEnvironment.h b/MoltenVK/MoltenVK/Utility/MVKEnvironment.h
+index 92d666a..10e2561 100644
+--- a/MoltenVK/MoltenVK/Utility/MVKEnvironment.h
++++ b/MoltenVK/MoltenVK/Utility/MVKEnvironment.h
+@@ -298,7 +298,11 @@ void mvkSetConfig(MVKConfiguration& dstMVKConfig, const MVKConfiguration& srcMVK
+ 
+ /** Resume MVKDevice VK_ERROR_DEVICE_LOST errors that do not cause MVKPhysicalDevice errors. Disabled by default. */
+ #ifndef MVK_CONFIG_RESUME_LOST_DEVICE
+-#   define MVK_CONFIG_RESUME_LOST_DEVICE    0
++/* On by default here: Metal's watchdog kills any command buffer running longer than ~0.5 s while the GPU is
++ * shared with the display ("Impacting Interactivity"), far below Windows' 2 s TDR. Losing the whole device for
++ * that turns one slow dispatch into a permanently black game. Errors that really end the device
++ * (GPU removed, not permitted) still mark it lost. MVK_CONFIG_RESUME_LOST_DEVICE=0 restores the old behaviour. */
++#   define MVK_CONFIG_RESUME_LOST_DEVICE    1
+ #endif
+ 
+ /** Support Metal argument buffers. Enabled by default. */

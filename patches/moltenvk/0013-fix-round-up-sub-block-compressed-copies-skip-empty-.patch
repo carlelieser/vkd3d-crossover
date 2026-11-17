@@ -1,0 +1,44 @@
+From 5a15cf810ddc298f0e7873e363806dc6ae0a31aa Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:11:59 -0500
+Subject: [PATCH 13/28] fix: round up sub-block compressed copies, skip empty
+ copies
+
+Problem: Process abort on a compressed -> uncompressed image copy smaller than one block.
+
+Root cause: The copy extent was divided by the block size with truncation, producing a 0x0 buffer->texture copy, which Metal aborts on.
+
+Fix: Round the block division up, and skip zero-sized buffer<->texture copies (no-ops in Vulkan).
+
+Verified by: Startup-path probes (probe2-4); vkd3d-proton sweep of 597 tests, 0 regressions.
+
+Off switch: none
+---
+ MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm b/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm
+index ab318c5..15c12ef 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm
+@@ -190,8 +190,9 @@ void MVKCmdCopyImage<N>::encode(MVKCommandEncoder* cmdEncoder, MVKCommandUse com
+             VkExtent3D dstExtent = vkIC.extent;
+             if (isSrcCompressed && !isDstCompressed) {
+                 VkExtent2D srcBlockExtent = pixFmts->getBlockTexelSize(srcMTLPixFmt);
+-                dstExtent.width /= srcBlockExtent.width;
+-                dstExtent.height /= srcBlockExtent.height;
++                // Round up: a region reaching the image edge may be smaller than one block.
++                dstExtent.width = (dstExtent.width + srcBlockExtent.width - 1) / srcBlockExtent.width;
++                dstExtent.height = (dstExtent.height + srcBlockExtent.height - 1) / srcBlockExtent.height;
+             } else if (!isSrcCompressed && isDstCompressed) {
+                 VkExtent2D dstBlockExtent = pixFmts->getBlockTexelSize(dstMTLPixFmt);
+                 dstExtent.width *= dstBlockExtent.width;
+@@ -1149,6 +1150,8 @@ void MVKCmdBufferImageCopy<N>::encode(MVKCommandEncoder* cmdEncoder) {
+ 		MTLSize mtlTxtSize = mvkClampMTLSize(mvkMTLSizeFromVkExtent3D(cpyRgn.imageExtent),
+ 											 mtlTxtOrigin,
+ 											 mvkMTLSizeFromVkExtent3D(_image->getExtent3D(planeIndex, mipLevel)));
++		// Metal aborts on zero-sized buffer<->texture copies; they are no-ops in Vulkan.
++		if (mtlTxtSize.width == 0 || mtlTxtSize.height == 0 || mtlTxtSize.depth == 0) { continue; }
+ 		NSUInteger mtlBuffOffset = mtlBuffOffsetBase + cpyRgn.bufferOffset;
+ 
+         uint32_t buffImgWd = cpyRgn.bufferRowLength;

@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 12:00:00 +0000
+Subject: [PATCH 04/13] feat(dev): track PSOs recreated after a rejected cached
+ blob
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Dev only, not for release builds.
+
+Problem: the failure log showed cached PSO blobs rejected with E_INVALIDARG;
+unclear whether the game then rebuilt those PSOs or ran without them.
+
+Root cause: n/a (diagnostic).
+
+Fix: remember the state hash of each PSO whose cached blob was rejected and
+log "pso-retry" when the same PSO is later created; a status line from
+Present at most once a minute.
+
+Verified by: rejected cached PSO blobs are all recreated, so they were not
+the cause of Requiem's black screen (N§29).
+
+Off switch: none of its own (on by default); VKD3D_FAILURE_LOG=0.
+---
+ libs/vkd3d/state.c         | 57 ++++++++++++++++++++++++++++++++++++++
+ libs/vkd3d/swapchain.c     |  2 ++
+ libs/vkd3d/vkd3d_private.h |  1 +
+ 3 files changed, 60 insertions(+)
+
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index b640fb7..f9cbeef 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -6316,6 +6316,60 @@ static HRESULT d3d12_pipeline_create_private_root_signature(struct d3d12_device
+     return S_OK;
+ }
+ 
++/* Diagnostic: track PSOs whose cached blob was rejected (E_INVALIDARG) and whether the
++ * application later recreates the same PSO (same state hash) without the blob. */
++#define VKD3D_PSO_RETRY_MAX 256
++static pthread_mutex_t vkd3d_pso_retry_lock = PTHREAD_MUTEX_INITIALIZER;
++static uint64_t vkd3d_pso_retry_hashes[VKD3D_PSO_RETRY_MAX];
++static unsigned int vkd3d_pso_retry_count, vkd3d_pso_retry_done, vkd3d_pso_retry_total;
++static uint64_t vkd3d_pso_retry_last_report;
++
++static void vkd3d_pso_retry_note_rejected(uint64_t hash)
++{
++    pthread_mutex_lock(&vkd3d_pso_retry_lock);
++    vkd3d_pso_retry_total++;
++    if (vkd3d_pso_retry_count < VKD3D_PSO_RETRY_MAX)
++        vkd3d_pso_retry_hashes[vkd3d_pso_retry_count++] = hash;
++    pthread_mutex_unlock(&vkd3d_pso_retry_lock);
++}
++
++static void vkd3d_pso_retry_note_created(uint64_t hash)
++{
++    unsigned int i;
++    bool found = false;
++    pthread_mutex_lock(&vkd3d_pso_retry_lock);
++    for (i = 0; i < vkd3d_pso_retry_count; i++)
++    {
++        if (vkd3d_pso_retry_hashes[i] == hash)
++        {
++            vkd3d_pso_retry_hashes[i] = vkd3d_pso_retry_hashes[--vkd3d_pso_retry_count];
++            vkd3d_pso_retry_done++;
++            found = true;
++            break;
++        }
++    }
++    pthread_mutex_unlock(&vkd3d_pso_retry_lock);
++    if (found)
++        vkd3d_failure_log("pso-retry", "PSO with rejected cached blob was recreated successfully");
++}
++
++void vkd3d_pso_retry_report(void)
++{
++    unsigned int pending, done, total;
++    uint64_t now = vkd3d_get_current_time_ns();
++    pthread_mutex_lock(&vkd3d_pso_retry_lock);
++    if (!vkd3d_pso_retry_total || now - vkd3d_pso_retry_last_report < 60ull * 1000000000ull)
++    {
++        pthread_mutex_unlock(&vkd3d_pso_retry_lock);
++        return;
++    }
++    vkd3d_pso_retry_last_report = now;
++    pending = vkd3d_pso_retry_count; done = vkd3d_pso_retry_done; total = vkd3d_pso_retry_total;
++    pthread_mutex_unlock(&vkd3d_pso_retry_lock);
++    vkd3d_failure_log("pso-retry", "status: %u PSOs had their cached blob rejected, %u recreated without it, %u never recreated",
++            total, done, pending);
++}
++
+ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindPoint bind_point,
+         const struct d3d12_pipeline_state_desc *desc, struct d3d12_pipeline_state **state)
+ {
+@@ -6380,6 +6434,8 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
+ 
+         if (FAILED(hr))
+         {
++            if (hr == E_INVALIDARG)
++                vkd3d_pso_retry_note_rejected(object->pipeline_cache_compat.state_desc_compat_hash);
+             if (object->root_signature)
+                 d3d12_root_signature_dec_ref(object->root_signature);
+             rwlock_destroy(&object->lock);
+@@ -6517,6 +6573,7 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
+     }
+ 
+     TRACE("Created pipeline state %p.\n", object);
++    vkd3d_pso_retry_note_created(object->pipeline_cache_compat.state_desc_compat_hash);
+ 
+ #ifdef VKD3D_ENABLE_PROFILING
+     vkd3d_timestamp_profiler_register_pipeline_state(device->timestamp_profiler, object);
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 2a13048..82233ae 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -1129,6 +1129,8 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
+             iface, SyncInterval, PresentFlags, pPresentParameters);
+     (void)pPresentParameters;
+ 
++    vkd3d_pso_retry_report();
++
+     /* Like DXGI: once the device is removed, Present fails instead of silently presenting nothing,
+      * so the application notices (and can query GetDeviceRemovedReason / recreate the device). */
+     {
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index a943373..8760741 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -2538,6 +2538,7 @@ struct vkd3d_pipeline_key
+ };
+ 
+ bool d3d12_pipeline_state_has_replaced_shaders(struct d3d12_pipeline_state *state);
++void vkd3d_pso_retry_report(void);
+ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindPoint bind_point,
+         const struct d3d12_pipeline_state_desc *desc, struct d3d12_pipeline_state **state);
+ VkPipeline d3d12_pipeline_state_get_or_create_pipeline(struct d3d12_pipeline_state *state,

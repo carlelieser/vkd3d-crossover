@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 12:00:00 +0000
+Subject: [PATCH 6/7] fix: return device removal from Present
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: after device removal Present kept returning S_OK while nothing
+rendered, so one slow dispatch left a permanently black game that still
+"presents" (cursor visible, frame counter running) (V3).
+
+Root cause: dxgi_vk_swap_chain_Present never checked the device's removed
+reason; vkd3d only reported removal through submits and fences.
+
+Fix: once the device is removed, Present returns the removed reason
+(DXGI_ERROR_DEVICE_REMOVED), as DXGI does, before doing any work.
+
+Verified by: hang probe with MVK_CONFIG_RESUME_LOST_DEVICE=0: Present returns
+0x887a0005 (N§27); device_removed_reason and fence-wait robustness tests
+rechecked after the step-6 sweep (N§27e).
+
+Off switch: none.
+---
+ libs/vkd3d/swapchain.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 2c6e9c7..2a13048 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -1129,6 +1129,14 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
+             iface, SyncInterval, PresentFlags, pPresentParameters);
+     (void)pPresentParameters;
+ 
++    /* Like DXGI: once the device is removed, Present fails instead of silently presenting nothing,
++     * so the application notices (and can query GetDeviceRemovedReason / recreate the device). */
++    {
++        HRESULT removed = d3d12_device_removed_reason(chain->queue->device);
++        if (FAILED(removed))
++            return removed;
++    }
++
+     if (dxgi_vk_swap_chain_present_is_occluded(chain, PresentFlags))
+         return DXGI_STATUS_OCCLUDED;
+     if (PresentFlags & DXGI_PRESENT_TEST)

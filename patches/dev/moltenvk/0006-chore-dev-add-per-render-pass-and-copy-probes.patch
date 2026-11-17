@@ -1,0 +1,576 @@
+From e52ff8a6af14895c82e4ebe8ef1476746a031e22 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:12:15 -0500
+Subject: [PATCH 06/10] chore(dev): add per-render-pass and copy probes
+
+Problem: Needed to locate which pass produced black, NaN or saturated values.
+
+Root cause: Diagnostics only; no defect.
+
+Fix: MVK_PASS_PROBE=1: at 10 s and then every 20 s after the first present (up to 40 frames) one frame is captured; after each Metal render pass 24 rows of every color target are copied and summarized into $WINEPREFIX/drive_c/gfx-passes.log (draw kinds, fs/cs hashes, zero/NaN/Inf counts, hot-value histogram, texture identity). Copy probe: identifies the texture behind single-row image->buffer copies.
+
+Verified by: Located the hair pass and the k-buffer compositor.
+
+Off switch: off by default; MVK_PASS_PROBE=1 enables
+---
+ MoltenVK/MoltenVK/Commands/MVKCmdDispatch.mm  |   2 +
+ MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm      |   6 +
+ MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm  |  10 +
+ MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h |  23 ++
+ .../MoltenVK/Commands/MVKCommandBuffer.mm     | 346 ++++++++++++++++++
+ .../Commands/MVKCommandEncoderState.mm        |   6 +-
+ MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm  |   2 +
+ 7 files changed, 394 insertions(+), 1 deletion(-)
+
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDispatch.mm b/MoltenVK/MoltenVK/Commands/MVKCmdDispatch.mm
+index 2a7eff4..dbc836b 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdDispatch.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdDispatch.mm
+@@ -43,6 +43,7 @@ VkResult MVKCmdDispatch::setContent(MVKCommandBuffer* cmdBuff,
+ }
+ 
+ void MVKCmdDispatch::encode(MVKCommandEncoder* cmdEncoder) {
++	mvkPassProbeNoteDispatch();
+ 	MTLRegion mtlThreadgroupCount = MTLRegionMake3D(_baseGroupX, _baseGroupY, _baseGroupZ, _groupCountX, _groupCountY, _groupCountZ);
+ 	cmdEncoder->finalizeDispatchState();	// Ensure all updated state has been submitted to Metal
+ 	id<MTLComputeCommandEncoder> mtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseDispatch);
+@@ -69,6 +70,7 @@ VkResult MVKCmdDispatchIndirect::setContent(MVKCommandBuffer* cmdBuff, VkBuffer
+ }
+ 
+ void MVKCmdDispatchIndirect::encode(MVKCommandEncoder* cmdEncoder) {
++	mvkPassProbeNoteDispatch();
+     cmdEncoder->finalizeDispatchState();	// Ensure all updated state has been submitted to Metal
+     [cmdEncoder->getMTLComputeEncoder(kMVKCommandUseDispatch) dispatchThreadgroupsWithIndirectBuffer: _mtlIndirectBuffer
+ 																				indirectBufferOffset: _mtlIndirectBufferOffset
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+index 57dc7b3..b12d859 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+@@ -179,6 +179,7 @@ void MVKCmdDraw::encodeIndexedIndirect(MVKCommandEncoder* cmdEncoder) {
+ }
+ 
+ void MVKCmdDraw::encode(MVKCommandEncoder* cmdEncoder) {
++	cmdEncoder->notePassProbeDraw(0);
+ 
+ 	if (_vertexCount == 0 || _instanceCount == 0) { return; }	// Nothing to do.
+ 
+@@ -453,6 +454,7 @@ static const MVKMTLBufferAllocation* convertUint8IndexBuffer(MVKCommandEncoder*
+ }
+ 
+ void MVKCmdDrawIndexed::encode(MVKCommandEncoder* cmdEncoder) {
++	cmdEncoder->notePassProbeDraw(1);
+ 
+ 	if (_indexCount == 0 || _instanceCount == 0) { return; }	// Nothing to do.
+ 
+@@ -912,6 +914,7 @@ void MVKCmdDrawIndirect::hoistCountConversion(MVKCommandEncoder* cmdEncoder) {
+ }
+ 
+ void MVKCmdDrawIndirect::encode(MVKCommandEncoder* cmdEncoder) {
++	cmdEncoder->notePassProbeDraw(_mtlCountBuffer ? 4 : 2);
+ 
+ 	cmdEncoder->restartMetalRenderPassIfNeeded();
+ 	id<MTLBuffer> indirectBuffer = _mtlIndirectBuffer;
+@@ -1269,6 +1272,7 @@ void MVKCmdDrawIndexedIndirect::hoistCountConversion(MVKCommandEncoder* cmdEncod
+ }
+ 
+ void MVKCmdDrawIndexedIndirect::encode(MVKCommandEncoder* cmdEncoder) {
++	cmdEncoder->notePassProbeDraw(_mtlCountBuffer ? 4 : 3);
+ 	cmdEncoder->restartMetalRenderPassIfNeeded();
+ 	encode(cmdEncoder, cmdEncoder->getVkGraphics()._indexBuffer);
+ }
+@@ -1615,6 +1619,7 @@ static MVKGraphicsPipeline* prepareMeshDraw(MVKCommandEncoder* cmdEncoder) {
+ }
+ 
+ void MVKCmdDrawMeshTasks::encode(MVKCommandEncoder* cmdEncoder) {
++	cmdEncoder->notePassProbeDraw(5);
+ 	if (_groupCount[0] == 0 || _groupCount[1] == 0 || _groupCount[2] == 0) { return; }	// Nothing to do.
+ 	auto* pipeline = prepareMeshDraw(cmdEncoder);
+ 	if ( !pipeline ) { return; }
+@@ -1654,6 +1659,7 @@ VkResult MVKCmdDrawMeshTasksIndirect::setContent(MVKCommandBuffer* cmdBuff, VkBu
+ }
+ 
+ void MVKCmdDrawMeshTasksIndirect::encode(MVKCommandEncoder* cmdEncoder) {
++	cmdEncoder->notePassProbeDraw(6);
+ 	if (_drawCount == 0) { return; }
+ 
+ 	id<MTLBuffer> argBuffer = _mtlIndirectBuffer;
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm b/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm
+index 15c12ef..3b6b56c 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm
+@@ -1144,6 +1144,16 @@ void MVKCmdBufferImageCopy<N>::encode(MVKCommandEncoder* cmdEncoder) {
+         MTLPixelFormat mtlPixFmt = _image->getMTLPixelFormat(planeIndex);
+         id<MTLTexture> mtlTexture = _image->getMTLTexture(planeIndex);
+         if ( !mtlTexture ) { continue; }
++		// Diagnostics: identify the texture behind single-row image->buffer copies (vkd3d's one-time GPU readback),
++		// so it can be matched with the render targets in gfx-passes.log.
++		static const bool copyProbe = getenv("MVK_PASS_PROBE") && getenv("MVK_PASS_PROBE")[0] == '1';
++		if ( copyProbe && !_toImage && cpyRgn.imageExtent.height == 1 && mtlTexture.height >= 256 ) {
++			id<MTLTexture> root = mtlTexture;
++			while (root.parentTexture) { root = root.parentTexture; }
++			mvkLogFailure("copy-probe", "row copy to buffer from %lux%lu texture %p, storage %p%s, pixel format %lu, row %d",
++						  (unsigned long)mtlTexture.width, (unsigned long)mtlTexture.height, (void*)mtlTexture, (void*)root,
++						  root == mtlTexture ? "" : " (view)", (unsigned long)mtlTexture.pixelFormat, cpyRgn.imageOffset.y);
++		}
+ 
+ 		uint32_t mipLevel = cpyRgn.imageSubresource.mipLevel;
+         MTLOrigin mtlTxtOrigin = mvkMTLOriginFromVkOffset3D(cpyRgn.imageOffset);
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
+index f1f0498..ade48ea 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
+@@ -31,6 +31,15 @@
+ class MVKCommandPool;
+ class MVKQueueCommandBufferSubmission;
+ class MVKCommandEncoder;
++
++/**
++ * Per-render-pass probe (diagnostics). At ~10/30/60/120 s after the first present, one whole frame is captured:
++ * after every render pass, a 3x3 grid of each color target is copied out and, once the GPU is done, summarized
++ * (zero samples, NaN/Inf, max value) into $WINEPREFIX/drive_c/gfx-passes.log. MVK_PASS_PROBE=0 disables it.
++ */
++void mvkPassProbeOnPresent();
++void mvkPassProbeNoteDispatch();
++void mvkPassProbeNoteCS(uint64_t shaderHash);
+ class MVKCommandEncodingPool;
+ class MVKRenderPass;
+ class MVKFramebuffer;
+@@ -505,6 +514,20 @@ public:
+ 
+ 	/** The current Metal render encoder. */
+ 	id<MTLRenderCommandEncoder> _mtlRenderEncoder;
++	void* _passProbeTargets = nullptr;	// MVKPassProbe targets of the current Metal render pass (diagnostics)
++public:
++	/** Pass probe: counts draws in the current Metal render pass. kind: 0 draw, 1 indexed, 2 indirect, 3 indexed indirect,
++	 *  4 indirect-count (either), 5 mesh, 6 mesh indirect, 7 skipped (no valid pipeline). */
++	void notePassProbeDraw(int kind, uint32_t n = 1) { if (_passProbeTargets) { _passProbeDraws[kind] += n; } }
++	uint32_t _passProbeDraws[8] = {};
++	/** Pass probe: remembers the distinct fragment shaders (code hashes) drawn in the current Metal render pass. */
++	void notePassProbeFS(uint64_t h) {
++		if ( !_passProbeTargets || !h ) { return; }
++		for (uint32_t i = 0; i < _passProbeFSCount; i++) { if (_passProbeFS[i] == h) { return; } }
++		if (_passProbeFSCount < 6) { _passProbeFS[_passProbeFSCount++] = h; }
++	}
++	uint64_t _passProbeFS[6] = {};
++	uint32_t _passProbeFSCount = 0;
+ 
+ 	/** Tracks the state of command encoding. */
+ 	MVKCommandEncoderState _state;
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+index 9fbe6d0..84a9dbe 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+@@ -937,6 +937,255 @@ void MVKCommandEncoder::encodeBarrierUpdates() {
+ 
+ 
+ // Creates _mtlRenderEncoder and marks cached render state as dirty so it will be set into the _mtlRenderEncoder.
++
++#pragma mark -
++#pragma mark Per-render-pass probe (diagnostics)
++
++#include <chrono>
++#include <cmath>
++#include <fcntl.h>
++#include <unistd.h>
++
++namespace {
++
++struct MVKPassProbeTarget {
++	id<MTLTexture> tex = nil;
++	MTLPixelFormat fmt = MTLPixelFormatInvalid;
++	uint32_t w = 0, h = 0, level = 0, slice = 0, bpp = 0, offset = 0;
++	bool skipped = false;
++	const char* why = "";
++	void* texId = nullptr;	// identity, captured when the pass starts
++	void* storageId = nullptr;
++};
++
++struct MVKPassProbeRecord {
++	uint32_t index = 0;
++	uint32_t dispatchesBefore = 0;
++	uint32_t draws[8] = {};
++	uint64_t fs[6] = {};
++	uint32_t fsCount = 0;
++	std::vector<uint64_t> cs;	// compute shaders dispatched since the previous pass, in order (consecutive repeats folded)
++	std::vector<MVKPassProbeTarget> targets;
++};
++
++struct MVKPassProbe {
++	std::mutex lock;
++	bool enabled = true;
++	double firstPresent = 0;
++	int nextThreshold = 0;
++	bool active = false;		// recording the render passes of the current frame
++	bool closed = false;		// frame ended; waiting for GPU completion
++	bool written = true;
++	int dumpIndex = 0;
++	id<MTLBuffer> buffer = nil;
++	id<MTLFence> fence = nil;
++	uint32_t used = 0;
++	uint32_t passCounter = 0;
++	uint32_t dispatchCounter = 0;
++	uint32_t pending = 0;
++	std::vector<MVKPassProbeRecord> records;
++	std::vector<uint64_t> gapCS;
++
++	static constexpr uint32_t kBufferSize = 192u << 20;
++	static constexpr uint32_t kRows = 24;		// full-width rows sampled per target
++	static constexpr int kMaxDumps = 40;
++	static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
++	// Diagnostics only: off by default, MVK_PASS_PROBE=1 enables.
++	MVKPassProbe() { const char* v = getenv("MVK_PASS_PROBE"); enabled = (v && v[0] == '1'); }
++};
++
++MVKPassProbe& passProbe() { static MVKPassProbe* p = new MVKPassProbe(); return *p; }
++
++const char* passProbeFormatName(MTLPixelFormat f) {
++	switch (f) {
++		case MTLPixelFormatRGBA8Unorm: return "RGBA8"; case MTLPixelFormatRGBA8Unorm_sRGB: return "RGBA8-sRGB";
++		case MTLPixelFormatBGRA8Unorm: return "BGRA8"; case MTLPixelFormatBGRA8Unorm_sRGB: return "BGRA8-sRGB";
++		case MTLPixelFormatRGB10A2Unorm: return "RGB10A2"; case MTLPixelFormatRG11B10Float: return "RG11B10F";
++		case MTLPixelFormatRGB9E5Float: return "RGB9E5"; case MTLPixelFormatRGBA16Float: return "RGBA16F";
++		case MTLPixelFormatRG16Float: return "RG16F"; case MTLPixelFormatR16Float: return "R16F";
++		case MTLPixelFormatR32Float: return "R32F"; case MTLPixelFormatRG32Float: return "RG32F";
++		case MTLPixelFormatRGBA32Float: return "RGBA32F"; case MTLPixelFormatR8Unorm: return "R8";
++		case MTLPixelFormatRG8Unorm: return "RG8"; case MTLPixelFormatR16Unorm: return "R16";
++		case MTLPixelFormatRG16Unorm: return "RG16"; case MTLPixelFormatRGBA16Unorm: return "RGBA16";
++		case MTLPixelFormatR32Uint: return "R32UI"; case MTLPixelFormatRG32Uint: return "RG32UI";
++		case MTLPixelFormatRGBA32Uint: return "RGBA32UI"; case MTLPixelFormatR16Uint: return "R16UI";
++		case MTLPixelFormatR8Uint: return "R8UI"; case MTLPixelFormatRGBA8Uint: return "RGBA8UI";
++		case MTLPixelFormatRGBA16Uint: return "RGBA16UI"; case MTLPixelFormatRG16Uint: return "RG16UI";
++		default: return nullptr;
++	}
++}
++
++float passProbeHalf(uint16_t h) {
++	uint32_t s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023;
++	float v = e == 0 ? std::ldexp((float)m, -24) : e == 31 ? (m ? NAN : INFINITY) : std::ldexp((float)(m | 1024), (int)e - 25);
++	return s ? -v : v;
++}
++
++// Decodes one sampled pixel into up to 4 float channels; returns the channel count (0 = not decoded).
++int passProbeDecode(MTLPixelFormat f, const uint8_t* p, float* c) {
++	uint32_t u; uint16_t h[4];
++	switch (f) {
++		case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB: case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB:
++			for (int i = 0; i < 4; i++) c[i] = p[i] / 255.0f; return 4;
++		case MTLPixelFormatRGB10A2Unorm:
++			memcpy(&u, p, 4); c[0] = (u & 1023) / 1023.0f; c[1] = ((u >> 10) & 1023) / 1023.0f; c[2] = ((u >> 20) & 1023) / 1023.0f; c[3] = (u >> 30) / 3.0f; return 4;
++		case MTLPixelFormatRGBA16Float: memcpy(h, p, 8); for (int i = 0; i < 4; i++) c[i] = passProbeHalf(h[i]); return 4;
++		case MTLPixelFormatRG16Float: memcpy(h, p, 4); c[0] = passProbeHalf(h[0]); c[1] = passProbeHalf(h[1]); return 2;
++		case MTLPixelFormatR16Float: memcpy(h, p, 2); c[0] = passProbeHalf(h[0]); return 1;
++		case MTLPixelFormatR32Float: memcpy(c, p, 4); return 1;
++		case MTLPixelFormatRG32Float: memcpy(c, p, 8); return 2;
++		case MTLPixelFormatRGBA32Float: memcpy(c, p, 16); return 4;
++		case MTLPixelFormatRG11B10Float: {
++			memcpy(&u, p, 4);
++			auto f11 = [](uint32_t x, int mbits) { uint32_t e = x >> mbits, m = x & ((1u << mbits) - 1);
++				return e == 0 ? std::ldexp((float)m, -14 - mbits) : e == 31 ? (m ? NAN : INFINITY) : std::ldexp((float)(m | (1u << mbits)), (int)e - 15 - mbits); };
++			c[0] = f11(u & 2047, 6); c[1] = f11((u >> 11) & 2047, 6); c[2] = f11(u >> 22, 5); return 3;
++		}
++		case MTLPixelFormatR8Unorm: c[0] = p[0] / 255.0f; return 1;
++		case MTLPixelFormatRG8Unorm: c[0] = p[0] / 255.0f; c[1] = p[1] / 255.0f; return 2;
++		case MTLPixelFormatR16Unorm: memcpy(h, p, 2); c[0] = h[0] / 65535.0f; return 1;
++		case MTLPixelFormatRG16Unorm: memcpy(h, p, 4); c[0] = h[0] / 65535.0f; c[1] = h[1] / 65535.0f; return 2;
++		case MTLPixelFormatRGBA16Unorm: memcpy(h, p, 8); for (int i = 0; i < 4; i++) c[i] = h[i] / 65535.0f; return 4;
++		default: return 0;
++	}
++}
++
++void passProbeWriteLocked(MVKPassProbe& pp) {
++	std::string out;
++	char line[512];
++	snprintf(line, sizeof(line), "==== frame dump %d (%s, %.0f s after first present): %zu render passes ====\n",
++			 pp.dumpIndex, getprogname(), MVKPassProbe::now() - pp.firstPresent, pp.records.size());
++	out += line;
++	const uint8_t* d = (const uint8_t*)pp.buffer.contents;
++	for (auto& r : pp.records) {
++		snprintf(line, sizeof(line), "#%-4u (+%u dispatches)", r.index, r.dispatchesBefore);
++		out += line;
++		{
++			static const char* kinds[8] = { "draw", "indexed", "indirect", "idx-indirect", "indirect-count", "mesh", "mesh-indirect", "SKIPPED" };
++			std::string dl;
++			for (int k = 0; k < 8; k++) { if (r.draws[k]) { char b[48]; snprintf(b, sizeof(b), "%s%s %u", dl.empty() ? "" : ", ", kinds[k], r.draws[k]); dl += b; } }
++			out += " draws[" + (dl.empty() ? std::string("none") : dl) + "]";
++			if ( !r.cs.empty() ) {
++				out += " cs[";
++				for (size_t i = 0; i < r.cs.size(); i++) { char b[24]; snprintf(b, sizeof(b), "%s%016llx", i ? "," : "", (unsigned long long)r.cs[i]); out += b; }
++				out += "]";
++			}
++			for (uint32_t i = 0; i < r.fsCount; i++) { char b[40]; snprintf(b, sizeof(b), "%s%016llx", i ? "," : " fs ", (unsigned long long)r.fs[i]); out += b; }
++		}
++		for (size_t t = 0; t < r.targets.size(); t++) {
++			auto& tg = r.targets[t];
++			const char* fn = passProbeFormatName(tg.fmt);
++			char fb[32]; if ( !fn ) { snprintf(fb, sizeof(fb), "fmt%lu", (unsigned long)tg.fmt); fn = fb; }
++			if (tg.skipped) { snprintf(line, sizeof(line), " | RT%zu %s %ux%u: not sampled (%s)", t, fn, tg.w, tg.h, tg.why); out += line; continue; }
++			std::map<std::array<float, 3>, int> hot;	// pixels with a non-finite or >= 512 channel, by value
++			int zero = 0, badPx = 0, chans = 0, total = 0; float maxv = 0; int badRowMin = -1, badRowMax = -1, badXMin = 1 << 30, badXMax = -1;
++			for (uint32_t row = 0; row < MVKPassProbe::kRows; row++) {
++				for (uint32_t x = 0; x < tg.w; x++) {
++					const uint8_t* px = d + tg.offset + (row * tg.w + x) * tg.bpp;
++					float c[4] = {}; chans = passProbeDecode(tg.fmt, px, c);
++					bool allZero = true;
++					for (uint32_t b = 0; b < tg.bpp; b++) { if (px[b]) { allZero = false; break; } }
++					if (allZero) zero++;
++					bool pxBad = false;
++					for (int i = 0; i < chans; i++) { if (std::isnan(c[i]) || std::isinf(c[i])) pxBad = true; else if (std::fabs(c[i]) > maxv) maxv = std::fabs(c[i]); }
++					bool pxHot = pxBad;
++					for (int i = 0; i < chans && i < 3; i++) { if (std::fabs(c[i]) >= 512.0f) pxHot = true; }
++					if (pxHot && hot.size() < 4096) {
++						auto k = [](float x) { return std::isnan(x) ? -1.0f : (std::isinf(x) ? -2.0f : x); };	// NaN -> -1, Inf -> -2
++						hot[{ k(c[0]), chans > 1 ? k(c[1]) : 0.0f, chans > 2 ? k(c[2]) : 0.0f }]++;
++					}
++					if (pxBad) {
++						badPx++;
++						if (badRowMin < 0) badRowMin = row;
++						badRowMax = row;
++						badXMin = std::min(badXMin, (int)x); badXMax = std::max(badXMax, (int)x);
++					}
++					total++;
++				}
++			}
++			if (chans) snprintf(line, sizeof(line), " | RT%zu %s %ux%u: zero %d%%, nan/inf px %d/%d, max %.4g", t, fn, tg.w, tg.h, total ? zero * 100 / total : 0, badPx, total, maxv);
++			else snprintf(line, sizeof(line), " | RT%zu %s %ux%u: zero %d%%", t, fn, tg.w, tg.h, total ? zero * 100 / total : 0);
++			out += line;
++			if (badPx) {
++				snprintf(line, sizeof(line), " [bad rows %d-%d of %u, x %d-%d]", badRowMin, badRowMax, MVKPassProbe::kRows, badXMin, badXMax);
++				out += line;
++			}
++			if ( !hot.empty() ) {
++				std::vector<std::pair<int, std::array<float, 3>>> top;
++				for (auto& h : hot) { top.push_back({ h.second, h.first }); }
++				std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
++				out += " hot{";
++				for (size_t i = 0; i < top.size() && i < 6; i++) {
++					snprintf(line, sizeof(line), "%s(%g,%g,%g)x%d", i ? " " : "", top[i].second[0], top[i].second[1], top[i].second[2], top[i].first);
++					out += line;
++				}
++				out += "}";
++			}
++			{
++				// Identity: the attachment texture, and the texture whose storage it views (to match against copies/samples).
++				uint32_t c4 = 0; memcpy(&c4, d + tg.offset + ((MVKPassProbe::kRows / 2) * tg.w + tg.w / 2) * tg.bpp, std::min(4u, tg.bpp));
++				snprintf(line, sizeof(line), " [centre %08x, tex %p, storage %p%s]", c4, tg.texId, tg.storageId,
++						 tg.storageId == tg.texId ? "" : " (view)");
++				out += line;
++			}
++		}
++		if (r.targets.empty()) out += " | no color targets (depth-only)";
++		out += "\n";
++	}
++	std::string path;
++	if (const char* pfx = getenv("WINEPREFIX")) { path = std::string(pfx) + "/drive_c/gfx-passes.log"; }
++	else if (const char* home = getenv("HOME")) { path = std::string(home) + "/Library/Logs/gfx-passes.log"; }
++	int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
++	if (fd >= 0) { ssize_t wr = write(fd, out.data(), out.size()); (void)wr; close(fd); }
++	mvkLogFailure("pass-probe", "frame dump %d written to %s (%zu render passes)", pp.dumpIndex, path.c_str(), pp.records.size());
++	pp.records.clear();
++	pp.written = true;
++}
++
++} // namespace
++
++void mvkPassProbeOnPresent() {
++	auto& pp = passProbe();
++	if ( !pp.enabled ) { return; }
++	std::lock_guard<std::mutex> guard(pp.lock);
++	double t = MVKPassProbe::now();
++	if ( !pp.firstPresent ) { pp.firstPresent = t; }
++	if (pp.active) {				// end of the captured frame
++		pp.active = false;
++		pp.closed = true;
++		if (pp.pending == 0 && !pp.written) { passProbeWriteLocked(pp); }
++		return;
++	}
++	// One frame every 20 s from 10 s on, up to kMaxDumps frames.
++	if ( !pp.written || pp.nextThreshold >= MVKPassProbe::kMaxDumps ) { return; }
++	if (t - pp.firstPresent >= 10.0 + 20.0 * pp.nextThreshold) {
++		pp.nextThreshold++;
++		pp.dumpIndex++;
++		pp.active = true;
++		pp.closed = false;
++		pp.written = false;
++		pp.used = 0;
++		pp.passCounter = 0;
++		pp.dispatchCounter = 0;
++		pp.records.clear();
++		pp.gapCS.clear();
++	}
++}
++
++void mvkPassProbeNoteCS(uint64_t shaderHash) {
++	auto& pp = passProbe();
++	if ( !pp.active ) { return; }
++	std::lock_guard<std::mutex> guard(pp.lock);
++	if (pp.active && pp.gapCS.size() < 64 && (pp.gapCS.empty() || pp.gapCS.back() != shaderHash)) { pp.gapCS.push_back(shaderHash); }
++}
++
++void mvkPassProbeNoteDispatch() {
++	auto& pp = passProbe();
++	if ( !pp.active ) { return; }
++	std::lock_guard<std::mutex> guard(pp.lock);
++	if (pp.active) { pp.dispatchCounter++; }
++}
++
+ void MVKCommandEncoder::beginMetalRenderPass(MVKCommandUse cmdUse) {
+ 
+     endCurrentMetalEncoding();
+@@ -1040,6 +1289,37 @@ void MVKCommandEncoder::beginMetalRenderPass(MVKCommandUse cmdUse) {
+ 	}
+     _mtlRenderEncoder = [_mtlCmdBuffer renderCommandEncoderWithDescriptor: mtlRPDesc];
+ 	retainIfImmediatelyEncoding(_mtlRenderEncoder);
++	if (passProbe().active) {
++		auto* targets = new std::vector<MVKPassProbeTarget>();
++		for (uint32_t i = 0; i < 8; i++) {
++			MTLRenderPassColorAttachmentDescriptor* ca = mtlRPDesc.colorAttachments[i];
++			id<MTLTexture> tex = ca.texture;
++			if ( !tex ) { continue; }
++			MVKPassProbeTarget tg;
++			tg.tex = [tex retain];
++			{
++				id<MTLTexture> root = tex;
++				while (root.parentTexture) { root = root.parentTexture; }
++				tg.texId = (void*)tex;
++				tg.storageId = (void*)root;
++			}
++			tg.fmt = tex.pixelFormat;
++			tg.level = (uint32_t)ca.level;
++			tg.slice = (uint32_t)ca.slice;
++			tg.w = std::max(1u, (uint32_t)tex.width >> tg.level);
++			tg.h = std::max(1u, (uint32_t)tex.height >> tg.level);
++			tg.bpp = getPixelFormats()->getBytesPerBlock(tg.fmt);
++			if (tex.sampleCount > 1) { tg.skipped = true; tg.why = "MSAA"; }
++			else if (tex.framebufferOnly) { tg.skipped = true; tg.why = "framebuffer-only"; }
++			else if (tex.storageMode == MTLStorageModeMemoryless) { tg.skipped = true; tg.why = "memoryless"; }
++			else if (tex.textureType == MTLTextureType3D) { tg.skipped = true; tg.why = "3D"; }
++			else if ( !tg.bpp || tg.bpp > 16 ) { tg.skipped = true; tg.why = "format"; }
++			targets->push_back(tg);
++		}
++		_passProbeTargets = targets;
++		memset(_passProbeDraws, 0, sizeof(_passProbeDraws));
++		_passProbeFSCount = 0;
++	}
+ 	_cmdBuffer->setMetalObjectLabel(_mtlRenderEncoder, getMTLRenderCommandEncoderName(cmdUse));
+ 	getState().beginGraphicsEncoding(getSampleCount());
+ 
+@@ -1252,7 +1532,73 @@ void MVKCommandEncoder::endMetalRenderEncoding() {
+ 
+ 	if (_cmdBuffer->_hasStageCounterTimestampCommand) { [_mtlRenderEncoder updateFence: getStageCountersMTLFence() afterStages: MTLRenderStageFragment]; }
+ 	encodeBarrierUpdates();
++	auto* probeTargets = static_cast<std::vector<MVKPassProbeTarget>*>(_passProbeTargets);
++	_passProbeTargets = nullptr;
++	auto& pp = passProbe();
++	if (probeTargets) {
++		{
++			std::lock_guard<std::mutex> guard(pp.lock);
++			if ( !pp.fence ) { pp.fence = [getMTLDevice() newFence]; pp.buffer = [getMTLDevice() newBufferWithLength: MVKPassProbe::kBufferSize options: MTLResourceStorageModeShared]; }
++		}
++		[_mtlRenderEncoder updateFence: pp.fence afterStages: MTLRenderStageFragment];
++	}
+ 	endMetalEncoding(_mtlRenderEncoder);
++	if (probeTargets) {
++		uint32_t recIdx = 0;
++		bool encode = false;
++		std::vector<MVKPassProbeTarget> toCopy;
++		{
++			std::lock_guard<std::mutex> guard(pp.lock);
++			if (pp.active && pp.records.size() < 2000) {
++				MVKPassProbeRecord rec;
++				rec.index = pp.passCounter++;
++				rec.dispatchesBefore = pp.dispatchCounter;
++				pp.dispatchCounter = 0;
++				memcpy(rec.draws, _passProbeDraws, sizeof(rec.draws));
++				memcpy(rec.fs, _passProbeFS, sizeof(rec.fs));
++				rec.fsCount = _passProbeFSCount;
++				rec.cs.swap(pp.gapCS);
++				pp.gapCS.clear();
++				for (auto tg : *probeTargets) {
++					if ( !tg.skipped ) {
++						uint32_t need = MVKPassProbe::kRows * tg.w * tg.bpp;
++						if (pp.used + need > MVKPassProbe::kBufferSize) { tg.skipped = true; tg.why = "probe buffer full"; }
++						else { tg.offset = pp.used; pp.used += (need + 15) & ~15u; toCopy.push_back(tg); }
++					}
++					tg.tex = nil;	// records keep no texture references
++					rec.targets.push_back(tg);
++				}
++				recIdx = (uint32_t)pp.records.size();
++				pp.records.push_back(std::move(rec));
++				pp.pending++;
++				encode = true;
++			}
++		}
++		if (encode) {
++			id<MTLBlitCommandEncoder> blit = [_mtlCmdBuffer blitCommandEncoder];
++			blit.label = @"MVK pass probe";
++			[blit waitForFence: pp.fence];
++			for (auto& tg : toCopy) {
++				for (uint32_t row = 0; row < MVKPassProbe::kRows; row++) {
++					[blit copyFromTexture: tg.tex sourceSlice: tg.slice sourceLevel: tg.level
++							 sourceOrigin: MTLOriginMake(0, tg.h * (2 * row + 1) / (2 * MVKPassProbe::kRows), 0)
++							   sourceSize: MTLSizeMake(tg.w, 1, 1)
++								 toBuffer: pp.buffer destinationOffset: tg.offset + row * tg.w * tg.bpp
++					   destinationBytesPerRow: tg.w * tg.bpp destinationBytesPerImage: tg.w * tg.bpp];
++				}
++			}
++			[blit endEncoding];
++			(void)recIdx;
++			[_mtlCmdBuffer addCompletedHandler: ^(id<MTLCommandBuffer>) {
++				auto& p2 = passProbe();
++				std::lock_guard<std::mutex> guard(p2.lock);
++				if (p2.pending) { p2.pending--; }
++				if (p2.closed && p2.pending == 0 && !p2.written) { passProbeWriteLocked(p2); }
++			}];
++		}
++		for (auto& tg : *probeTargets) { [tg.tex release]; }
++		delete probeTargets;
++	}
+ 
+ 	getSubpass()->resolveUnresolvableAttachments(this, _attachments.contents());
+ 	endCurrentMetalEncoding();
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+index 597a59f..4bb8e6c 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+@@ -1472,9 +1472,12 @@ void MVKMetalGraphicsCommandEncoderState::prepareDraw(
+   const MVKVulkanGraphicsCommandEncoderState& vk,
+   const MVKVulkanSharedCommandEncoderState& vkShared) {
+ 	MVKGraphicsPipeline* pipeline = vk._pipeline;
+-	if (!pipeline->getMainPipelineState()) // Abort if pipeline could not be created.
++	if (!pipeline->getMainPipelineState()) { // Abort if pipeline could not be created.
++		mvkEncoder.notePassProbeDraw(7);
+ 		return;
++	}
+ 	mvkEncoder.profNoteRenderDraw(pipeline->getFragmentCodeHash());
++	mvkEncoder.notePassProbeFS(pipeline->getFragmentCodeHash());
+ 
+ 	// Pipeline
+ 	if (!_flags.has(MVKMetalRenderEncoderStateFlag::PipelineReady)) {
+@@ -1660,6 +1663,7 @@ void MVKMetalComputeCommandEncoderState::prepareComputeDispatch(
+ 	}
+ 
+ 	mvkEncoder.profNoteComputeShader(pipeline->getShaderCodeHash());
++	mvkPassProbeNoteCS(pipeline->getShaderCodeHash());
+ 	_vkPipeline = pipeline;
+ 
+ 	if (_pipeline != mtlPipeline) {
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm b/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm
+index 41a4df0..2456239 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKSwapchain.mm
+@@ -21,6 +21,7 @@
+ #include "MVKSwapchain.h"
+ #include "MVKImage.h"
+ #include "MVKQueue.h"
++#include "MVKCommandBuffer.h"
+ #include "MVKFoundation.h"
+ #include "MVKOSExtensions.h"
+ #include "MVKWatermark.h"
+@@ -186,6 +187,7 @@ struct MVKPresentProbe {
+ 
+ void MVKSwapchain::probePresentedImage(id<MTLTexture> mtlTexture, id<MTLCommandBuffer> mtlCmdBuff) {
+ 	mvkFrameStatsOnPresent();
++	mvkPassProbeOnPresent();
+ 	if ( !mtlTexture || !mvkFailureLogEnabled() ) { return; }
+ 	if ( !_presentProbe ) { _presentProbe = std::make_shared<MVKPresentProbe>(); }
+ 	auto probe = _presentProbe;

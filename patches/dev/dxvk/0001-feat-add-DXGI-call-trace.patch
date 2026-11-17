@@ -1,3 +1,43 @@
+From f5de1c971eb37922d58e8bd7a517ac631ba15cc5 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:02:28 -0500
+Subject: [PATCH] feat: add DXGI call trace
+
+Dev only, not part of release builds.
+
+Problem: display-mode and swapchain decisions made by games through DXGI
+(mode list, chosen mode, swapchain and window sizes) are invisible, which
+made the 882x550 render resolution hard to explain.
+
+Root cause: DXVK has no per-call log of the DXGI output, factory and
+swapchain entry points.
+
+Fix: rename the traced methods to *_Impl and add thin wrappers that call
+them and log arguments and results: Output::GetDesc, GetDesc1,
+GetDisplayModeList, GetDisplayModeList1, FindClosestMatchingMode,
+FindClosestMatchingMode1; Factory::CreateSwapChain,
+CreateSwapChainForHwnd (with window and client rects); SwapChain::GetDesc,
+GetDesc1, ResizeBuffers, ResizeTarget, SetFullscreenState,
+GetContainingOutput. Output goes to C:\gfx-dxgi.log, capped at 20000
+lines.
+
+Verified by: found the 882x550 mode selection fixed by the Windows-like
+display mode list.
+
+Off switch: off by default. Enabled by DXVK_DXGI_TRACE=1 or by the
+presence of the file C:\gfx-dxgi.trace (delete it from the bottle when
+done).
+---
+ src/dxgi/dxgi_factory.cpp   |  34 +++++++++++-
+ src/dxgi/dxgi_factory.h     |   4 ++
+ src/dxgi/dxgi_output.cpp    | 103 +++++++++++++++++++++++++++++++++---
+ src/dxgi/dxgi_output.h      |  12 +++++
+ src/dxgi/dxgi_swapchain.cpp |  64 +++++++++++++++++++---
+ src/dxgi/dxgi_swapchain.h   |  12 +++++
+ src/dxgi/dxgi_trace.h       |  37 +++++++++++++
+ 7 files changed, 252 insertions(+), 14 deletions(-)
+ create mode 100644 src/dxgi/dxgi_trace.h
+
 diff --git a/src/dxgi/dxgi_factory.cpp b/src/dxgi/dxgi_factory.cpp
 index d89409e..0d66340 100644
 --- a/src/dxgi/dxgi_factory.cpp
@@ -82,7 +122,7 @@ index d6a6808..c82bcd8 100644
      DXVK_HOTPATCHABLE
      HRESULT STDMETHODCALLTYPE CreateSwapChainForCoreWindow(
 diff --git a/src/dxgi/dxgi_output.cpp b/src/dxgi/dxgi_output.cpp
-index 8814f5c..85a7aa3 100644
+index 6c79aec..85a7aa3 100644
 --- a/src/dxgi/dxgi_output.cpp
 +++ b/src/dxgi/dxgi_output.cpp
 @@ -1,3 +1,4 @@
@@ -126,102 +166,16 @@ index 8814f5c..85a7aa3 100644
            DXGI_OUTPUT_DESC1*    pDesc) {
      if (pDesc == nullptr)
        return DXGI_ERROR_INVALID_CALL;
-@@ -261,7 +262,93 @@ namespace dxvk {
+@@ -347,7 +348,7 @@ namespace dxvk {
    }
  
  
 -  HRESULT STDMETHODCALLTYPE DxgiOutput::GetDisplayModeList(
-+  /**
-+   * Wine's macOS driver exposes hundreds of synthetic scaled sizes
-+   * (~17px apart, mostly odd aspect ratios) and lacks common ones like
-+   * 1920x1080. Games that pick a default from the mode list (RE Engine
-+   * stores an index into it) end up at absurd sizes such as 882x550.
-+   * When the list looks like that, replace it with what a Windows
-+   * driver reports: standard sizes that fit the panel, plus the native
-+   * and desktop sizes, at the panel's refresh rates.
-+   * DXVK_DXGI_MODE_FILTER=0 disables this.
-+   */
-+  void DxgiOutput::NormalizeModeList(std::vector<DXGI_MODE_DESC1>& modeList) const {
-+    static const bool disabled = [] {
-+      const char* e = std::getenv("DXVK_DXGI_MODE_FILTER");
-+      return e && e[0] == '0';
-+    }();
-+
-+    if (disabled || modeList.empty())
-+      return;
-+
-+    std::vector<std::pair<UINT, UINT>> sizes;
-+    for (const auto& m : modeList) {
-+      std::pair<UINT, UINT> s = { m.Width, m.Height };
-+      if (std::find(sizes.begin(), sizes.end(), s) == sizes.end())
-+        sizes.push_back(s);
-+    }
-+
-+    // A real Windows driver reports a few dozen sizes at most.
-+    if (sizes.size() <= 64)
-+      return;
-+
-+    auto native = *std::max_element(sizes.begin(), sizes.end(),
-+      [] (const auto& a, const auto& b) { return uint64_t(a.first) * a.second < uint64_t(b.first) * b.second; });
-+
-+    std::vector<DXGI_MODE_DESC1> templates;
-+    for (const auto& m : modeList) {
-+      if (m.Width == native.first && m.Height == native.second)
-+        templates.push_back(m);
-+    }
-+
-+    static const std::pair<UINT, UINT> standard[] = {
-+      {  640,  480 }, {  800,  600 }, { 1024,  768 }, { 1152,  864 },
-+      { 1280,  720 }, { 1280,  768 }, { 1280,  800 }, { 1280,  960 },
-+      { 1280, 1024 }, { 1360,  768 }, { 1366,  768 }, { 1440,  900 },
-+      { 1600,  900 }, { 1600, 1200 }, { 1680, 1050 }, { 1920, 1080 },
-+      { 1920, 1200 }, { 2048, 1152 }, { 2560, 1440 }, { 2560, 1600 },
-+      { 2880, 1800 }, { 3200, 1800 }, { 3840, 2160 }, { 3840, 2400 },
-+      { 5120, 2880 }, { 5120, 3200 }, { 6016, 3384 },
-+    };
-+
-+    std::vector<std::pair<UINT, UINT>> keep;
-+    for (const auto& s : standard) {
-+      if (s.first <= native.first && s.second <= native.second)
-+        keep.push_back(s);
-+    }
-+
-+    keep.push_back(native);
-+
-+    wsi::WsiMode desktop = { };
-+    if (wsi::getDesktopDisplayMode(m_monitor, &desktop)
-+     && desktop.width <= native.first && desktop.height <= native.second)
-+      keep.push_back({ desktop.width, desktop.height });
-+
-+    std::vector<DXGI_MODE_DESC1> result;
-+    for (const auto& s : keep) {
-+      for (const auto& t : templates) {
-+        DXGI_MODE_DESC1 mode = t;
-+        mode.Width  = s.first;
-+        mode.Height = s.second;
-+
-+        bool dup = std::any_of(result.begin(), result.end(), [&] (const DXGI_MODE_DESC1& r) {
-+          return r.Width == mode.Width && r.Height == mode.Height
-+              && r.RefreshRate.Numerator   == mode.RefreshRate.Numerator
-+              && r.RefreshRate.Denominator == mode.RefreshRate.Denominator
-+              && r.ScanlineOrdering == mode.ScanlineOrdering
-+              && r.Scaling == mode.Scaling;
-+        });
-+
-+        if (!dup)
-+          result.push_back(mode);
-+      }
-+    }
-+
-+    modeList = std::move(result);
-+  }
-+
-+
 +  HRESULT DxgiOutput::GetDisplayModeList_Impl(
            DXGI_FORMAT    EnumFormat,
            UINT           Flags,
            UINT*          pNumModes,
-@@ -291,7 +378,7 @@ namespace dxvk {
+@@ -377,7 +378,7 @@ namespace dxvk {
    }
    
    
@@ -230,50 +184,7 @@ index 8814f5c..85a7aa3 100644
            DXGI_FORMAT           EnumFormat,
            UINT                  Flags,
            UINT*                 pNumModes,
-@@ -310,30 +397,28 @@ namespace dxvk {
-     wsi::WsiMode devMode = { };
-     
-     uint32_t srcModeId = 0;
--    uint32_t dstModeId = 0;
--    
-+
-     std::vector<DXGI_MODE_DESC1> modeList;
--    
-+
-     while (wsi::getDisplayMode(m_monitor, srcModeId++, &devMode)) {
-       // Only enumerate interlaced modes if requested.
-       if (devMode.interlaced && !(Flags & DXGI_ENUM_MODES_INTERLACED))
-         continue;
--      
-+
-       // Skip modes with incompatible formats
-       if (devMode.bitsPerPixel != GetMonitorFormatBpp(EnumFormat))
-         continue;
--      
--      if (pDesc != nullptr) {
--        DXGI_MODE_DESC1 mode = ConvertDisplayMode(devMode);
--        // Fix up the DXGI_FORMAT to match what we were enumerating.
--        mode.Format = EnumFormat;
- 
--        modeList.push_back(mode);
--      }
--      
--      dstModeId += 1;
-+      DXGI_MODE_DESC1 mode = ConvertDisplayMode(devMode);
-+      // Fix up the DXGI_FORMAT to match what we were enumerating.
-+      mode.Format = EnumFormat;
-+      modeList.push_back(mode);
-     }
--    
-+
-+    NormalizeModeList(modeList);
-+
-+    uint32_t dstModeId = uint32_t(modeList.size());
-+
-     // Sort display modes by width, height and refresh rate,
-     // in that order. Some games rely on correct ordering.
-     std::sort(modeList.begin(), modeList.end(),
-@@ -697,4 +782,94 @@ namespace dxvk {
+@@ -781,4 +782,94 @@ namespace dxvk {
      m_monitorInfo->InitMonitorData(m_monitor, &monitorData);
    }
  
@@ -369,10 +280,10 @@ index 8814f5c..85a7aa3 100644
 +  }
  }
 diff --git a/src/dxgi/dxgi_output.h b/src/dxgi/dxgi_output.h
-index dca52ea..89225e5 100644
+index f5787c0..89225e5 100644
 --- a/src/dxgi/dxgi_output.h
 +++ b/src/dxgi/dxgi_output.h
-@@ -47,29 +47,42 @@ namespace dxvk {
+@@ -47,30 +47,42 @@ namespace dxvk {
        const DXGI_MODE_DESC*       pModeToMatch,
              DXGI_MODE_DESC*       pClosestMatch,
              IUnknown*             pConcernedDevice) final;
@@ -410,7 +321,7 @@ index dca52ea..89225e5 100644
              UINT*                 pNumModes,
              DXGI_MODE_DESC1*      pDesc) final;
 +    HRESULT GetDisplayModeList1_Impl(DXGI_FORMAT EnumFormat, UINT Flags, UINT* pNumModes, DXGI_MODE_DESC1* pDesc);
-+    void NormalizeModeList(std::vector<DXGI_MODE_DESC1>& modeList) const;
+     void NormalizeModeList(std::vector<DXGI_MODE_DESC1>& modeList) const;
 +
      
      HRESULT STDMETHODCALLTYPE GetDisplaySurfaceData(
@@ -625,44 +536,6 @@ index 0000000..78be079
 +  }
 +
 +}
-diff --git a/src/dxvk/dxvk_device_info.cpp b/src/dxvk/dxvk_device_info.cpp
-index 6e821e9..e7df087 100644
---- a/src/dxvk/dxvk_device_info.cpp
-+++ b/src/dxvk/dxvk_device_info.cpp
-@@ -8,6 +8,8 @@
- #include "dxvk_instance.h"
- #include "dxvk_limits.h"
- 
-+#include "../util/util_env.h"
-+
- namespace dxvk {
- 
-   #define CORE_VERSIONS                            \
-@@ -786,8 +788,18 @@ namespace dxvk {
-     if (m_queueMapping.graphics.family == VK_QUEUE_FAMILY_IGNORED)
-       return std::string("Device does not have a graphics queue");
- 
-+    // Dev hack: DXVK_RELAX_CAPS=1 lets the adapter through even if D3D11-only features are missing.
-+    // Used when only dxgi.dll is needed to front vkd3d-proton (e.g. on MoltenVK, which lacks geometry shaders).
-+    const std::string relax = env::getEnvVar("DXVK_RELAX_CAPS");
-+    const bool relaxCaps = !relax.empty() && relax != "0";
-+
-     for (const auto& f : getFeatureList()) {
-       if (f.featureRequired && !(*f.featureEnabled)) {
-+        if (relaxCaps) {
-+          Logger::warn(str::format("DXVK_RELAX_CAPS: ignoring missing required feature '", f.readableName, "'"));
-+          continue;
-+        }
-+
-         std::string message = str::format("Device does not support required feature '", f.readableName, "'");
- 
-         if (f.extensionEnabled)
-@@ -797,7 +809,7 @@ namespace dxvk {
-       }
-     }
- 
--    if (!m_featuresEnabled.extDescriptorHeap.descriptorHeap && m_properties.core.properties.limits.maxPushConstantsSize < MaxTotalPushDataSize)
-+    if (!relaxCaps && !m_featuresEnabled.extDescriptorHeap.descriptorHeap && m_properties.core.properties.limits.maxPushConstantsSize < MaxTotalPushDataSize)
-       return str::format("Device does not support ", MaxTotalPushDataSize, " of push data");
- 
-     return std::nullopt;
+-- 
+2.51.0
+

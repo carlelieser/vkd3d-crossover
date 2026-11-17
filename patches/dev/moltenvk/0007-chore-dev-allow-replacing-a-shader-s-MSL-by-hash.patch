@@ -1,0 +1,62 @@
+From f080146a2a61a4216f0877c695cff1cda8de5c27 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:12:16 -0500
+Subject: [PATCH 07/10] chore(dev): allow replacing a shader's MSL by hash
+
+Problem: Needed to instrument single game shaders without rebuilding.
+
+Root cause: Diagnostics only; no defect.
+
+Fix: MVK_MSL_OVERRIDE_DIR=dir: shader-{cs,fs}-<hash>.metal there replaces the converted MSL of that shader (never cached).
+
+Verified by: Used to instrument the hair compositor.
+
+Off switch: off by default; MVK_MSL_OVERRIDE_DIR enables
+---
+ .../MoltenVK/GPUObjects/MVKShaderModule.mm    | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+index 31775b7..f9a84cc 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+@@ -477,6 +477,23 @@ static void mvkProfileDumpComputeMSL(const SPIRVToMSLConversionConfiguration* cf
+ 	if (f) { fwrite(msl.data(), 1, msl.size(), f); fclose(f); }
+ }
+ 
++// Debugging aid: with MVK_MSL_OVERRIDE_DIR set, a file named like the profile dumps (shader-cs|fs-<hash>.metal) in that
++// directory replaces the converted MSL of that shader (used to instrument a single game shader). Never cached.
++static void mvkApplyMSLOverride(const SPIRVToMSLConversionConfiguration* cfg, size_t codeHash, std::string& msl) {
++	static const char* dir = getenv("MVK_MSL_OVERRIDE_DIR");
++	if ( !dir || !*dir ) { return; }
++	bool cs = cfg->options.entryPointStage == spv::ExecutionModelGLCompute, fs = cfg->options.entryPointStage == spv::ExecutionModelFragment;
++	if ( !(cs || fs) ) { return; }
++	char path[PATH_MAX];
++	snprintf(path, sizeof(path), "%s/shader-%s-%016zx.metal", dir, cs ? "cs" : "fs", codeHash);
++	FILE* f = fopen(path, "rb");
++	if ( !f ) { return; }
++	std::string o; char buf[65536]; size_t n;
++	while ((n = fread(buf, 1, sizeof(buf), f)) > 0) { o.append(buf, n); }
++	fclose(f);
++	if ( !o.empty() ) { msl = o; mvkLogFailure("msl-override", "using %s", path); }
++}
++
+ bool MVKShaderModule::convert(SPIRVToMSLConversionConfiguration* pShaderConfig,
+ 							  SPIRVToMSLConversionResult& conversionResult) {
+ 	MVKFrameStatTimer frameStatTimer(kMVKStatSPIRVToMSL);
+@@ -491,6 +508,7 @@ bool MVKShaderModule::convert(SPIRVToMSLConversionConfiguration* pShaderConfig,
+ 		addPerformanceInterval(getPerformanceStats().shaderCompilation.shaderLibraryFromCache, startTime);
+ 		mvkLogAtomic64Use(pShaderConfig, conversionResult.msl);
+ 		mvkProfileDumpComputeMSL(pShaderConfig, _key.codeHash, conversionResult.msl);
++		mvkApplyMSLOverride(pShaderConfig, _key.codeHash, conversionResult.msl);
+ 		return true;
+ 	}
+ 	std::string preCfgBytes = useDiskCache ? mvkDiskShaderCacheSerializeConfig(*pShaderConfig) : std::string();
+@@ -500,6 +518,7 @@ bool MVKShaderModule::convert(SPIRVToMSLConversionConfiguration* pShaderConfig,
+ 	if (wasConverted && useDiskCache && !preCfgBytes.empty()) {
+ 		mvkDiskShaderCacheStore(preCfgBytes, _spvConverter.getSPIRV(), *pShaderConfig, conversionResult);
+ 	}
++	if (wasConverted) { mvkApplyMSLOverride(pShaderConfig, _key.codeHash, conversionResult.msl); }
+ 
+ 	const char* dumpDir = getMVKConfig().shaderDumpDir;
+ 	if (dumpDir && *dumpDir) {

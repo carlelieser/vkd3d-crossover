@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:08:23 -0500
+Subject: [PATCH 12/20] fix: use PhysicalStorageBuffer storage for BDA access
+ chains
+
+Problem: atomics on a vector component reached through a buffer_reference
+(BDA) pointer emitted "&vec[0]", which is invalid MSL.
+
+Root cause: the BDA pointer is usually loaded from a push constant or UBO,
+so get_expression_effective_storage_class returned that block's storage
+class instead of PhysicalStorageBuffer, and the MSL scalar-access path
+did not handle PhysicalStorageBuffer.
+
+Fix: in the vector-to-scalar access-chain path, treat a base whose type
+is a PhysicalStorageBuffer pointer as PhysicalStorageBuffer, and accept
+PhysicalStorageBuffer in prepare_access_chain_for_scalar_access.
+
+Verified by: see NOTES.md Finding 3.
+
+Off switch: none.
+---
+ spirv_glsl.cpp | 9 ++++++++-
+ spirv_msl.cpp  | 3 ++-
+ 2 files changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/spirv_glsl.cpp b/spirv_glsl.cpp
+index 79db239..1e27d30 100644
+--- a/spirv_glsl.cpp
++++ b/spirv_glsl.cpp
+@@ -11458,7 +11458,14 @@ string CompilerGLSL::access_chain_internal(uint32_t base, const uint32_t *indice
+ 			if ((flags & ACCESS_CHAIN_FORCE_COMPOSITE_BIT) == 0)
+ 			{
+ 				if (expression_type(base).pointer)
+-					effective_storage = get_expression_effective_storage_class(base);
++				{
++					// A buffer_reference (BDA) pointer is often loaded from a push constant or UBO, so the
++					// backing variable is that block. The memory accessed through it is PhysicalStorageBuffer.
++					if (expression_type(base).storage == StorageClassPhysicalStorageBuffer)
++						effective_storage = StorageClassPhysicalStorageBuffer;
++					else
++						effective_storage = get_expression_effective_storage_class(base);
++				}
+ 
+ 				// Special consideration for control points.
+ 				// Control points can only be written by InvocationID, so there is no need
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index f421f15..0f679dc 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -9788,7 +9788,8 @@ bool CompilerMSL::prepare_access_chain_for_scalar_access(std::string &expr, cons
+ 	// For packed types, we could technically omit this if we know the reference does not have to turn into a pointer
+ 	// of some kind, but that requires external analysis passes to figure out, and
+ 	// this case is likely rare enough that we don't need to bother.
+-	if (storage == StorageClassStorageBuffer || storage == StorageClassWorkgroup)
++	if (storage == StorageClassStorageBuffer || storage == StorageClassPhysicalStorageBuffer ||
++	    storage == StorageClassWorkgroup)
+ 	{
+ 		const char *addr_space = storage == StorageClassWorkgroup ? "threadgroup" : "device";
+ 		expr = join("((", addr_space, " ", type_to_glsl(type), "*)&", enclose_expression(expr), ")");
+-- 
+2.51.0
+

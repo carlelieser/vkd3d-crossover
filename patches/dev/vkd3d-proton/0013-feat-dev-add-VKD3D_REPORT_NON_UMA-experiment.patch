@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 12:00:00 +0000
+Subject: [PATCH 13/13] feat(dev): add VKD3D_REPORT_NON_UMA experiment
+
+Dev only, experiment that did not ship (OVERVIEW.md section 5); candidate for
+removal.
+
+Problem: hypothesis that engines treat a UMA GPU as integrated/low-power.
+
+Root cause: hypothesis not confirmed.
+
+Fix: report a discrete (non-UMA) GPU through D3D12_FEATURE_ARCHITECTURE(1).
+
+Verified by: the game never queried it (OVERVIEW.md section 5).
+
+Off switch: off by default; VKD3D_REPORT_NON_UMA=1 or an existing
+C:\gfx-nonuma.on file enables.
+---
+ libs/vkd3d/device.c | 23 +++++++++++++++++++++--
+ 1 file changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 34fc15c..95aeb88 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -4642,6 +4642,25 @@ static bool d3d12_barrier_layout_is_supported(D3D12_COMMAND_LIST_TYPE type, D3D1
+     return true;
+ }
+ 
++/* Experiment: report a discrete (non-UMA) GPU through D3D12_FEATURE_ARCHITECTURE(1). Some engines treat UMA as an
++ * integrated/low-power GPU. Enabled by VKD3D_REPORT_NON_UMA=1 or an existing C:\\gfx-nonuma.on file. */
++static bool vkd3d_report_non_uma(void)
++{
++    static int enabled = -1;
++    if (enabled < 0)
++    {
++        char env[16];
++        enabled = vkd3d_get_env_var("VKD3D_REPORT_NON_UMA", env, sizeof(env)) && env[0] == '1';
++#ifdef _WIN32
++        if (!enabled && GetFileAttributesA("C:\\gfx-nonuma.on") != INVALID_FILE_ATTRIBUTES)
++            enabled = 1;
++#endif
++        if (enabled)
++            vkd3d_failure_log("info", "experiment: reporting a non-UMA (discrete) GPU to the application");
++    }
++    return enabled;
++}
++
+ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_iface *iface,
+         D3D12_FEATURE feature, void *feature_data, UINT feature_data_size)
+ {
+@@ -4703,7 +4722,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_i
+             WARN("Assuming device does not support tile based rendering.\n");
+             data->TileBasedRenderer = FALSE;
+ 
+-            data->UMA = d3d12_device_is_uma(device, &coherent);
++            data->UMA = d3d12_device_is_uma(device, &coherent) && !vkd3d_report_non_uma();
+             data->CacheCoherentUMA = data->UMA ? coherent : FALSE;
+ 
+             TRACE("Tile based renderer %#x, UMA %#x, cache coherent UMA %#x.\n",
+@@ -4921,7 +4940,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_i
+             WARN("Assuming device does not support tile based rendering.\n");
+             data->TileBasedRenderer = FALSE;
+ 
+-            data->UMA = d3d12_device_is_uma(device, &coherent);
++            data->UMA = d3d12_device_is_uma(device, &coherent) && !vkd3d_report_non_uma();
+             data->CacheCoherentUMA = data->UMA ? coherent : FALSE;
+             data->IsolatedMMU = TRUE; /* Appears to be true Windows drivers */
+ 

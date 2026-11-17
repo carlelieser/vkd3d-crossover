@@ -1,0 +1,80 @@
+From 99239aff232e37fc8c8928da620855de51d020b1 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:12:12 -0500
+Subject: [PATCH 02/10] chore(dev): log shaders using emulated 64-bit atomics
+
+Problem: Needed to know how much a game relies on the emulated (tearable) 64-bit atomics.
+
+Root cause: Diagnostics only; no defect.
+
+Fix: Failure-log "atomic64" line per converted shader (fresh and disk-cached): stage, emulated ops and counts, buffer/threadgroup.
+
+Verified by: Demo and Requiem: 1 fragment + 3 compute shaders, UMax only.
+
+Off switch: MVK_FAILURE_LOG=0
+---
+ .../MoltenVK/GPUObjects/MVKShaderModule.mm    | 39 +++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+index 5243f37..cf37228 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+@@ -424,6 +424,43 @@ void mvkDiskShaderCacheStore(const std::string& preConversionCfgBytes, const std
+ 							 const SPIRVToMSLConversionResult& conversionResult);
+ std::string mvkDiskShaderCacheSerializeConfig(const SPIRVToMSLConversionConfiguration& cfg);
+ 
++// Failure log: report shaders that use the emulated 64-bit atomics (M1 has none in hardware). The emulation
++// works on the two 32-bit halves separately, so it can tear under contention; this shows how much a game relies on it.
++static void mvkLogAtomic64Use(SPIRVToMSLConversionConfiguration* pShaderConfig, const std::string& msl) {
++	if ( !mvkFailureLogEnabled() || msl.find("spvAtomic64") == std::string::npos ) { return; }
++	static const char* ops[] = { "Load", "Store", "Exchange", "CompareExchange", "Add", "And", "Or", "Xor",
++	                             "UMax", "UMin", "SMax", "SMin" };
++	std::string used;
++	size_t calls = 0;
++	for (const char* op : ops) {
++		std::string name = std::string("spvAtomic64") + op + "(";
++		size_t n = 0;
++		for (size_t pos = msl.find(name); pos != std::string::npos; pos = msl.find(name, pos + 1)) {
++			// Skip the helper definitions themselves ("inline ulong spvAtomic64X(" / "inline void spvAtomic64X(").
++			size_t ls = msl.rfind('\n', pos);
++			std::string head = msl.substr(ls == std::string::npos ? 0 : ls + 1, pos - (ls == std::string::npos ? 0 : ls + 1));
++			if (head.find("inline ") != std::string::npos) { continue; }
++			n++;
++		}
++		if (n) { used += (used.empty() ? "" : ", "); used += op; used += "x" + std::to_string(n); calls += n; }
++	}
++	if ( !calls ) { return; }
++	size_t tg = 0, dev = 0;
++	for (size_t pos = msl.find("(threadgroup atomic_uint*)"); pos != std::string::npos; pos = msl.find("(threadgroup atomic_uint*)", pos + 1)) { tg++; }
++	for (size_t pos = msl.find("(device atomic_uint*)"); pos != std::string::npos; pos = msl.find("(device atomic_uint*)", pos + 1)) { dev++; }
++	const char* stage = "?";
++	switch (pShaderConfig->options.entryPointStage) {
++		case spv::ExecutionModelVertex:    stage = "vertex"; break;
++		case spv::ExecutionModelFragment:  stage = "fragment"; break;
++		case spv::ExecutionModelGLCompute: stage = "compute"; break;
++		case spv::ExecutionModelMeshEXT:   stage = "mesh"; break;
++		case spv::ExecutionModelTaskEXT:   stage = "task"; break;
++		default: break;
++	}
++	mvkLogFailure("atomic64", "%s shader uses emulated 64-bit atomics: %s (buffer %s, threadgroup %s)",
++	              stage, used.c_str(), dev ? "yes" : "no", tg ? "yes" : "no");
++}
++
+ bool MVKShaderModule::convert(SPIRVToMSLConversionConfiguration* pShaderConfig,
+ 							  SPIRVToMSLConversionResult& conversionResult) {
+ 	const auto& mvkCfg = getMVKConfig();
+@@ -435,11 +472,13 @@ bool MVKShaderModule::convert(SPIRVToMSLConversionConfiguration* pShaderConfig,
+ 	bool useDiskCache = !shouldLogCode && !(dumpDirCheck && *dumpDirCheck);
+ 	if (useDiskCache && mvkDiskShaderCacheLoad(pShaderConfig, _spvConverter.getSPIRV(), conversionResult)) {
+ 		addPerformanceInterval(getPerformanceStats().shaderCompilation.shaderLibraryFromCache, startTime);
++		mvkLogAtomic64Use(pShaderConfig, conversionResult.msl);
+ 		return true;
+ 	}
+ 	std::string preCfgBytes = useDiskCache ? mvkDiskShaderCacheSerializeConfig(*pShaderConfig) : std::string();
+ 	bool wasConverted = _spvConverter.convert(*pShaderConfig, conversionResult, shouldLogCode, shouldLogCode, shouldLogEstimatedGLSL);
+ 	addPerformanceInterval(getPerformanceStats().shaderCompilation.spirvToMSL, startTime);
++	if (wasConverted) { mvkLogAtomic64Use(pShaderConfig, conversionResult.msl); }
+ 	if (wasConverted && useDiskCache && !preCfgBytes.empty()) {
+ 		mvkDiskShaderCacheStore(preCfgBytes, _spvConverter.getSPIRV(), *pShaderConfig, conversionResult);
+ 	}

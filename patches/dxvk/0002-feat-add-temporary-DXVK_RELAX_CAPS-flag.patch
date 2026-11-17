@@ -1,0 +1,72 @@
+From a78495ed5667fe83b432627ddd798c127122ea04 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:02:02 -0500
+Subject: [PATCH 2/2] feat: add temporary DXVK_RELAX_CAPS flag
+
+TEMPORARY: to be replaced by accepting the adapter for dxgi-only use
+without an environment variable (OVERVIEW.md section 6).
+
+Problem: DXVK rejects MoltenVK as an adapter, so dxgi.dll cannot front
+vkd3d-proton on macOS.
+
+Root cause: DXVK treats geometryShader (and a minimum push-data size) as
+required. Both are D3D11 requirements; MoltenVK has no geometry shaders.
+When dxgi.dll only presents for vkd3d-proton, D3D11 rendering is not
+used and the requirement does not apply.
+
+Fix: with DXVK_RELAX_CAPS set to a value other than 0, missing required
+features are logged as warnings instead of rejecting the device, and the
+push-data size check is skipped.
+
+Verified by: no dedicated test; this is the configuration the
+Requiem and PRAGMATA SKETCHBOOK runs on MoltenVK use.
+
+Off switch: unset DXVK_RELAX_CAPS (default behaviour is unchanged).
+---
+ src/dxvk/dxvk_device_info.cpp | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/dxvk/dxvk_device_info.cpp b/src/dxvk/dxvk_device_info.cpp
+index 6e821e9..e7df087 100644
+--- a/src/dxvk/dxvk_device_info.cpp
++++ b/src/dxvk/dxvk_device_info.cpp
+@@ -8,6 +8,8 @@
+ #include "dxvk_instance.h"
+ #include "dxvk_limits.h"
+ 
++#include "../util/util_env.h"
++
+ namespace dxvk {
+ 
+   #define CORE_VERSIONS                            \
+@@ -786,8 +788,18 @@ namespace dxvk {
+     if (m_queueMapping.graphics.family == VK_QUEUE_FAMILY_IGNORED)
+       return std::string("Device does not have a graphics queue");
+ 
++    // Dev hack: DXVK_RELAX_CAPS=1 lets the adapter through even if D3D11-only features are missing.
++    // Used when only dxgi.dll is needed to front vkd3d-proton (e.g. on MoltenVK, which lacks geometry shaders).
++    const std::string relax = env::getEnvVar("DXVK_RELAX_CAPS");
++    const bool relaxCaps = !relax.empty() && relax != "0";
++
+     for (const auto& f : getFeatureList()) {
+       if (f.featureRequired && !(*f.featureEnabled)) {
++        if (relaxCaps) {
++          Logger::warn(str::format("DXVK_RELAX_CAPS: ignoring missing required feature '", f.readableName, "'"));
++          continue;
++        }
++
+         std::string message = str::format("Device does not support required feature '", f.readableName, "'");
+ 
+         if (f.extensionEnabled)
+@@ -797,7 +809,7 @@ namespace dxvk {
+       }
+     }
+ 
+-    if (!m_featuresEnabled.extDescriptorHeap.descriptorHeap && m_properties.core.properties.limits.maxPushConstantsSize < MaxTotalPushDataSize)
++    if (!relaxCaps && !m_featuresEnabled.extDescriptorHeap.descriptorHeap && m_properties.core.properties.limits.maxPushConstantsSize < MaxTotalPushDataSize)
+       return str::format("Device does not support ", MaxTotalPushDataSize, " of push data");
+ 
+     return std::nullopt;
+-- 
+2.51.0
+

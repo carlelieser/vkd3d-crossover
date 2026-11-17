@@ -1,0 +1,34 @@
+From ba32750a461fee9daaf67d2e631deb407370b41e Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:11:57 -0500
+Subject: [PATCH 10/28] fix: allow arrays of multi-planar images
+
+Problem: "Fatal D3D error (1, E_FAIL)" source: chroma-subsampled (NV12/P010...) texture arrays could not be created.
+
+Root cause: MoltenVK refused arrayLayers > 1 for chroma-subsampled formats, although each plane texture is created with the image's texture type and array length.
+
+Fix: Remove the restriction.
+
+Verified by: test_planar_video_formats 1774/1774 (was 1 failure).
+
+Off switch: none
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKImage.mm | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+index 2b39492..2702e79 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+@@ -1389,9 +1389,8 @@ void MVKImage::validateConfig(const VkImageCreateInfo* pCreateInfo, bool isAttac
+ 	if (isChromaSubsampled && mvkIsAnyFlagEnabled(pCreateInfo->flags, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT)) {
+ 		setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkCreateImage() : Under Metal, chroma subsampled formats may not be used with cube images."));
+ 	}
+-	if (isChromaSubsampled && (pCreateInfo->arrayLayers > 1)) {
+-		setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkCreateImage() : Chroma-subsampled formats may only have one array layer."));
+-	}
++	// Multi-planar images are stored as one MTLTexture per plane, each created with the image's texture type and
++	// array length, so arrays of chroma-subsampled images work (D3D12 allows e.g. NV12 texture arrays).
+ 	if ((pixFmts->getFormatType(pCreateInfo->format) == kMVKFormatDepthStencil) && !is2D ) {
+ 		setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkCreateImage() : Under Metal, depth/stencil formats may only be used with 2D images."));
+ 	}

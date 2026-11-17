@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 12:00:00 +0000
+Subject: [PATCH 12/13] feat(dev): add VKD3D_DISPATCH_BARRIER experiment
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Dev only, experiment that did not ship (OVERVIEW.md section 5).
+
+Problem: Requiem black screen; hypothesis that the game omits a barrier
+between compute writes and later graphics reads, which Windows drivers
+tolerate.
+
+Root cause: hypothesis not confirmed.
+
+Fix: a full memory barrier after every dispatch.
+
+Verified by: did not help the black screen (N§29); the actual cause was a
+D3D11/DXGI pairing in the bottle setup.
+
+Off switch: off by default; VKD3D_DISPATCH_BARRIER=1 enables.
+---
+ libs/vkd3d/command.c | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index ac28d31..c4832b5 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -10054,6 +10054,32 @@ static void STDMETHODCALLTYPE d3d12_command_list_Dispatch(d3d12_command_list_ifa
+     VKD3D_BREADCRUMB_AUX32(z);
+     VKD3D_BREADCRUMB_COMMAND(DISPATCH);
+ 
++    /* Experiment: a full memory barrier after every dispatch, so compute writes are visible to later graphics work
++     * even when the application omits the barrier (Windows drivers tolerate that). Off by default; VKD3D_DISPATCH_BARRIER=1 enables.
++     * Did not fix Requiem's black screen. */
++    {
++        static int enabled = -1;
++        if (enabled < 0)
++        {
++            char env[16];
++            enabled = vkd3d_get_env_var("VKD3D_DISPATCH_BARRIER", env, sizeof(env)) && env[0] == '1';
++            if (enabled)
++                vkd3d_failure_log("info", "experiment: full memory barrier after every dispatch is on");
++        }
++        if (enabled)
++        {
++            VkMemoryBarrier2 mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
++            VkDependencyInfo dep = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
++            mb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
++            mb.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
++            mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++            mb.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
++            dep.memoryBarrierCount = 1;
++            dep.pMemoryBarriers = &mb;
++            VK_CALL(vkCmdPipelineBarrier2(list->cmd.vk_command_buffer, &dep));
++        }
++    }
++
+     d3d12_command_list_check_compute_barrier(list);
+ }
+ 

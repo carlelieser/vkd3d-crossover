@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:09:11 -0500
+Subject: [PATCH 15/20] fix: strip per-vertex array from mesh ClipDistance
+ outputs
+
+Problem: mesh shaders writing ClipDistance fail to compile in Metal:
+"float gl_ClipDistance [[clip_distance]] [4][1]" is an invalid mesh
+vertex type.
+
+Root cause: for arrayed IO (mesh per-vertex outputs) the [[clip_distance]]
+member kept the outer per-vertex array, and standalone (non-block)
+ClipDistance/CullDistance outputs, as emitted by dxil-spirv, were copied
+as whole arrays.
+
+Fix: declare the member as the per-vertex float[N], and copy standalone
+clip/cull distance outputs element by element per vertex in
+emit_mesh_outputs.
+
+Verified by: vkd3d-proton test_mesh_shader_rendering 260/260 (see
+NOTES.md Finding 11).
+
+Off switch: none.
+---
+ spirv_msl.cpp | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 3bf914f..fefb25c 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -3080,7 +3080,12 @@ void CompilerMSL::add_composite_variable_to_interface_block(StorageClass storage
+ 	{
+ 		// Also declare [[clip_distance]] attribute here.
+ 		uint32_t clip_array_mbr_idx = uint32_t(ib_type.member_types.size());
+-		ib_type.member_types.push_back(get_variable_data_type_id(var));
++		// For arrayed IO (e.g. mesh shader per-vertex outputs), the outer per-vertex array is stripped:
++		// the [[clip_distance]] member is the per-vertex float[N], not float[verts][N].
++		uint32_t clip_type_id = get_variable_data_type_id(var);
++		if (meta.strip_array && is_array(get<SPIRType>(clip_type_id)))
++			clip_type_id = get<SPIRType>(clip_type_id).parent_type;
++		ib_type.member_types.push_back(clip_type_id);
+ 		set_member_decoration(ib_type.self, clip_array_mbr_idx, DecorationBuiltIn, BuiltInClipDistance);
+ 
+ 		flatten_from_ib_mbr_name = builtin_to_glsl(BuiltInClipDistance, StorageClassOutput);
+@@ -21772,6 +21777,19 @@ void CompilerMSL::emit_mesh_outputs()
+ 				}
+ 			}
+ 
++			else if (has_decoration(orig_var, DecorationBuiltIn))
++			{
++				// Standalone (non-block) builtin outputs, e.g. dxil-spirv's gl_ClipDistance[verts][N].
++				builtin = BuiltIn(get_decoration(orig_var, DecorationBuiltIn));
++				if ((builtin == BuiltInClipDistance || builtin == BuiltInCullDistance) &&
++				    has_member_decoration(type_vert.self, index, DecorationIndex))
++				{
++					const uint32_t orig_index = get_member_decoration(type_vert.self, index, DecorationIndex);
++					access = "[" + to_string(orig_index) + "]";
++					statement("spvV.", builtin_to_glsl(builtin, StorageClassOutput), "[", orig_index, "] = ", to_name(orig_var), "[spvVI]", access, ";");
++				}
++			}
++
+ 			statement("spvV.", to_member_name(type_vert, index), " = ", to_name(orig_var), "[spvVI]", access, ";");
+ 			if (options.vertex.flip_vert_y && builtin == BuiltInPosition)
+ 			{
+-- 
+2.51.0
+

@@ -1,0 +1,36 @@
+From da71adb27b951cfa511fd1fefd3b9980778a89e5 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:12:01 -0500
+Subject: [PATCH 15/28] fix: skip unbound buffers in
+ encodeGPUAddressableBuffers
+
+Problem: A nil MTLBuffer could be handed to useResources:.
+
+Root cause: A buffer with device-address usage may not be bound to memory yet (or any more).
+
+Fix: Only add buffers that have an MTLBuffer.
+
+Verified by: Found and fixed while debugging test_mesh_shader_rendering on M1; mesh and regression suites pass.
+
+Off switch: none
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index 7759433..01096f8 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -4725,7 +4725,11 @@ void MVKDevice::encodeGPUAddressableBuffers(MVKUseResourceHelper& resources, MVK
+ 
+ 	lock_guard<mutex> lock(_rezLock);
+ 	for (auto& buff : _gpuAddressableBuffers) {
+-		resources.add(buff->getMTLBuffer(), stage, true);
++		// A buffer with device-address usage may not be bound to memory (yet, or any more).
++		// Never hand a nil resource to useResources:.
++		if (id<MTLBuffer> mtlBuff = buff->getMTLBuffer()) {
++			resources.add(mtlBuff, stage, true);
++		}
+ 	}
+ }
+ 

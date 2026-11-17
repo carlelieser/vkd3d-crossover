@@ -1,0 +1,197 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:09:33 -0500
+Subject: [PATCH 16/20] feat: add MSL options to retype fragment inputs and
+ outputs
+
+Problem: pipeline creation rejected for interface mismatches that D3D12
+and Vulkan allow: a fragment output whose base type differs from the
+render target (float4 to R32_UINT), a fragment input whose type or width
+differs from the previous stage's output, and a fragment input the
+previous stage does not write.
+
+Root cause: Metal links stages and attachments on exact types and rejects
+these pipelines outright.
+
+Fix: new options fragment_output_basetypes[8] and
+fragment_input_basetypes[32] (0 = no override, 1 = float, 2 = int,
+3 = uint), filled by MoltenVK. 32-bit outputs and inputs whose base type
+differs are declared with the expected type and bit-cast through the
+padded local-variable path; inputs take exactly the previous stage's
+vector width; inputs the previous stage does not write become
+zero-initialized locals. Builtins with synthesized locations and
+component-packed locations are not retyped.
+
+Verified by: vkd3d-proton test_shader_io_mismatch 3 -> 0 failures (see
+NOTES.md Finding 12).
+
+Off switch: none (options default to no override).
+---
+ spirv_msl.cpp | 109 +++++++++++++++++++++++++++++++++++++++++++++++---
+ spirv_msl.hpp |  11 +++++
+ 2 files changed, 115 insertions(+), 5 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index fefb25c..207a3d4 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -2880,6 +2880,81 @@ void CompilerMSL::add_plain_variable_to_interface_block(StorageClass storage, co
+ 		}
+ 	}
+ 
++	// Retype a 32-bit fragment output to the attached render target's base type, or a 32-bit fragment input to
++	// the previous stage's output type, if they differ (see Options).
++	string retype_cast;
++	uint32_t retyped_input_type_id = 0;
++	if (has_decoration(var.self, DecorationLocation) && get_entry_point().model == ExecutionModelFragment &&
++	    (storage == StorageClassOutput || storage == StorageClassInput) && !is_builtin_variable(var) &&
++	    !(storage == StorageClassInput && pull_model_inputs.count(var.self)))
++	{
++		uint32_t locn = get_decoration(var.self, DecorationLocation);
++		uint8_t want = storage == StorageClassOutput ? (locn < 8 ? msl_options.fragment_output_basetypes[locn] : 0) :
++		                                               (locn < 32 ? msl_options.fragment_input_basetypes[locn] : 0);
++		const SPIRType &cur = get<SPIRType>(type_id);
++		const SPIRType::BaseType cur_bt = cur.basetype; // cur may dangle once new types are created
++		SPIRType::BaseType want_bt = want == 1 ? SPIRType::Float : want == 2 ? SPIRType::Int : want == 3 ? SPIRType::UInt : SPIRType::Unknown;
++		bool is32 = cur.width == 32 && (cur.basetype == SPIRType::Float || cur.basetype == SPIRType::Int || cur.basetype == SPIRType::UInt);
++		uint32_t want_vs = cur.vecsize;
++
++		if (storage == StorageClassInput && !inputs_by_location.empty() && !is_array(cur) && !is_matrix(cur))
++		{
++			auto prev = inputs_by_location.find({ locn, get_decoration(var.self, DecorationComponent) });
++			// Builtin outputs (e.g. Position) may carry a synthesized location; they never feed user inputs.
++			if (prev == end(inputs_by_location) || prev->second.builtin != BuiltInMax)
++			{
++				// The previous stage doesn't write this location (allowed by D3D12/Vulkan: value undefined),
++				// but Metal rejects the pipeline. Make it a zero-initialized local instead of a stage-in member.
++				entry_func.add_local_variable(var.self);
++				vars_needing_early_declaration.push_back(var.self);
++				return;
++			}
++			// Metal links stages on exact types: declare the member with exactly the previous stage's width.
++			if (prev->second.vecsize && prev->second.vecsize != cur.vecsize)
++				want_vs = prev->second.vecsize;
++		}
++
++		// Component-packed variables share a location with other types; never retype those.
++		if (has_decoration(var.self, DecorationComponent))
++			want_bt = SPIRType::Unknown;
++		bool retype_bt = want_bt != SPIRType::Unknown && is32 && cur.basetype != want_bt;
++		bool retype_vs = want_vs != cur.vecsize && is32;
++		if (want_bt == SPIRType::Unknown)
++			want_bt = cur.basetype;
++		if ((retype_bt || retype_vs) && !is_array(cur) && !is_matrix(cur))
++		{
++			uint32_t new_id;
++			if (want_vs > 1)
++			{
++				// Handles scalar->vector and base type changes, with a valid scalar parent.
++				new_id = build_extended_vector_type(type_id, want_vs, want_bt);
++			}
++			else
++			{
++				uint32_t scalar_src = is_scalar(cur) ? type_id : uint32_t(cur.parent_type);
++				new_id = ir.increase_bound_by(1);
++				auto &nt = set<SPIRType>(new_id, get<SPIRType>(scalar_src));
++				nt.basetype = want_bt;
++				nt.op = want_bt == SPIRType::Float ? OpTypeFloat : OpTypeInt;
++				nt.vecsize = 1;
++				nt.self = new_id;
++				nt.parent_type = 0;
++			}
++			SPIRType::BaseType cast_bt = storage == StorageClassOutput ? want_bt : cur_bt;
++			type_id = new_id;
++			const char *bn = cast_bt == SPIRType::Float ? "float" : cast_bt == SPIRType::Int ? "int" : "uint";
++			retype_cast = type_components > 1 ? join("as_type<", bn, type_components, ">") : join("as_type<", bn, ">");
++			// Use the local-variable + fixup path to go through the cast.
++			if (storage == StorageClassOutput)
++				padded_output = true;
++			else
++			{
++				padded_input = true;
++				retyped_input_type_id = type_id;
++			}
++		}
++	}
++
+ 	if (storage == StorageClassInput && pull_model_inputs.count(var.self))
+ 		ib_type.member_types.push_back(build_msl_interpolant_type(type_id, is_noperspective));
+ 	else
+@@ -2910,15 +2985,39 @@ void CompilerMSL::add_plain_variable_to_interface_block(StorageClass storage, co
+ 		if (padded_output)
+ 		{
+ 			entry_func.fixup_hooks_out.push_back([=, &var]() {
+-				statement(qual_var_name, vector_swizzle(type_components, start_component), " = ", to_name(var.self),
+-				          ";");
++				if (!retype_cast.empty())
++					statement(qual_var_name, vector_swizzle(type_components, start_component), " = ", retype_cast, "(",
++					          to_name(var.self), ");");
++				else
++					statement(qual_var_name, vector_swizzle(type_components, start_component), " = ", to_name(var.self),
++					          ";");
+ 			});
+ 		}
+ 		else
+ 		{
++			uint32_t retype_ib_type_id = ib_type.self;
++			uint32_t retype_ib_mbr_idx = ib_mbr_idx;
+ 			entry_func.fixup_hooks_in.push_back([=, &var]() {
+-				statement(to_name(var.self), " = ", qual_var_name, vector_swizzle(type_components, start_component),
+-				          ";");
++				if (!retype_cast.empty())
++				{
++					// Widths are resolved at emit time: component padding may have widened the local variable.
++					const SPIRType &local_t = get_variable_data_type(var);
++					uint32_t local_vs = local_t.vecsize;
++					// Read the member's final type: input padding may replace it after this point.
++					uint32_t mbr_vs = get<SPIRType>(get<SPIRType>(retype_ib_type_id).member_types[retype_ib_mbr_idx]).vecsize;
++					const char *bn = local_t.basetype == SPIRType::Float ? "float" : local_t.basetype == SPIRType::Int ? "int" : "uint";
++					auto vt = [&](uint32_t n) { return n > 1 ? join(bn, n) : string(bn); };
++					if (local_vs == mbr_vs)
++						statement(to_name(var.self), " = as_type<", vt(local_vs), ">(", qual_var_name, ");");
++					else if (local_vs < mbr_vs)
++						statement(to_name(var.self), " = as_type<", vt(local_vs), ">(", qual_var_name,
++						          vector_swizzle(local_vs, start_component), ");");
++					else
++						statement(to_name(var.self), vector_swizzle(mbr_vs, 0), " = as_type<", vt(mbr_vs), ">(", qual_var_name, ");");
++				}
++				else
++					statement(to_name(var.self), " = ", qual_var_name, vector_swizzle(type_components, start_component),
++					          ";");
+ 			});
+ 		}
+ 	}
+@@ -2970,7 +3069,7 @@ void CompilerMSL::add_plain_variable_to_interface_block(StorageClass storage, co
+ 			if (pull_model_inputs.count(var.self))
+ 				ib_type.member_types[ib_mbr_idx] = build_msl_interpolant_type(type_id, is_noperspective);
+ 			else
+-				ib_type.member_types[ib_mbr_idx] = type_id;
++				ib_type.member_types[ib_mbr_idx] = retyped_input_type_id ? retyped_input_type_id : type_id;
+ 		}
+ 		set_member_decoration(ib_type.self, ib_mbr_idx, DecorationLocation, locn);
+ 		if (comp)
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index 39027b6..7cdf8c3 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -374,6 +374,17 @@ public:
+ 		// Add support to explicit pad out components.
+ 		bool pad_fragment_output_components = false;
+ 
++		// Per color location (0-7), the base type of the render target attached there:
++		// 0 = unknown (no override), 1 = float, 2 = int, 3 = uint. If a 32-bit fragment output's base type differs
++		// (e.g. float4 written to an R32_UINT target, legal but undefined in D3D12/Vulkan), the output is retyped to
++		// the attachment's type and bit-cast, since Metal rejects such pipelines outright.
++		uint8_t fragment_output_basetypes[8] = {};
++
++		// Per fragment input location (0-31), the base type the previous stage writes there (same encoding as
++		// fragment_output_basetypes). If a 32-bit fragment input's base type differs (legal in D3D12, rejected by
++		// Metal), the [[stage_in]] member takes the previous stage's type and is bit-cast to the shader's type.
++		uint8_t fragment_input_basetypes[32] = {};
++
+ 		// Specifies whether the iOS target version supports the [[base_vertex]] and [[base_instance]] attributes.
+ 		bool ios_support_base_vertex_instance = false;
+ 
+-- 
+2.51.0
+

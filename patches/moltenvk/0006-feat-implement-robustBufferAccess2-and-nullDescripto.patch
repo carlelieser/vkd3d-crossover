@@ -1,0 +1,94 @@
+From 3110fe1660fdc0a72e5ac5e5351417b67d53f5e1 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:11:54 -0500
+Subject: [PATCH 06/28] feat: implement robustBufferAccess2 and nullDescriptor
+
+Problem: Silent memory corruption: out-of-range writes landed ~4 GB away or 16 bytes before the view, and vkd3d-proton reported "Robustness2 not supported" / "Null descriptor not supported".
+
+Root cause: vkd3d-proton/dxil-spirv range-check views and substitute a huge index when out of range, relying on the driver's robustness to drop the access. Metal has no robustness, and MoltenVK reported robustBufferAccess2 = nullDescriptor = false.
+
+Fix: Enable the SPIRV-Cross robust_buffer_access option (bounds checks against the per-descriptor size table, 0 for null descriptors) whenever the app enables robustBufferAccess or robustBufferAccess2, and report robustBufferAccess2 = true and nullDescriptor = true on Apple GPUs. Not covered: buffers reached through raw pointers (BDA / root descriptors). Requires the SPIRV-Cross patches of this series (patches/spirv-cross).
+
+Verified by: test_buffers_oob_behavior_dxbc/dxil 68 -> 0 failures; vectorized_byte_address 192 -> 0; test_uav_robustness_oob_structure_element 5 -> 0; test_null_descriptor_resinfo 4 -> 0; full sweep (597 tests) 23 improvements, 0 regressions.
+
+Off switch: MVK_ROBUST_BUFFER_ACCESS=0 (shader bounds checks off, for debugging)
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.h    |  5 +++++
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm   | 12 ++++++++++--
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm |  2 ++
+ 3 files changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+index fdd0c08..9666685 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+@@ -943,6 +943,9 @@ public:
+ 	 */
+ 	id<MTLBuffer> getDummyBlitMTLBuffer();
+ 
++	/** Whether shaders bounds-check buffer descriptor accesses (robustBufferAccess / robustBufferAccess2). */
++	bool usesRobustBufferAccess() const { return _usesRobustBufferAccess; }
++
+ 	/** A zero-filled buffer bound in place of null vertex buffers (robustness2 nullDescriptor). */
+ 	id<MTLBuffer> getZeroVertexMTLBuffer();
+ 
+@@ -1084,6 +1087,8 @@ protected:
+ 	MVKPhysicalDevice* _physicalDevice = nullptr;
+ 	MVKExtensionList _enabledExtensions;
+ 	VkPhysicalDeviceFeatures _enabledFeatures;
++
++	bool _usesRobustBufferAccess = false;
+ 	MVKPhysicalDeviceVulkan12NoExtFeatures _enabledVulkan12NoExtFeatures;
+ 	MVKPhysicalDeviceVulkan14NoExtFeatures _enabledVulkan14NoExtFeatures;
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index 167d957..ad4d22e 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -643,9 +643,11 @@ void MVKPhysicalDevice::getFeatures(VkPhysicalDeviceFeatures2* features) {
+ 			}
+ 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_KHR: {
+ 				auto* robustness2Features = (VkPhysicalDeviceRobustness2FeaturesKHR*)next;
+-				robustness2Features->robustBufferAccess2 = false;
++				// Buffer accesses are bounds-checked in the shader against the descriptor range (SPIRV-Cross
++				// robust_buffer_access); null buffer descriptors have range 0, null textures read zero on Apple GPUs.
++				robustness2Features->robustBufferAccess2 = true;
+ 				robustness2Features->robustImageAccess2 = _gpuCapabilities.isAppleGPU;
+-				robustness2Features->nullDescriptor = false;
++				robustness2Features->nullDescriptor = _gpuCapabilities.isAppleGPU;
+ 				break;
+ 			}
+ 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR: {
+@@ -5224,6 +5226,12 @@ MVKDevice::MVKDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo
+ 	reservePrivateData(pCreateInfo);
+ 	initConfiguration();
+ 
++	{
++		const char* rba = getenv("MVK_ROBUST_BUFFER_ACCESS");	// "0" turns the shader bounds checks off (debugging)
++		_usesRobustBufferAccess = (_enabledFeatures.robustBufferAccess || _enabledRobustness2Features.robustBufferAccess2) &&
++		                          !(rba && rba[0] == '0');
++	}
++
+ 	if (!physicalDevice->_gpuCapabilities.isAppleGPU &&
+ 	        (_enabledFeatures.robustBufferAccess || _enabledImageRobustnessFeatures.robustImageAccess)) {
+ 		reportWarning(VK_ERROR_FEATURE_NOT_PRESENT, "Non-Apple GPUs do not fully support robustness.");
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 47bbd4f..4108750 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -2036,6 +2036,7 @@ void MVKGraphicsPipeline::initShaderConversionConfig(SPIRVToMSLConversionConfigu
+ 
+ 	bool useMetalArgBuff = isUsingMetalArgumentBuffers();
+ 	shaderConfig.options.mslOptions.argument_buffers = useMetalArgBuff;
++	shaderConfig.options.mslOptions.robust_buffer_access = _device->usesRobustBufferAccess();
+ 	shaderConfig.options.mslOptions.force_active_argument_buffer_resources = false;
+ 	shaderConfig.options.mslOptions.pad_argument_buffer_resources = useMetalArgBuff;
+ 	shaderConfig.options.mslOptions.argument_buffers_tier = (SPIRV_CROSS_NAMESPACE::CompilerMSL::Options::ArgumentBuffersTier)getMetalFeatures().argumentBuffersTier;
+@@ -2439,6 +2440,7 @@ MVKMTLFunction MVKComputePipeline::getMTLFunction(const VkComputePipelineCreateI
+ 
+ 	bool useMetalArgBuff = isUsingMetalArgumentBuffers();
+ 	shaderConfig.options.mslOptions.argument_buffers = useMetalArgBuff;
++	shaderConfig.options.mslOptions.robust_buffer_access = _device->usesRobustBufferAccess();
+ 	shaderConfig.options.mslOptions.force_active_argument_buffer_resources = false;
+ 	shaderConfig.options.mslOptions.pad_argument_buffer_resources = useMetalArgBuff;
+ 	shaderConfig.options.mslOptions.argument_buffers_tier = (SPIRV_CROSS_NAMESPACE::CompilerMSL::Options::ArgumentBuffersTier)getMetalFeatures().argumentBuffersTier;

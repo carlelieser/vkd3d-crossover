@@ -1,0 +1,49 @@
+From d4d9c0031b2ef44e9c8f9c6fc952302f8a6fd0e9 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:11:58 -0500
+Subject: [PATCH 12/28] fix: clamp texel buffer views to 2^28 texels
+
+Problem: Process abort (Metal descriptor assertion) for texel buffer views wider than 2^28 texels.
+
+Root cause: Metal rejects texture buffers wider than 2^28 texels on Apple silicon; MoltenVK reported a larger maxTexelBufferElements and passed the full width.
+
+Fix: Clamp the view width to 2^28 (texels beyond are unreachable, matching robust out-of-bounds reads) and report maxTexelBufferElements = 2^28 on Apple7+.
+
+Verified by: Startup-path probes (probe2-4); vkd3d-proton sweep of 597 tests, 0 regressions.
+
+Off switch: none
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm | 5 ++++-
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm | 3 +++
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm b/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm
+index d81f5e8..45ae9c1 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKBuffer.mm
+@@ -325,7 +325,10 @@ MVKBufferView::MVKBufferView(MVKDevice* device, const VkBufferViewCreateInfo* pC
+     if (byteCount == VK_WHOLE_SIZE) { byteCount = _buffer->getByteCount() - pCreateInfo->offset; }    // Remaining bytes in buffer
+     size_t blockCount = byteCount / bytesPerBlock;
+ 
+-	_textureSize.width = uint32_t(blockCount * fmtBlockSize.width);
++	// Metal rejects (aborts on) texture buffers wider than 2^28 texels. Clamp; texels beyond are unreachable,
++	// matching robust out-of-bounds behavior for reads.
++	static constexpr size_t kMVKMaxMTLTextureBufferWidth = 1u << 28;
++	_textureSize.width = uint32_t(std::min(blockCount * fmtBlockSize.width, kMVKMaxMTLTextureBufferWidth));
+     _textureSize.height = 1;
+     _mtlBytesPerRow = mvkAlignByteCount(byteCount, _device->getVkFormatTexelBufferAlignment(pCreateInfo->format, this));
+ }
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index e5db8b0..94df11a 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -3016,6 +3016,9 @@ void MVKPhysicalDevice::initLimits() {
+ 	// Whether handled as a real texture buffer or a 2D texture, this value is likely nowhere near the size of a buffer,
+ 	// needs to fit in 32 bits, and some apps (I'm looking at you, CTS), assume it is low when doing 32-bit math.
+ 	_properties.limits.maxTexelBufferElements = _properties.limits.maxImageDimension2D * (4 * KIBI);
++	if (supportsMTLGPUFamily(Apple7)) {
++		_properties.limits.maxTexelBufferElements = 1u << 28;	// Metal texture buffer width limit on Apple silicon.
++	}
+ 	if (supportsMTLGPUFamily(Apple1)) {
+ 		_properties.limits.maxUniformBufferRange = (uint32_t)min(_metalFeatures.maxMTLBufferSize, (VkDeviceSize)std::numeric_limits<uint32_t>::max());
+ 	} else {

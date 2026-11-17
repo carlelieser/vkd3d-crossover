@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 12:00:00 +0000
+Subject: [PATCH 5/7] fix: use update-after-bind UAV limits for feature level
+ 11_1
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: the maximum feature level was 11_0. D3D12CreateDevice(FL 12_0)
+returned E_INVALIDARG, so games requesting 12_0 failed or took their FL 11
+fallback (V2).
+
+Root cause: the FL 11_1 check required maxPerStageDescriptorStorageBuffers/
+Images >= 64; MoltenVK reports Metal's 31 discrete buffer slots. vkd3d never
+binds UAVs through per-stage slots: descriptor tables go through bindless
+update-after-bind heaps (~1M on argument buffers), which is also why it
+already reports resource binding tier 3.
+
+Fix: compare the larger of the plain and update-after-bind limits.
+
+Verified by: maximum feature level 12_0 (12_1 needs ROVs and conservative
+rasterization, not available on Metal); the demo at FL 12_0 shows its normal
+timeline with no errors; sweep8: 0 regressions (N§25). FL 11_1 also needs
+OutputMergerLogicOp, which MoltenVK reports when built with
+MVK_USE_METAL_PRIVATE_API=1.
+
+Off switch: none.
+---
+ libs/vkd3d/device.c | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 0fc1b06..3daa90b 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -9712,9 +9712,14 @@ static void d3d12_device_caps_init_feature_level(struct d3d12_device *device)
+ 
+     caps->max_feature_level = D3D_FEATURE_LEVEL_11_0;
+ 
++    /* UAVs reach shaders through the bindless descriptor heaps (update-after-bind), never through
++     * per-stage descriptor slots, so check the limits of that path. On MoltenVK the plain per-stage
++     * buffer limit is Metal's 31 discrete slots while argument buffers allow ~1M. */
+     if (caps->options.OutputMergerLogicOp && features->vertexPipelineStoresAndAtomics &&
+-            vk_info->device_limits.maxPerStageDescriptorStorageBuffers >= D3D12_UAV_SLOT_COUNT &&
+-            vk_info->device_limits.maxPerStageDescriptorStorageImages >= D3D12_UAV_SLOT_COUNT)
++            max(vk_info->device_limits.maxPerStageDescriptorStorageBuffers,
++                device->device_info.vulkan_1_2_properties.maxPerStageDescriptorUpdateAfterBindStorageBuffers) >= D3D12_UAV_SLOT_COUNT &&
++            max(vk_info->device_limits.maxPerStageDescriptorStorageImages,
++                device->device_info.vulkan_1_2_properties.maxPerStageDescriptorUpdateAfterBindStorageImages) >= D3D12_UAV_SLOT_COUNT)
+         caps->max_feature_level = D3D_FEATURE_LEVEL_11_1;
+ 
+     if (caps->max_feature_level >= D3D_FEATURE_LEVEL_11_1 &&

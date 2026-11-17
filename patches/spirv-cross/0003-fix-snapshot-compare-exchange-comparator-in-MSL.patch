@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vkd3d-crossover <noreply@vkd3d-crossover.invalid>
+Date: Tue, 17 Nov 2026 01:06:17 -0500
+Subject: [PATCH 03/20] fix: snapshot compare-exchange comparator in MSL
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: blown-out hair in Resident Evil Requiem (same engine path in
+PRAGMATA). The hair k-buffer compositor re-added each overflow strand's
+colour up to 128 times.
+
+Root cause: the comparator of OpAtomicCompareExchange is evaluated more
+than once (in the CAS loop and in the caller's "orig == comparator"
+success test). When it was a forwarded load, every evaluation re-read
+memory: the CAS compared against the value just read and always
+succeeded, while the success test read the value just written and
+reported failure, so the game's "old = buf; new = f(old); CAS" retry loop
+applied f repeatedly.
+
+Fix: force the comparator into a temporary (forced_temporaries and a
+recompile), as SPIR-V SSA semantics require.
+
+Verified by: GPU repro, 64 increments yield 1695 before and 64 after;
+vkd3d-proton atomics tests 316/316; hair confirmed correct in Requiem
+(see NOTES.md §34).
+
+Off switch: none.
+---
+ spirv_msl.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index d91799a..a000bfd 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -10221,6 +10221,14 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 		uint32_t mem_sem_fail = ops[5];
+ 		uint32_t val = ops[6];
+ 		uint32_t comp = ops[7];
++		// The comparator is evaluated more than once (the CAS loop below, and any later "orig == comparator" success
++		// test). If it is a forwarded load, every evaluation re-reads memory, so the CAS compares against the value
++		// just read (succeeds unconditionally) and the success test reads the value just written (reports failure):
++		// a lock-free "old = buf; new = f(old); CAS(buf, old, new)" retry loop then applies f many times (RE Engine's
++		// hair k-buffer accumulated each strand up to 128x). Snapshot the comparator in a temporary, as the SPIR-V
++		// SSA semantics require.
++		if (ir.ids[comp].get_type() == TypeExpression && forced_temporaries.insert(comp).second)
++			force_recompile();
+ 		emit_atomic_func_op(result_type, id, "atomic_compare_exchange_weak", opcode,
+ 		                    mem_sem_pass, mem_sem_fail, true,
+ 		                    ptr, comp, true, false, val);
+-- 
+2.51.0
+
