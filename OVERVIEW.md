@@ -159,10 +159,10 @@ Tools that found the bugs above. They cost nothing unless enabled; worth keeping
 |---|---|---|
 | `VKD3D_RELAX_CAPS=1` | Hides remaining gaps: transform feedback, single-texel buffer alignment; also gates TiledResourcesTier 2 (V1) | Make the V1/FL behaviour unconditional; keep only honest caps (N§21 rule) |
 | `DXVK_RELAX_CAPS=1` | DXVK refuses MoltenVK without geometry shaders | Accept for dxgi-only use (vkd3d path) without an env var |
-| PSO mismatch log `C:\gfx-pso-mismatch.log` | Investigation | **On by default today** → gate behind diagnostics |
-| DXGI trace trigger file `C:\gfx-dxgi.trace` | Investigation | Delete from the bottle; trace stays opt-in |
+| PSO mismatch log `C:\gfx-pso-mismatch.log` | Investigation | Done: dev-only patch, off by default (`VKD3D_DIAGNOSTICS=1`) |
+| DXGI trace trigger file `C:\gfx-dxgi.trace` | Investigation | Done: dev bottle deleted; the trace is a dev-only patch, opt-in |
 | Debug buffer auto-enabled by `MVK_MSL_OVERRIDE_DIR` | Convenience | Fine for dev; no effect in a package without overrides |
-| Launcher profiling vars (GPU profile, shader dumps, pass probe, override dir, frame stats) | Profiling | Remove from the shipped launcher |
+| Launcher profiling vars (GPU profile, shader dumps, pass probe, override dir, frame stats) | Profiling | Done: dev launcher deleted; `launch-steam.sh` will set none of them |
 | Dev test edits in vkd3d tests (MESH_ONLY_CULL, MESH_CULL_NO_PSO; test_logic_op_rendering added) | Testing | Revert dev edits; keep the new test for upstreaming |
 | `patches/*.patch` | Last regenerated Nov 16 00:16 | Regenerate as a topic-split series (§9) |
 
@@ -191,27 +191,17 @@ Tools that found the bugs above. They cost nothing unless enabled; worth keeping
 
 ---
 
-## 9. Proposed patch organisation for packaging
+## 9. Patch series
 
-One patch per concern, numbered in dependency order, each with its symptom/root-cause header from §3:
+The changes are split into one patch per fix: 58 shipping patches (spirv-cross 20, moltenvk 28, vkd3d-proton 7,
+dxil-spirv 1, dxvk 2) and 24 dev patches for diagnostics and experiments (moltenvk 10, vkd3d-proton 13, dxvk 1).
+The full index, with each patch mapped to the IDs in §3, is [`patches/README.md`](patches/README.md).
 
-```
-spirv-cross/  0001 int64 atomic emulation (S2)       0002 int64 max/min lock (S3)
-              0003 CAS comparator snapshot (S1)      0004 64-bit wave ops (S4)
-              0005 SM6.5/6.6 emulations (S5)         0006 codegen fixes (S6) ...
-              00xx robust buffer access (S9)
-moltenvk/     0001 feature exposure (M1)             0002 mesh shaders (M2, M3)
-              0003 E_FAIL sources (M4, M5)           0004 robustness / null descriptors (M10, M16)
-              0005 render-target fixes (M7, M8, M9)  0006 device resume (M11)
-              0007 math mode (M12)                   0008 indirect-count hoist (M13)
-              0009 MSL disk cache (M14)              0010 deferred PSOs (M15)
-              dev/ diagnostics (failure log, frame stats, profiler, pass probe, override, debug buffer)
-vkd3d-proton/ 0001 tiled fallback + FL 12_0 (V1, V2) 0002 present removal (V3, V4)
-              dev/ diagnostics bundle, pso-retry, pso-mismatch log
-dxil-spirv/   0001 f32tof16 round-toward-zero (D1)
-dxvk/         0001 Windows-like mode list (X1)       0002 relax caps for dxgi (X2)
-              dev/ DXGI trace
-```
+Verified: on fresh checkouts of the `versions.lock` commits, the shipping series applies and builds at every commit,
+and shipping + dev reproduces the original working tree exactly.
 
-Shipping = numbered patches only; `dev/` patches stay in the developer build. Bottle setup (DXVK d3d11+dxgi, per-app
-overrides, launcher without profiling vars) becomes a script.
+Ordering differs from a strict §3 order where dependencies require it: spirv-cross scans (0004) before 64-bit wave ops
+(0005); vkd3d-proton's temporary `VKD3D_RELAX_CAPS` first, since the tiled-resource fallback reports tier 2 through it.
+
+Shipping = numbered patches only; `patches/dev/` stays in developer builds. Bottle setup (DXVK d3d11+dxgi, per-app
+overrides, launcher without profiling vars) is done by the scripts.

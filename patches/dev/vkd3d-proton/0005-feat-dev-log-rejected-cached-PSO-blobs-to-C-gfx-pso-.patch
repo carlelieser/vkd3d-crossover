@@ -4,8 +4,7 @@ Date: Tue, 17 Nov 2026 12:00:00 +0000
 Subject: [PATCH 05/13] feat(dev): log rejected cached PSO blobs to
  C:\gfx-pso-mismatch.log
 
-Dev only, not for release builds. ON BY DEFAULT today; to be gated behind
-VKD3D_DIAGNOSTICS (OVERVIEW.md section 6).
+Dev only, not for release builds. Off by default, like the other diagnostics.
 
 Problem: needed to cross-check rejected cached PSO blobs against the game's
 own cache file offline.
@@ -18,7 +17,7 @@ shader and root-signature hashes.
 
 Verified by: no record in NOTES.md; listed in OVERVIEW.md section 6.
 
-Off switch: VKD3D_PSO_MISMATCH_LOG=0.
+Switch: off by default; on with VKD3D_DIAGNOSTICS=1 or VKD3D_PSO_MISMATCH_LOG=1.
 ---
  libs/vkd3d/cache.c | 40 ++++++++++++++++++++++++++++++++++++++++
  1 file changed, 40 insertions(+)
@@ -33,7 +32,7 @@ index 2e692e1..80f5cf9 100644
  
 +/* Diagnostics: one raw line per rejected cached PSO blob in C:\\gfx-pso-mismatch.log (never collapsed), with the
 + * requested and stored state hashes and whether root signature and shaders match, so a game's own cache file can be
-+ * cross-checked offline. VKD3D_PSO_MISMATCH_LOG=0 disables. */
++ * cross-checked offline. On with VKD3D_DIAGNOSTICS=1 or VKD3D_PSO_MISMATCH_LOG=1. */
 +static void vkd3d_pso_mismatch_record(const struct vkd3d_pipeline_cache_compatibility *want,
 +        const struct vkd3d_pipeline_cache_compatibility *have)
 +{
@@ -45,7 +44,7 @@ index 2e692e1..80f5cf9 100644
 +    char env[16];
 +
 +    if (enabled < 0)
-+        enabled = !(vkd3d_get_env_var("VKD3D_PSO_MISMATCH_LOG", env, sizeof(env)) && env[0] == '0');
++        enabled = vkd3d_diagnostics_enabled() || (vkd3d_get_env_var("VKD3D_PSO_MISMATCH_LOG", env, sizeof(env)) && env[0] == '1');
 +    if (!enabled)
 +        return;
 +    for (i = 0; i < ARRAY_SIZE(want->dxbc_blob_hashes); i++)

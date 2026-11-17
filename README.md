@@ -133,6 +133,17 @@ Nothing in CrossOver or your games is modified in place:
 - CrossOver (a Windows bottle with Steam)
 - For building from source: Xcode, MinGW-w64, Meson/Ninja
 
+### Building from source
+
+```sh
+tools/dev/fetch.sh           # upstream sources at the versions.lock commits (shallow), into src/
+tools/dev/apply-patches.sh   # pinned commit + shipping patches   (--dev adds diagnostics, --force discards local edits)
+tools/dev/build.sh           # MoltenVK + vkd3d-proton + DXVK  ->  out/release/ (or out/dev/), with BUILDINFO + SHA256SUMS
+```
+
+Output: `libMoltenVK.dylib`, `d3d12.dll`, `d3d12core.dll`, `dxgi.dll`, `d3d11.dll`. A release build fails if dev
+diagnostics leak into MoltenVK.
+
 ---
 
 ## Repository layout
@@ -144,6 +155,7 @@ vkd3d-crossover/
 ├─ NOTES.md           chronological investigation notes
 ├─ versions.lock      pinned upstream commits
 ├─ patches/
+│  ├─ README.md     index: every patch, what it fixes, OVERVIEW ID
 │  ├─ spirv-cross/  moltenvk/  vkd3d-proton/  dxil-spirv/  dxvk/   one patch per fix, numbered
 │  └─ dev/                                                         diagnostics, never in release builds
 ├─ scripts/
@@ -153,16 +165,16 @@ vkd3d-crossover/
 │  ├─ launch-steam.sh    start a bottle's Steam through the cloned app
 │  ├─ fix-game-config.sh one-time reset of RE Engine's saved display mode
 │  ├─ doctor.sh          check the setup
-│  ├─ uninstall.sh       remove the clone, restore the bottle
-│  └─ dev/               fetch, apply patches, build, test, regenerate patches
-└─ .github/workflows/  build and publish releases
+│  └─ uninstall.sh       remove the clone, restore the bottle
+├─ tools/dev/         developer scripts: fetch.sh, apply-patches.sh, build.sh, test harness, probes
+└─ .github/workflows/ build and publish releases
 ```
 
 ---
 
 ## Roadmap
 
-1. Split the work into topic patches (`patches/`), pin upstream versions.
+1. ~~Split the work into topic patches (`patches/`), pin upstream versions.~~ Done: 58 shipping + 24 dev patches.
 2. Scripts: install, bottle setup, doctor, uninstall; build-from-source.
 3. Prebuilt releases (GitHub Actions).
 4. Remove the dev-only capability bypasses (report only what is real).
