@@ -119,6 +119,22 @@ device-generated commands (some ExecuteIndirect state).
 
 ## How it installs
 
+### Quick start
+Prebuilt releases are coming; for now build first (see [Building from source](#building-from-source)), then:
+
+```sh
+scripts/install.sh                                         # clone CrossOver, install our MoltenVK
+scripts/setup-bottle.sh Steam-D3D12 --create --install-steam  # new bottle + DLLs + per-game overrides + Steam
+scripts/launch-steam.sh Steam-D3D12                        # start Steam (launch games from this window)
+```
+
+Then sign in to Steam and add your library folders (Steam → Settings → Storage; your home folder is drive `Y:`).
+Start games **from the Steam started by `launch-steam.sh`**, not from the CrossOver app — CrossOver's own MoltenVK
+is too old for vkd3d-proton. Enable another game with `scripts/setup-bottle.sh Steam-D3D12 --game Game.exe`.
+Re-run `scripts/install.sh --force` after updating CrossOver.
+
+### What the scripts change
+
 Nothing in CrossOver or your games is modified in place:
 
 - A local APFS clone of your CrossOver app (`CrossOver (D3D12).app`, near-zero disk space) gets our MoltenVK.
@@ -127,6 +143,10 @@ Nothing in CrossOver or your games is modified in place:
   overrides — Steam and everything else keep their usual DLLs.
 - **Rule:** `d3d11` and `dxgi` always come from DXVK together. Mixing DXVK's `dxgi` with D3DMetal's `d3d11`
   crashes RE Engine.
+- **PlayStation controllers** (DualShock 4, DualSense) are also presented as XInput gamepads (Wine `winebus`
+  `DisableHidraw=1`). By default Wine exposes them only as raw HID devices, which Steam and native-PlayStation games
+  use, but XInput-only games — most modern ones, including non-Steam games — then see no controller. Trade-off:
+  games may show Xbox button icons. `--native-ps-controllers` keeps Wine's default.
 
 ### Requirements
 - Apple Silicon Mac (built and tested on M1 Max), macOS 15+
@@ -159,13 +179,12 @@ vkd3d-crossover/
 │  ├─ spirv-cross/  moltenvk/  vkd3d-proton/  dxil-spirv/  dxvk/   one patch per fix, numbered
 │  └─ dev/                                                         diagnostics, never in release builds
 ├─ scripts/
-│  ├─ install.sh         download a release, clone CrossOver, install MoltenVK
-│  ├─ setup-bottle.sh    install the DLLs into a bottle, set per-game overrides
-│  ├─ add-game.sh        enable another game's .exe
-│  ├─ launch-steam.sh    start a bottle's Steam through the cloned app
-│  ├─ fix-game-config.sh one-time reset of RE Engine's saved display mode
-│  ├─ doctor.sh          check the setup
-│  └─ uninstall.sh       remove the clone, restore the bottle
+│  ├─ install.sh         clone CrossOver, install MoltenVK                      ✅
+│  ├─ setup-bottle.sh    bottle + DLLs + per-game overrides (--game), controllers, Steam  ✅
+│  ├─ launch-steam.sh    start a bottle's Steam through the cloned app          ✅
+│  ├─ fix-game-config.sh one-time reset of RE Engine's saved display mode       (planned)
+│  ├─ doctor.sh          check the setup                                        (planned)
+│  └─ uninstall.sh       remove the clone, restore the bottle                   (planned)
 ├─ tools/dev/         developer scripts: fetch.sh, apply-patches.sh, build.sh, test harness, probes
 └─ .github/workflows/ build and publish releases
 ```
@@ -175,7 +194,7 @@ vkd3d-crossover/
 ## Roadmap
 
 1. ~~Split the work into topic patches (`patches/`), pin upstream versions.~~ Done: 58 shipping + 24 dev patches.
-2. Scripts: install, bottle setup, doctor, uninstall; build-from-source.
+2. Scripts: ~~install, bottle setup, Steam launcher, build-from-source~~ (done, tested on a fresh bottle); doctor, uninstall, game-config fixup.
 3. Prebuilt releases (GitHub Actions).
 4. Remove the dev-only capability bypasses (report only what is real).
 5. **Upstream the generic fixes** to SPIRV-Cross, MoltenVK, dxil-spirv, vkd3d-proton and DXVK. The more lands

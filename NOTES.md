@@ -601,3 +601,18 @@ Previous MoltenVK saved as libMoltenVK.dylib.pre-deferred.
   Metal buffer index 20 (MVKDebugBuffer.h -> C:\gfx-dbg.bin, decoder build/dbgcap/decode.py), pass probe now records
   per-pass fs/cs hashes, 24 full rows per target, hot-value histograms. Local MSL compile check: scratchpad mslcheck.
 - MoltenVK must be rebuilt with build/rebuild_mvk.sh when SPIRV-Cross changes (plain `make macos` links a stale lib).
+
+## 35. Clean install with the repo scripts; PlayStation controllers in XInput games
+
+- Fresh test: scripts/install.sh (APFS clone of CrossOver Preview + our MoltenVK), setup-bottle.sh Steam-D3D12
+  --create --install-steam, launch-steam.sh. Both games run from the new bottle. The Pragmata Steam-launch stall of
+  the old dev bottle (section 34 follow-up) does not occur: it was that bottle's state, not Denuvo or our stack.
+- Non-Steam games had no controller, with or without Steam Input. tools/dev/probe/inputprobe.c (XInput 1.4/9.1.0/1.3
+  slots, DInput8 game controllers, raw HID): DualShock 4 (054c:09cc, Bluetooth) visible as raw HID and DInput, all
+  XInput slots empty. winebus trace: both backends see it — SDL adds a mapped gamepad (is_gamepad 1), IOHID a raw
+  device (is_hidraw 1) — and Wine prefers hidraw for DS4/DualSense ("ignoring non-hidraw device 054c:09cc"), so the
+  XInput-capable SDL device is dropped. "Enable SDL"/"Map Controllers" alone change nothing.
+- Fix: HKLM\System\CurrentControlSet\Services\winebus DisableHidraw=1 (bottle restart needed). XInput slot 0
+  connected, device path gets IG_00. User-confirmed: controller works in non-Steam games and still in Steam games.
+  setup-bottle.sh sets it by default; --native-ps-controllers keeps Wine's default. Trade-off: Xbox button icons in
+  games with native PlayStation support; DS4 extras (touchpad/gyro) via Steam Input may be lost.

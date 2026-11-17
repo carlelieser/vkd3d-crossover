@@ -26,7 +26,7 @@ Nothing in the games themselves is modified.
 ### Status at a glance
 | | Requiem | PRAGMATA SKETCHBOOK |
 |---|---|---|
-| Boots, menus, gameplay | ✅ | ✅ (until the current Steam-launch stall, §8) |
+| Boots, menus, gameplay | ✅ | ✅ |
 | Correct image (no black screen) | ✅ | ✅ |
 | Correct render resolution | ✅ (was 882x550) | ✅ |
 | Hair | ✅ fixed | expected fixed (same code path), not yet confirmed |
@@ -184,7 +184,7 @@ Tools that found the bugs above. They cost nothing unless enabled; worth keeping
 
 | Issue | What we know | Next step |
 |---|---|---|
-| Pragmata won't start from Steam (since ~23:43 Nov 16) | Stalls in Steam client/network init before any graphics DLL loads; overlay on → fatal 0xe0465043, off → hang; direct launch with the same DLLs and env works; rolling back DXGI/D3D12/core/MoltenVK didn't help | Pinned. Retry later; then compare Steam-launch vs direct-launch environment/arguments |
+| ~~Pragmata won't start from Steam~~ | Resolved: runs from Steam in a fresh bottle set up by the scripts. The old dev bottle stalled in Steam client/network init before any graphics DLL loaded; cause was that bottle's state (not Denuvo, not our stack) | — |
 | Residual stutter | Game re-creates ~48k PSOs per launch; deferred compiles help | Measure "draws waited on PSO"; move remaining library compiles off game threads |
 | 64-bit exchange under contention | 6/85 test cases; no game impact seen | Lock table if a game needs it |
 | Unimplementable on Metal | Transform feedback, geometry shaders, per-shader FP32 denorm mode, ROVs/conservative raster (FL 12_1), DGC (ExecuteIndirect state) | Report honestly; document |
